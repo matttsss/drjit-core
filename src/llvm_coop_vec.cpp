@@ -193,6 +193,13 @@ void jitc_llvm_render_coop_vec(const Variable *v, const Variable *a0,
             }
             break;
 
+        case VarKind::CoopVecExtract: {
+                const std::vector<uint32_t> *cved = (const std::vector<uint32_t> *) v->data;
+                for (uint32_t i = 0; i < cved->size(); ++i)
+                    fmt("    $v_$u = bitcast $V_$u to $T\n", v, i, a0, cved->at(i), v);
+            }
+            break;
+
         case VarKind::CoopVecBinaryOp: {
                 const char *op = nullptr;
 

@@ -265,6 +265,16 @@ void jitc_optix_render_coop_vec(const Variable *v, const Variable *a0,
             }
             break;
 
+        case VarKind::CoopVecExtract: {
+                // Source elements already occupy full b32 registers (with the
+                // upper half unused for f16), so a plain move suffices here
+                const std::vector<uint32_t> *cved = (const std::vector<uint32_t> *) v->data;
+                for (uint32_t i = 0; i < cved->size(); ++i)
+                    fmt("        mov.b32 %cv$u_$u, %cv$u_$u;\n",
+                        v->reg_index, i, a0->reg_index, cved->at(i));
+            }
+            break;
+
         case VarKind::CoopVecLoad:
             fmt("        .reg.b32 %type, %size, %u;\n"
                 "        .reg.b64 %src;\n"

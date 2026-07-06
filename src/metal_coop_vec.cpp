@@ -52,6 +52,13 @@ void jitc_metal_render_coop_vec(const Variable *v, const Variable *a0,
             break;
         }
 
+        case VarKind::CoopVecExtract: {
+            const std::vector<uint32_t> *cved = (const std::vector<uint32_t> *) v->data;
+            for (uint32_t i = 0; i < cved->size(); ++i)
+                fmt("$t $v_$u = $v_$u;\n", v, v, i, a0, cved->at(i));
+            break;
+        }
+
         case VarKind::CoopVecLoad: {
             for (uint32_t i = 0; i < v->array_length; ++i) {
                 fmt("$t $v_$u = ((device const $t*) $v)[$u];\n",

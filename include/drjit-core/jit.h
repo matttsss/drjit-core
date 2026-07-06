@@ -3062,6 +3062,15 @@ extern JIT_EXPORT uint32_t jit_coop_vec_pack(uint32_t n, const uint32_t *in);
 /// Unpack a cooperative vector into its components
 extern JIT_EXPORT void jit_coop_vec_unpack(uint32_t index, uint32_t n, uint32_t *out);
 
+/// Extract a subset of elements into a new, smaller cooperative vector
+extern JIT_EXPORT uint32_t jit_coop_vec_extract(uint32_t index,
+                                                const uint32_t *indices,
+                                                uint32_t n);
+
+/// Extract a single element from a cooperative vector as a regular variable
+extern JIT_EXPORT uint32_t jit_coop_vec_extract_single(uint32_t index,
+                                                       uint32_t i);
+
 /// Create a cooperative vectors, whose components are a uniform literal constant
 extern JIT_EXPORT uint32_t jit_coop_vec_literal(JIT_ENUM JitBackend backend,
                                                 JIT_ENUM VarType type,

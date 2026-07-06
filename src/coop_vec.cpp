@@ -140,6 +140,86 @@ void jitc_coop_vec_unpack(uint32_t index, uint32_t n, uint32_t *out) {
     }
 }
 
+uint32_t jitc_coop_vec_extract_single(uint32_t vec, uint32_t i) {
+    if (unlikely(!vec)) return 0;
+
+    const Variable *vec_v = jitc_var(vec);
+    if (unlikely(!vec_v->coop_vec))
+        jitc_raise("jit_coop_vec_extract_single(): source must be a "
+                   "cooperative vector!");
+    if (unlikely(i >= vec_v->array_length))
+        jitc_raise("jit_coop_vec_extract_single(): element %u is out of "
+                   "bounds (the vector has %u entries)!",
+                   i, vec_v->array_length);
+
+    // Extracting from a uniform literal vector yields a literal scalar
+    if (vec_v->is_coop_vec_literal()) {
+        uint64_t literal = vec_v->literal;
+        return jitc_var_literal((JitBackend) vec_v->backend,
+                                (VarType) vec_v->type, &literal,
+                                vec_v->size, 0);
+    }
+
+    Variable v;
+    v.kind = (uint32_t) VarKind::CoopVecUnpack;
+    v.type = vec_v->type;
+    v.size = vec_v->size;
+    v.backend = vec_v->backend;
+    v.literal = i;
+    v.dep[0] = vec;
+    jitc_var_inc_ref(vec);
+
+    jitc_log(Debug, "jit_coop_vec_extract_single(): extracting element %u of "
+                    "%u from r%u", i, vec_v->array_length, vec);
+
+    return jitc_var_new(v);
+}
+
+uint32_t jitc_coop_vec_extract(uint32_t vec, const uint32_t *indices, uint32_t n) {
+    if (unlikely(!vec)) return 0;
+    if (unlikely(n == 0))
+        jitc_raise("jit_coop_vec_extract(): vector cannot be empty!");
+    if (unlikely(n > 0xFFFF))
+        jitc_raise("jit_coop_vec_extract(): cooperative vector is too large!");
+
+    const Variable *vec_v = jitc_var(vec);
+    if (unlikely(!vec_v->coop_vec))
+        jitc_raise("jit_coop_vec_extract(): source must be a cooperative vector!");
+
+    for (uint32_t i = 0; i < n; ++i)
+        jitc_assert(indices[i] < vec_v->array_length,
+                    "jit_coop_vec_extract(): element %u is out of bounds "
+                    "(the vector has %u entries)!",
+                    indices[i], vec_v->array_length);
+
+    // A subset of a uniform literal vector is a smaller literal vector
+    if (vec_v->is_coop_vec_literal()) {
+        uint64_t literal = vec_v->literal;
+        return jitc_coop_vec_literal((JitBackend) vec_v->backend,
+                                     (VarType) vec_v->type, &literal,
+                                     vec_v->size, n);
+    }
+
+    Variable v;
+    v.kind = (uint32_t) VarKind::CoopVecExtract;
+    v.type = vec_v->type;
+    v.size = vec_v->size;
+    v.backend = vec_v->backend;
+    v.array_length = (uint16_t) n;
+    v.coop_vec = true;
+    v.optix = jitc_is_cuda(v.backend);
+    v.dep[0] = vec;
+    jitc_var_inc_ref(vec);
+
+    drjit::unique_ptr<std::vector<uint32_t>> cved = 
+            new std::vector<uint32_t>(indices, indices + n);
+
+    jitc_log(Debug, "jit_coop_vec_extract(): extracting %u of %u elements "
+                    "from r%u", n,  vec_v->array_length, vec);
+
+    return jitc_var_new_take_ownership(v, std::move(cved), true);
+}
+
 uint32_t jitc_coop_vec_literal(JitBackend backend,
                                VarType type,
                                const void *value,

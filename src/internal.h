@@ -198,6 +198,7 @@ enum class VarKind : uint32_t {
     CoopVecMatVec,
     CoopVecAccum,
     CoopVecOuterProductAccum,
+    CoopVecExtract,
 
     // Shader execution reordering (OptiX)
     ReorderThread,

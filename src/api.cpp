@@ -2157,6 +2157,16 @@ void jit_coop_vec_unpack(uint32_t index, uint32_t n, uint32_t *out) {
     jitc_coop_vec_unpack(index, n, out);
 }
 
+uint32_t jit_coop_vec_extract(uint32_t index, const uint32_t *indices, uint32_t n) {
+    lock_guard guard(state.lock);
+    return jitc_coop_vec_extract(index, indices, n);
+}
+
+uint32_t jit_coop_vec_extract_single(uint32_t index, uint32_t i) {
+    lock_guard guard(state.lock);
+    return jitc_coop_vec_extract_single(index, i);
+}
+
 uint32_t jit_coop_vec_literal(JitBackend backend, VarType type,
                               const void *value, size_t size, uint32_t length) {
     lock_guard guard(state.lock);
