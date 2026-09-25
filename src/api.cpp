@@ -106,6 +106,14 @@ int jit_has_backend(JitBackend backend) {
 #endif
             break;
 
+        case JitBackend::Vulkan:
+#if defined(DRJIT_ENABLE_VULKAN)
+            result = state.backends & (1u << (uint32_t) JitBackend::Vulkan);
+#else
+            result = false;
+#endif
+            break;
+
         default:
             jitc_raise("jit_has_backend(): invalid input!");
     }

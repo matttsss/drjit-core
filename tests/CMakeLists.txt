@@ -7,6 +7,21 @@ add_test(NAME test_half COMMAND test_half
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(test_half PRIVATE drjit-core)
 
+# White-box test of the bit fields encoding the JIT backend (private headers)
+add_executable(test_backend_bits backend_bits.cpp)
+set_property(TARGET test_backend_bits PROPERTY CXX_STANDARD 17)
+target_link_libraries(test_backend_bits PRIVATE drjit-core)
+target_include_directories(test_backend_bits PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ext/robin_map/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ext/nanothread/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ext/lz4)
+if (DRJIT_ENABLE_VULKAN)
+  target_compile_definitions(test_backend_bits PRIVATE -DDRJIT_ENABLE_VULKAN=1)
+endif()
+add_test(NAME test_backend_bits COMMAND test_backend_bits
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+
 foreach (TEST_FILE ${TEST_FILES})
   get_filename_component(TEST_NAME ${TEST_FILE} NAME_WE)
   add_executable(test_${TEST_NAME} ${TEST_NAME}.cpp test.h test.cpp ${TEST_NAME}.cpp)

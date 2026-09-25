@@ -289,10 +289,10 @@ struct alignas(64) Variable {
     uint32_t kind : 7;
 
     /// Backend associated with this variable
-    uint32_t backend : 2;
+    uint32_t backend : 3;
 
     /// Variable type (Bool/Int/Float/....)
-    uint32_t type : 5;
+    uint32_t type : 4;
 
     /// Is this a pointer variable that tracks a pending write? It holds a side
     /// effect reference that keeps the target marked dirty until it expires.
@@ -388,6 +388,15 @@ struct alignas(64) Variable {
 
 static_assert(sizeof(Variable) == 64);
 
+// The bit fields 'Variable::kind', 'Variable::backend' and 'Variable::type'
+// must be wide enough to represent all enumeration values
+static_assert((uint32_t) VarKind::Count <= (1u << 7),
+              "Variable::kind: bit field is too narrow!");
+static_assert((uint32_t) JitBackend::Count <= (1u << 3),
+              "Variable::backend: bit field is too narrow!");
+static_assert((uint32_t) VarType::Count <= (1u << 4),
+              "Variable::type: bit field is too narrow!");
+
 /// This record represents additional information that can *optionally* be
 /// associated with a 'Variable' instance. These are factored out into a struct
 /// since only very few variables need these fields, and to to ensure that
@@ -444,7 +453,7 @@ struct VariableKey {
         memcpy((void *) this, (const void *) &v.scope, 32);
         uint32_t array_length =
             (v.is_array() || v.coop_vec) ? (uint32_t) v.array_length : 0u;
-        // The bitfields kind:7|backend:2|type:5|write_ptr:1|written:1 occupy
+        // The bitfields kind:7|backend:3|type:4|write_ptr:1|written:1 occupy
         // bits 0..15 of the 32-bit word immediately after 'scratch' (LSB-first
         // packing), which is exactly the layout 'packed' wants. Reading the raw
         // word and masking avoids extracting and re-assembling each field
@@ -1229,6 +1238,9 @@ struct ThreadLocal {
 #if defined(DRJIT_ENABLE_METAL)
     ThreadState *ts_metal = nullptr;
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    ThreadState *ts_vulkan = nullptr;
+#endif
 
     // Compilation flags
     uint32_t flags = (uint32_t) JitFlag::Default;
@@ -1251,6 +1263,9 @@ struct ThreadLocal {
 #if defined(DRJIT_ENABLE_METAL)
 #  define thread_state_metal (tls.ts_metal)
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+#  define thread_state_vulkan (tls.ts_vulkan)
+#endif
 #define jitc_flags_v      (tls.flags)
 #define default_backend   (tls.def_backend)
 
@@ -1272,6 +1287,12 @@ inline ThreadState *thread_state(JitBackend backend) {
 #if defined(DRJIT_ENABLE_METAL)
         case JitBackend::Metal:
             result = thread_state_metal;
+            break;
+#endif
+
+#if defined(DRJIT_ENABLE_VULKAN)
+        case JitBackend::Vulkan:
+            result = thread_state_vulkan;
             break;
 #endif
 
@@ -1344,13 +1365,21 @@ template <typename T> inline bool jitc_is_metal(T b) {
 #endif
 }
 
+template <typename T> inline bool jitc_is_vulkan(T b) {
+#if defined(DRJIT_ENABLE_VULKAN)
+    return (JitBackend) b == JitBackend::Vulkan;
+#else
+    (void) b; return false;
+#endif
+}
+
 template <typename T> inline bool jitc_is_llvm(T b) {
     return (JitBackend) b == JitBackend::LLVM;
 }
 
-/// Returns true if the given backend uses GPU device memory (CUDA or Metal)
+/// Returns true if the given backend uses GPU device memory (CUDA, Metal, or Vulkan)
 template <typename T> inline bool jitc_is_gpu(T b) {
-    return jitc_is_cuda(b) || jitc_is_metal(b);
+    return jitc_is_cuda(b) || jitc_is_metal(b) || jitc_is_vulkan(b);
 }
 
 /// Search for a shared library and dlopen it if possible

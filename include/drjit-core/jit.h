@@ -56,23 +56,28 @@ enum class JitBackend : uint32_t {
     /// Metal backend (Apple Silicon GPUs, generates MSL source)
     Metal = 3,
 
+    /// Vulkan backend (Vulkan 1.2+ GPUs, generates SPIR-V assembly)
+    Vulkan = 4,
+
     /// Sentinel value (not a real backend; equals the number of backends)
-    Count = 4
+    Count = 5
 };
 
 /// Compile-time name of a JIT backend (e.g., to identify registry domains)
 template <JitBackend Backend>
 constexpr const char *jit_backend_name_v =
-    Backend == JitBackend::CUDA  ? "cuda"  :
-    Backend == JitBackend::LLVM  ? "llvm"  :
-    Backend == JitBackend::Metal ? "metal" : "none";
+    Backend == JitBackend::CUDA   ? "cuda"   :
+    Backend == JitBackend::LLVM   ? "llvm"   :
+    Backend == JitBackend::Metal  ? "metal"  :
+    Backend == JitBackend::Vulkan ? "vulkan" : "none";
 #else
 enum JitBackend {
     JitBackendNone = 0,
     JitBackendCUDA = 1,
     JitBackendLLVM = 2,
     JitBackendMetal = 3,
-    JitBackendCount = 4
+    JitBackendVulkan = 4,
+    JitBackendCount = 5
 };
 #endif
 
@@ -87,6 +92,10 @@ enum JitBackend {
  * already occurred. It is possible to re-initialize the JIT following a call
  * to \ref jit_shutdown(), which can be useful to reset the state, e.g., in
  * testcases.
+ *
+ * The Vulkan backend is experimental and not part of the default set of
+ * backends. It must be requested explicitly by passing
+ * ``1u << (uint32_t) JitBackend::Vulkan``.
  */
 extern JIT_EXPORT void
 jit_init(uint32_t backends JIT_DEF((1u << (uint32_t) JitBackend::CUDA) |

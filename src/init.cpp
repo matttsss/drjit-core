@@ -231,6 +231,9 @@ void jitc_shutdown(int light) {
 #if defined(DRJIT_ENABLE_METAL)
         tl.ts_metal = nullptr;
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+        tl.ts_vulkan = nullptr;
+#endif
 
         for (ThreadState *ts : state.tss) {
 #if defined(DRJIT_ENABLE_CUDA)
@@ -259,7 +262,7 @@ void jitc_shutdown(int light) {
                         " - id=%u: size=%u, type=%s, dep=[%u, "
                         "%u, %u, %u]",
                         kv.second, kv.first.size,
-                        type_name[(kv.first.packed >> 9) & 0x1f],
+                        type_name[(kv.first.packed >> 10) & 0xf],
                         kv.first.dep[0], kv.first.dep[1], kv.first.dep[2],
                         kv.first.dep[3]);
 
@@ -377,6 +380,20 @@ ThreadState *jitc_init_thread_state(JitBackend backend) {
         ts->scope = jitc_scope_next();
         state.tss.push_back(ts);
         return ts;
+    }
+#endif
+
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (jitc_is_vulkan(backend)) {
+        if ((state.backends & (1u << (uint32_t) JitBackend::Vulkan)) == 0)
+            jitc_raise(
+                "jit_init_thread_state(): the Vulkan backend has not been "
+                "initialized. Make sure to call jit_init(JitBackend::Vulkan) "
+                "first. The Vulkan backend requires a Vulkan 1.2 (or newer) "
+                "capable device and driver.");
+
+        jitc_raise("jit_init_thread_state(): the Vulkan backend does not "
+                   "support thread states yet.");
     }
 #endif
 

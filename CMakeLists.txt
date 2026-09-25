@@ -27,6 +27,14 @@ if (APPLE)
   option(DRJIT_ENABLE_METAL "Enable the Apple Metal backend?" ON)
 endif()
 
+if (APPLE)
+  # Vulkan is only available via MoltenVK on macOS, where Metal is the native backend
+  option(DRJIT_ENABLE_VULKAN "Enable the Vulkan backend?" OFF)
+else()
+  option(DRJIT_ENABLE_VULKAN "Enable the Vulkan backend?" ON)
+endif()
+option(DRJIT_DYNAMIC_VULKAN "Resolve the Vulkan loader dynamically at run time (no Vulkan SDK needed at build time)?" ON)
+
 if (NOT MSVC)
   option(DRJIT_SANITIZE_UBSAN   "Enable the address sanitizer (GCC, Clang)" OFF)
   option(DRJIT_SANITIZE_ASAN    "Enable the undefined behavior sanitizer (GCC, Clang)" OFF)
@@ -77,6 +85,16 @@ if (DRJIT_ENABLE_METAL)
   message(STATUS "Dr.Jit-Core: Metal GPU backend enabled.")
 else()
   message(STATUS "Dr.Jit-Core: Metal GPU backend disabled.")
+endif()
+
+if (DRJIT_ENABLE_VULKAN)
+  if (DRJIT_DYNAMIC_VULKAN)
+    message(STATUS "Dr.Jit-Core: Vulkan GPU backend enabled (the Vulkan loader will be loaded dynamically at runtime).")
+  else()
+    message(STATUS "Dr.Jit-Core: Vulkan GPU backend enabled (linking against the Vulkan loader).")
+  endif()
+else()
+  message(STATUS "Dr.Jit-Core: Vulkan GPU backend disabled.")
 endif()
 
 # ----------------------------------------------------------
@@ -190,6 +208,14 @@ if (DRJIT_ENABLE_METAL)
     src/metal_coop_vec.cpp)
 endif()
 
+if (DRJIT_ENABLE_VULKAN)
+  # Vulkan backend sources: the dynamic Vulkan/SPIRV-Tools loader
+  # (vulkan_api.*), device context & thread state (vulkan_core.cpp,
+  # vulkan_ts.*), and SPIR-V code generation (vulkan_eval.*) are added to this
+  # list as they are implemented.
+  set(DRJIT_VULKAN_FILES)
+endif()
+
 
 add_library(
   drjit-core SHARED
@@ -224,6 +250,9 @@ add_library(
 
   # Metal backend, if enabled
   ${DRJIT_METAL_FILES}
+
+  # Vulkan backend, if enabled
+  ${DRJIT_VULKAN_FILES}
 
   # LLVM backend
   src/llvm_api.h
@@ -374,6 +403,18 @@ endif()
 
 if (DRJIT_ENABLE_CUDA)
   target_compile_definitions(drjit-core PRIVATE -DDRJIT_ENABLE_CUDA=1)
+endif()
+
+if (DRJIT_ENABLE_VULKAN)
+  target_compile_definitions(drjit-core PRIVATE -DDRJIT_ENABLE_VULKAN=1)
+  if (DRJIT_DYNAMIC_VULKAN)
+    # Self-contained Vulkan declarations, loader resolved via dlopen()
+    target_compile_definitions(drjit-core PRIVATE -DDRJIT_DYNAMIC_VULKAN=1)
+  else()
+    # Official Vulkan headers, link against the Vulkan loader
+    find_package(Vulkan REQUIRED)
+    target_link_libraries(drjit-core PRIVATE Vulkan::Vulkan)
+  endif()
 endif()
 
 if (DRJIT_ENABLE_METAL)

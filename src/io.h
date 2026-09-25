@@ -121,6 +121,23 @@ struct Kernel {
             bool has_call_table;
         } metal;
 #endif
+
+#if defined(DRJIT_ENABLE_VULKAN)
+        /// 5. Vulkan (non-dispatchable handles are 64-bit on all platforms)
+        struct {
+            /// VkPipeline
+            uint64_t pipeline;
+
+            /// VkPipelineLayout
+            uint64_t layout;
+
+            /// VkShaderModule
+            uint64_t module;
+
+            /// Number of threads per workgroup (``LocalSize`` execution mode)
+            uint32_t workgroup_size;
+        } vulkan;
+#endif
     };
 };
 
