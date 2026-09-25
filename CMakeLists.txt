@@ -33,7 +33,7 @@ if (APPLE)
 else()
   option(DRJIT_ENABLE_VULKAN "Enable the Vulkan backend?" ON)
 endif()
-option(DRJIT_DYNAMIC_VULKAN "Resolve the Vulkan loader dynamically at run time (no Vulkan SDK needed at build time)?" ON)
+option(DRJIT_DYNAMIC_VULKAN "Use self-contained Vulkan declarations (no Vulkan SDK/headers needed at build time)? The Vulkan loader is always loaded dynamically at runtime." ON)
 
 if (NOT MSVC)
   option(DRJIT_SANITIZE_UBSAN   "Enable the address sanitizer (GCC, Clang)" OFF)
@@ -91,7 +91,7 @@ if (DRJIT_ENABLE_VULKAN)
   if (DRJIT_DYNAMIC_VULKAN)
     message(STATUS "Dr.Jit-Core: Vulkan GPU backend enabled (the Vulkan loader will be loaded dynamically at runtime).")
   else()
-    message(STATUS "Dr.Jit-Core: Vulkan GPU backend enabled (linking against the Vulkan loader).")
+    message(STATUS "Dr.Jit-Core: Vulkan GPU backend enabled (using the official Vulkan headers, the Vulkan loader will be loaded dynamically at runtime).")
   endif()
 else()
   message(STATUS "Dr.Jit-Core: Vulkan GPU backend disabled.")
@@ -213,7 +213,9 @@ if (DRJIT_ENABLE_VULKAN)
   # (vulkan_api.*), device context & thread state (vulkan_core.cpp,
   # vulkan_ts.*), and SPIR-V code generation (vulkan_eval.*) are added to this
   # list as they are implemented.
-  set(DRJIT_VULKAN_FILES)
+  set(DRJIT_VULKAN_FILES
+    src/vulkan_api.h
+    src/vulkan_api.cpp)
 endif()
 
 
@@ -407,13 +409,27 @@ endif()
 
 if (DRJIT_ENABLE_VULKAN)
   target_compile_definitions(drjit-core PRIVATE -DDRJIT_ENABLE_VULKAN=1)
+
+  # Official Vulkan headers (optional unless DRJIT_DYNAMIC_VULKAN=OFF). They
+  # are also used by 'tests/vulkan_layout.cpp' to check the self-contained
+  # declarations in 'src/vulkan_api.h'.
+  find_path(DRJIT_VULKAN_INCLUDE_DIR NAMES vulkan/vulkan.h
+    HINTS "$ENV{VULKAN_SDK}/include" "$ENV{VULKAN_SDK}/Include"
+    DOC "Directory containing the official Vulkan headers (vulkan/vulkan.h)")
+  mark_as_advanced(DRJIT_VULKAN_INCLUDE_DIR)
+
   if (DRJIT_DYNAMIC_VULKAN)
-    # Self-contained Vulkan declarations, loader resolved via dlopen()
+    # Self-contained Vulkan declarations
     target_compile_definitions(drjit-core PRIVATE -DDRJIT_DYNAMIC_VULKAN=1)
   else()
-    # Official Vulkan headers, link against the Vulkan loader
-    find_package(Vulkan REQUIRED)
-    target_link_libraries(drjit-core PRIVATE Vulkan::Vulkan)
+    # Official Vulkan headers. Dr.Jit never links against the Vulkan loader:
+    # it is always loaded at runtime (like OptiX).
+    if (NOT DRJIT_VULKAN_INCLUDE_DIR)
+      message(FATAL_ERROR "Dr.Jit-Core: DRJIT_DYNAMIC_VULKAN=OFF requires the "
+        "official Vulkan headers, which could not be found. Install them or set "
+        "DRJIT_VULKAN_INCLUDE_DIR.")
+    endif()
+    target_include_directories(drjit-core PRIVATE ${DRJIT_VULKAN_INCLUDE_DIR})
   endif()
 endif()
 

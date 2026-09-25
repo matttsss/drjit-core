@@ -4,7 +4,7 @@
     ``AllocInfo``). Adding the Vulkan backend (``JitBackend::Vulkan == 4``)
     required widening all backend fields to 3 bits.
 
-    Copyright (c) 2021 Wenzel Jakob <wenzel.jakob@epfl.ch>
+    Copyright (c) 2026 Wenzel Jakob <wenzel.jakob@epfl.ch>
 
     All rights reserved. Use of this source code is governed by a BSD-style
     license that can be found in the LICENSE file.
@@ -136,7 +136,8 @@ static void test_names_and_predicates() {
 /// Public API: requesting the Vulkan backend must never raise or disturb the
 /// other backends
 static void test_public_api() {
-    jit_set_log_level_stderr(LogLevel::Warn);
+    // Only show errors: a warning is expected if Vulkan is unavailable
+    jit_set_log_level_stderr(LogLevel::Error);
     uint32_t backends = (1u << (uint32_t) JitBackend::LLVM) |
                         (1u << (uint32_t) JitBackend::Vulkan);
 

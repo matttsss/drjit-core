@@ -37,6 +37,10 @@
 #  include "metal_ts.h"
 #endif
 
+#if defined(DRJIT_ENABLE_VULKAN)
+#  include "vulkan_api.h"
+#endif
+
 #if defined(_WIN32)
 #  include <windows.h>
 #  include <direct.h>
@@ -105,6 +109,13 @@ void jitc_init(uint32_t backends) {
 #if defined(DRJIT_ENABLE_METAL)
     if ((backends & (1u << (uint32_t) JitBackend::Metal)) && jitc_metal_init())
         state.backends |= 1u << (uint32_t) JitBackend::Metal;
+#endif
+
+#if defined(DRJIT_ENABLE_VULKAN)
+    // Load the Vulkan loader & SPIRV-Tools and create the Vulkan instance.
+    // The backend is only flagged as available once devices are supported.
+    if (backends & (1u << (uint32_t) JitBackend::Vulkan))
+        jitc_vulkan_api_init();
 #endif
 
     state.variable_counter = 0;
@@ -338,6 +349,9 @@ void jitc_shutdown(int light) {
 #endif
 #if defined(DRJIT_ENABLE_METAL)
         jitc_metal_shutdown();
+#endif
+#if defined(DRJIT_ENABLE_VULKAN)
+        jitc_vulkan_api_shutdown();
 #endif
     }
 

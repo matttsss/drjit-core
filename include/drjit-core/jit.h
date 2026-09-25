@@ -354,6 +354,40 @@ extern JIT_EXPORT void *jit_metal_queue();
 extern JIT_EXPORT int jit_metal_supports_ray_tracing();
 
 // ====================================================================
+//                        Vulkan-specific functionality
+// ====================================================================
+
+/**
+ * \brief Return the version of the Vulkan loader used by the Vulkan backend
+ *
+ * This is the instance-level API version reported by the Vulkan loader. All
+ * values are set to zero if the Vulkan libraries have not been loaded (see
+ * \ref jit_init()) or are unavailable.
+ */
+extern JIT_EXPORT void jit_vulkan_version(int *major, int *minor, int *patch);
+
+/**
+ * \brief Return the Vulkan instance (\c VkInstance) created by Dr.Jit
+ *
+ * Returns \c NULL if the Vulkan libraries have not been loaded (see \ref
+ * jit_init()) or are unavailable.
+ */
+extern JIT_EXPORT void *jit_vulkan_instance();
+
+/**
+ * \brief Look up a Vulkan or SPIRV-Tools function by name
+ *
+ * Names starting with <tt>vk</tt> are resolved via
+ * <tt>vkGetInstanceProcAddr()</tt> using the Vulkan instance of Dr.Jit (or
+ * without an instance in the case of global commands such as
+ * <tt>vkEnumerateInstanceVersion()</tt>). Device-level functions obtained in
+ * this way can be used with any device created from this instance. Names
+ * starting with <tt>spv</tt> are looked up in the SPIRV-Tools library loaded
+ * by Dr.Jit. Raises an exception if the function cannot be found.
+ */
+extern JIT_EXPORT void *jit_vulkan_lookup(const char *name);
+
+// ====================================================================
 //                        Logging infrastructure
 // ====================================================================
 

@@ -19,6 +19,9 @@
 #  include "cuda_tex.h"
 #  include "cuda_green.h"
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+#  include "vulkan_api.h"
+#endif
 #include "op.h"
 #include "call.h"
 #include "isect.h"
@@ -543,6 +546,49 @@ void jit_metal_scene_set_cleanup(uint32_t scene_index,
     scene->cleanup_payload = payload;
 #else
     (void) scene_index; (void) callback; (void) payload;
+#endif
+}
+
+// ==========================================================================
+//                          Vulkan-specific API
+// ==========================================================================
+
+void jit_vulkan_version(int *major, int *minor, int *patch) {
+    lock_guard guard(state.lock);
+    int v_major = 0, v_minor = 0, v_patch = 0;
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (jitc_vulkan_instance) {
+        v_major = (int) VK_API_VERSION_MAJOR(jitc_vulkan_loader_version);
+        v_minor = (int) VK_API_VERSION_MINOR(jitc_vulkan_loader_version);
+        v_patch = (int) VK_API_VERSION_PATCH(jitc_vulkan_loader_version);
+    }
+#endif
+    if (major)
+        *major = v_major;
+    if (minor)
+        *minor = v_minor;
+    if (patch)
+        *patch = v_patch;
+}
+
+void *jit_vulkan_instance() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_VULKAN)
+    return (void *) jitc_vulkan_instance;
+#else
+    return nullptr;
+#endif
+}
+
+void *jit_vulkan_lookup(const char *name) {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_VULKAN)
+    return jitc_vulkan_lookup(name);
+#else
+    (void) name;
+    jit_raise("jit_vulkan_lookup(): the Vulkan backend is not enabled in "
+              "this build of Dr.Jit.");
+    return nullptr;
 #endif
 }
 
