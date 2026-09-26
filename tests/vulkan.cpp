@@ -820,28 +820,21 @@ TEST_VULKAN(14_threads) {
 }
 
 TEST_VULKAN(15_errors) {
-    // Unimplemented kernel operations (e.g. local arrays) raise a clear error
+    // Unimplemented kernel operations (e.g. cooperative vectors) raise a clear error
     {
-        uint32_t arr = jit_array_create(Backend, VarType::UInt32, 10, 4);
         uint32_t idx = jit_var_counter(Backend, 10);
-        uint8_t mask_val = 1;
-        uint32_t mask =
-            jit_var_literal(Backend, VarType::Bool, &mask_val, 10, 0);
-        uint32_t zero_val = 0;
-        uint32_t zero =
-            jit_var_literal(Backend, VarType::UInt32, &zero_val, 1, 0);
-        uint32_t arr2 = jit_array_write(arr, zero, idx, mask);
-        uint32_t elem = jit_array_read(arr2, zero, mask);
-        jit_var_schedule(elem);
+        uint32_t in[2] = { idx, idx };
+        uint32_t cv = jit_coop_vec_pack(2, in);
+        uint32_t out[2] = { 0, 0 };
+        jit_coop_vec_unpack(cv, 2, out);
+        jit_var_schedule(out[0]);
         jit_assert(raises([&] { jit_eval(); }, "cannot compile kernels"));
-        jit_assert(jit_var_state(elem) == VarState::Unevaluated);
+        jit_assert(jit_var_state(out[0]) == VarState::Unevaluated);
         jit_eval(); // (nothing left to do)
-        jit_var_dec_ref(elem);
-        jit_var_dec_ref(arr2);
-        jit_var_dec_ref(zero);
-        jit_var_dec_ref(mask);
+        jit_var_dec_ref(out[0]);
+        jit_var_dec_ref(out[1]);
+        jit_var_dec_ref(cv);
         jit_var_dec_ref(idx);
-        jit_var_dec_ref(arr);
     }
 
     // Events and frozen functions are unsupported
@@ -3157,3 +3150,914 @@ TEST_VULKAN(23_kernel_cache_and_history) {
 
     jit_set_flag(JitFlag::KernelHistory, prev_kh);
 }
+
+namespace {
+
+/// RAII helper to temporarily record symbolic computation
+struct ScopedRecord {
+    ScopedRecord(JitBackend backend, const char *name = nullptr,
+                 bool new_scope = false)
+        : backend(backend) {
+        checkpoint = jit_record_begin(backend, name);
+        if (new_scope)
+            scope = jit_new_scope(backend);
+    }
+
+    ~ScopedRecord() {
+        jit_record_end(backend, checkpoint, cleanup);
+    }
+
+    void disarm() { cleanup = false; }
+
+    JitBackend backend;
+    uint32_t checkpoint = 0, scope = 0;
+    bool cleanup = true;
+};
+
+struct VarRef {
+    VarRef() : index(0) { }
+    ~VarRef() { jit_var_dec_ref(index); }
+    VarRef(VarRef &&r) : index(r.index) { r.index = 0; }
+    VarRef &operator=(VarRef &&r) {
+        jit_var_dec_ref(index);
+        index = r.index;
+        r.index = 0;
+        return *this;
+    }
+    VarRef(const VarRef &) = delete;
+    VarRef &operator=(const VarRef &) = delete;
+    operator uint32_t() const { return index; }
+
+    static VarRef steal(uint32_t idx) {
+        VarRef r;
+        r.index = idx;
+        return r;
+    }
+
+    uint32_t index = 0;
+};
+
+template <typename Value> struct LocalArr {
+    using UInt32 = typename Value::template ReplaceValue<uint32_t>;
+    using Bool = typename Value::template ReplaceValue<bool>;
+    using Scalar = typename Value::Value;
+
+    LocalArr() : m_index(0) { }
+    LocalArr(LocalArr &&a) : m_index(a.m_index) { a.m_index = 0; }
+    LocalArr(const LocalArr &a) : m_index(jit_var_inc_ref(a.m_index)) { }
+
+    LocalArr &operator=(const LocalArr &) = delete;
+    LocalArr &operator=(LocalArr &&a) {
+        jit_var_dec_ref(m_index);
+        m_index = a.m_index;
+        a.m_index = 0;
+        return *this;
+    }
+
+    LocalArr(size_t length) {
+        m_index = jit_array_create(Value::Backend, Value::Type, 1, length);
+    }
+
+    LocalArr(size_t length, Value value) {
+        uint32_t tmp = jit_array_create(Value::Backend, Value::Type, 1, length);
+        m_index = jit_array_init(tmp, value.index());
+        jit_var_dec_ref(tmp);
+    }
+
+    ~LocalArr() {
+        jit_var_dec_ref(m_index);
+    }
+
+    size_t length() const {
+        return jit_array_length(m_index);
+    }
+
+    void eval() {
+        jit_var_eval(m_index);
+    }
+
+    void schedule() {
+        jit_var_schedule(m_index);
+    }
+
+    void write(const UInt32 &offset, const Value &value, const Bool &mask = true) {
+        uint32_t new_index =
+            jit_array_write(m_index, offset.index(), value.index(), mask.index());
+        jit_var_dec_ref(m_index);
+        m_index = new_index;
+    }
+
+    Value read(const UInt32 &offset, const Bool &mask = true) const {
+        return Value::steal(jit_array_read(m_index, offset.index(), mask.index()));
+    }
+
+    static LocalArr steal(uint32_t idx) {
+        LocalArr a;
+        a.m_index = idx;
+        return a;
+    }
+
+    uint32_t m_index;
+};
+
+} // namespace
+
+TEST_VULKAN(24_symbolic_conditionals) {
+    // 1. Multi-output symbolic conditional with active and invariant outputs
+    {
+        UInt32 idx = arange<UInt32>(8);
+        Float  x   = Float(idx) * 2.f;
+        Mask   c   = idx < 4u;
+
+        Float  out_f;
+        UInt32 out_u;
+        Float  out_inv;
+        {
+            ScopedRecord rec(Backend, "CondBasic");
+            Mask cond_t = Mask::steal(jit_var_mask_apply(c.index(), 8));
+            Mask cond_f = Mask::steal(jit_var_mask_apply((!c).index(), 8));
+            VarRef cond = VarRef::steal(
+                jit_var_cond_start("CondBasic", false, cond_t.index(), cond_f.index()));
+
+            // True branch: idx < 4
+            jit_var_mask_push(Backend, cond_t.index());
+            Float  ft   = x + 10.f;
+            UInt32 ut   = idx + 100u;
+            Float  invt = Float(42.f);
+            jit_var_mask_pop(Backend);
+            uint32_t rv_t[3] = { ft.index(), ut.index(), invt.index() };
+            VarRef lbl_t = VarRef::steal(jit_var_cond_append(cond, rv_t, 3));
+
+            // False branch: idx >= 4
+            jit_var_mask_push(Backend, cond_f.index());
+            Float  ff   = x * 3.f;
+            UInt32 uf   = idx + 200u;
+            Float  invf = Float(42.f);
+            jit_var_mask_pop(Backend);
+            uint32_t rv_f[3] = { ff.index(), uf.index(), invf.index() };
+            VarRef lbl_f = VarRef::steal(jit_var_cond_append(cond, rv_f, 3));
+
+            uint32_t rv_out[3] = { 0, 0, 0 };
+            jit_var_cond_end(cond, rv_out);
+            out_f   = Float::steal(rv_out[0]);
+            out_u   = UInt32::steal(rv_out[1]);
+            out_inv = Float::steal(rv_out[2]);
+            rec.disarm();
+        }
+
+        out_f.schedule();
+        out_u.schedule();
+        out_inv.schedule();
+        std::string spv = assemble_and_validate_spirv();
+        jit_assert(spv.find("OpSelectionMerge %cond_merge_r") != std::string::npos);
+
+        for (uint32_t i = 0; i < 8; ++i) {
+            float exp_f = (i < 4) ? (i * 2.f + 10.f) : (i * 2.f * 3.f);
+            uint32_t exp_u = (i < 4) ? (i + 100u) : (i + 200u);
+            jit_assert(out_f.read(i) == exp_f);
+            jit_assert(out_u.read(i) == exp_u);
+            jit_assert(out_inv.read(i) == 42.f);
+        }
+    }
+
+    // 2. Conditional with side effects (scatter in true/false branches) and
+    //    nested conditionals + gathers inside branches (tests current_block_label)
+    {
+        UInt32 idx = arange<UInt32>(8);
+        UInt32 tbl = arange<UInt32>(8) * 10u + 1u;
+        tbl.eval();
+
+        UInt32 dst = zeros<UInt32>(8);
+        Mask c_outer = eq(idx & UInt32(1), UInt32(0)); // even lanes
+        Mask c_inner = idx < 4u;                       // first 4 lanes
+
+        UInt32 res;
+        {
+            ScopedRecord rec(Backend, "CondNested");
+            Mask outer_t = Mask::steal(jit_var_mask_apply(c_outer.index(), 8));
+            Mask outer_f = Mask::steal(jit_var_mask_apply((!c_outer).index(), 8));
+            VarRef cond_outer = VarRef::steal(
+                jit_var_cond_start("Outer", false, outer_t.index(), outer_f.index()));
+
+            // Outer true branch (even lanes): nested conditional + gather + scatter
+            jit_var_mask_push(Backend, outer_t.index());
+            UInt32 rt;
+            {
+                Mask inner_t = Mask::steal(jit_var_mask_apply(c_inner.index(), 8));
+                Mask inner_f = Mask::steal(jit_var_mask_apply((!c_inner).index(), 8));
+                VarRef cond_inner = VarRef::steal(
+                    jit_var_cond_start("Inner", true, inner_t.index(), inner_f.index()));
+
+                jit_var_mask_push(Backend, inner_t.index());
+                UInt32 g_t = gather<UInt32>(tbl, idx);
+                scatter(dst, g_t + 1000u, idx);
+                jit_var_mask_pop(Backend);
+                uint32_t rv_it[1] = { g_t.index() };
+                VarRef lbl_it = VarRef::steal(jit_var_cond_append(cond_inner, rv_it, 1));
+
+                jit_var_mask_push(Backend, inner_f.index());
+                UInt32 g_f = gather<UInt32>(tbl, UInt32(7) - idx);
+                scatter(dst, g_f + 2000u, idx);
+                jit_var_mask_pop(Backend);
+                uint32_t rv_if[1] = { g_f.index() };
+                VarRef lbl_if = VarRef::steal(jit_var_cond_append(cond_inner, rv_if, 1));
+
+                uint32_t rv_iout[1] = { 0 };
+                jit_var_cond_end(cond_inner, rv_iout);
+                rt = UInt32::steal(rv_iout[0]);
+            }
+            jit_var_mask_pop(Backend);
+            uint32_t rv_ot[1] = { rt.index() };
+            VarRef lbl_ot = VarRef::steal(jit_var_cond_append(cond_outer, rv_ot, 1));
+
+            // Outer false branch (odd lanes): gather + scatter
+            jit_var_mask_push(Backend, outer_f.index());
+            UInt32 rf = gather<UInt32>(tbl, idx) + 500u;
+            scatter(dst, rf, idx);
+            jit_var_mask_pop(Backend);
+            uint32_t rv_of[1] = { rf.index() };
+            VarRef lbl_of = VarRef::steal(jit_var_cond_append(cond_outer, rv_of, 1));
+
+            uint32_t rv_oout[1] = { 0 };
+            jit_var_cond_end(cond_outer, rv_oout);
+            res = UInt32::steal(rv_oout[0]);
+            rec.disarm();
+        }
+
+        res.schedule();
+        dst.schedule();
+        assemble_and_validate_spirv();
+
+        for (uint32_t i = 0; i < 8; ++i) {
+            uint32_t tbl_i = i * 10u + 1u;
+            uint32_t tbl_rev = (7u - i) * 10u + 1u;
+            if ((i & 1) == 0) {
+                uint32_t exp_res = (i < 4) ? tbl_i : tbl_rev;
+                uint32_t exp_dst = (i < 4) ? (tbl_i + 1000u) : (tbl_rev + 2000u);
+                jit_assert(res.read(i) == exp_res);
+                jit_assert(dst.read(i) == exp_dst);
+            } else {
+                uint32_t exp_res = tbl_i + 500u;
+                jit_assert(res.read(i) == exp_res);
+                jit_assert(dst.read(i) == exp_res);
+            }
+        }
+    }
+}
+
+TEST_VULKAN(25_symbolic_loops) {
+    // 1. Simple symbolic loop (OptimizeLoops off & on)
+    for (uint32_t i = 0; i < 2; ++i) {
+        jit_set_flag(JitFlag::OptimizeLoops, i == 1);
+
+        for (uint32_t j = 0; j < 2; ++j) {
+            UInt32 x = arange<UInt32>(10);
+            Float  y = zeros<Float>(1);
+            Float  z = 1;
+            {
+                ScopedRecord record_guard(Backend);
+                uint32_t var_indices[3] = { x.index(), y.index(), z.index() };
+
+                VarRef loop = VarRef::steal(
+                    jit_var_loop_start("MyLoop", false, 3, var_indices));
+
+                UInt32 xl = UInt32::steal(var_indices[0]);
+                Float  yl = Float::steal(var_indices[1]);
+                Float  zl = Float::steal(var_indices[2]);
+
+                do {
+                    Mask active_i = xl < 5;
+                    Mask active = Mask::steal(jit_var_mask_apply(
+                        active_i.index(), (uint32_t) jit_var_size(active_i.index())));
+
+                    VarRef loop_cond = VarRef::steal(
+                        jit_var_loop_cond(loop, active.index()));
+
+                    yl += Float(xl);
+                    xl += 1;
+                    zl += 1;
+
+                    var_indices[0] = xl.index();
+                    var_indices[1] = yl.index();
+                    var_indices[2] = zl.index();
+
+                    int rv = jit_var_loop_end(loop, loop_cond, var_indices,
+                                              record_guard.checkpoint);
+                    if (rv) {
+                        x = UInt32::steal(var_indices[0]);
+                        y = Float::steal(var_indices[1]);
+                        z = Float::steal(var_indices[2]);
+                        record_guard.disarm();
+                        break;
+                    }
+                } while (true);
+            }
+
+            if (j == 0) {
+                jit_var_schedule(z.index());
+                jit_var_schedule(y.index());
+                jit_var_schedule(x.index());
+                if (i == 0) {
+                    std::string spv = assemble_and_validate_spirv();
+                    jit_assert(spv.find("OpLoopMerge %loop_exit_r") != std::string::npos);
+                }
+            }
+
+            jit_assert(strcmp(x.str(), "[5, 5, 5, 5, 5, 5, 6, 7, 8, 9]") == 0);
+            jit_assert(strcmp(y.str(), "[10, 10, 9, 7, 4, 0, 0, 0, 0, 0]") == 0);
+            jit_assert(strcmp(z.str(), "[6, 5, 4, 3, 2, 1, 1, 1, 1, 1]") == 0);
+        }
+    }
+
+    // 2. Loop with scatter_reduce side effects (referencing and not referencing loop vars)
+    for (uint32_t i = 0; i < 2; ++i) {
+        jit_set_flag(JitFlag::OptimizeLoops, i == 1);
+
+        UInt32 x = arange<UInt32>(10);
+        Float  y = zeros<Float>(1);
+        UInt32 target1 = zeros<UInt32>(11);
+        UInt32 target2 = zeros<UInt32>(11);
+        {
+            uint32_t var_indices[2] = { x.index(), y.index() };
+            ScopedRecord record_guard(Backend);
+
+            VarRef loop = VarRef::steal(
+                jit_var_loop_start("SideEffectLoop", false, 2, var_indices));
+
+            UInt32 xl = UInt32::steal(var_indices[0]);
+            Float  yl = Float::steal(var_indices[1]);
+
+            do {
+                Mask active_i = xl < 5;
+                Mask active = Mask::steal(jit_var_mask_apply(
+                    active_i.index(), (uint32_t) jit_var_size(active_i.index())));
+
+                VarRef loop_cond = VarRef::steal(
+                    jit_var_loop_cond(loop, active.index()));
+
+                scatter_reduce(ReduceOp::Add, target1, UInt32(1), xl, active);
+                scatter_reduce(ReduceOp::Add, target2, UInt32(2), UInt32(2), active);
+                yl += Float(xl);
+                xl += 1;
+
+                var_indices[0] = xl.index();
+                var_indices[1] = yl.index();
+
+                int rv = jit_var_loop_end(loop, loop_cond, var_indices,
+                                          record_guard.checkpoint);
+                if (rv) {
+                    x = UInt32::steal(var_indices[0]);
+                    y = Float::steal(var_indices[1]);
+                    record_guard.disarm();
+                    break;
+                }
+            } while (true);
+        }
+
+        jit_assert(strcmp(x.str(), "[5, 5, 5, 5, 5, 5, 6, 7, 8, 9]") == 0);
+        jit_assert(strcmp(y.str(), "[10, 10, 9, 7, 4, 0, 0, 0, 0, 0]") == 0);
+        jit_assert(strcmp(target1.str(), "[1, 2, 3, 4, 5, 0, 0, 0, 0, 0, 0]") == 0);
+        jit_assert(strcmp(target2.str(), "[0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0]") == 0);
+    }
+
+    // 3. Loop invariant optimization (04_optimize_invariant)
+    for (uint32_t i = 0; i < 2; ++i) {
+        jit_set_flag(JitFlag::OptimizeLoops, i == 1);
+
+        UInt32 j = 0,
+               v1 = 123, v1_orig = v1,
+               v2 = opaque<UInt32>(123), v2_orig = v2,
+               v3 = 124, v3_orig = v3,
+               v4 = 125, v4_orig = v4,
+               v5 = 1,   v5_orig = v5,
+               v6 = 0,   v6_orig = v6;
+
+        int count = 0;
+        {
+            uint32_t var_indices[7] = {
+                j.index(), v1.index(), v2.index(), v3.index(),
+                v4.index(), v5.index(), v6.index()
+            };
+            ScopedRecord record_guard(Backend);
+
+            VarRef loop = VarRef::steal(
+                jit_var_loop_start("InvariantLoop", false, 7, var_indices));
+
+            UInt32 jl  = UInt32::steal(var_indices[0]),
+                   v1l = UInt32::steal(var_indices[1]),
+                   v2l = UInt32::steal(var_indices[2]),
+                   v3l = UInt32::steal(var_indices[3]),
+                   v4l = UInt32::steal(var_indices[4]),
+                   v5l = UInt32::steal(var_indices[5]),
+                   v6l = UInt32::steal(var_indices[6]);
+            do {
+                Mask active_i = jl < 10;
+                Mask active = Mask::steal(jit_var_mask_apply(
+                    active_i.index(), (uint32_t) jit_var_size(active_i.index())));
+
+                VarRef loop_cond = VarRef::steal(
+                    jit_var_loop_cond(loop, active.index()));
+
+                jl += 1;
+                (void) v1l;
+                (void) v2l;
+                v3l = 124;
+                v4l = 100;
+                (void) v5l;
+                v6l += v5l;
+                ++count;
+
+                var_indices[0] = jl.index();
+                var_indices[1] = v1l.index();
+                var_indices[2] = v2l.index();
+                var_indices[3] = v3l.index();
+                var_indices[4] = v4l.index();
+                var_indices[5] = v5l.index();
+                var_indices[6] = v6l.index();
+                int rv = jit_var_loop_end(loop, loop_cond, var_indices,
+                                          record_guard.checkpoint);
+                if (!rv) {
+                    jl  = UInt32::steal(var_indices[0]);
+                    v1l = UInt32::steal(var_indices[1]);
+                    v2l = UInt32::steal(var_indices[2]);
+                    v3l = UInt32::steal(var_indices[3]);
+                    v4l = UInt32::steal(var_indices[4]);
+                    v5l = UInt32::steal(var_indices[5]);
+                    v6l = UInt32::steal(var_indices[6]);
+                } else {
+                    j  = UInt32::steal(var_indices[0]);
+                    v1 = UInt32::steal(var_indices[1]);
+                    v2 = UInt32::steal(var_indices[2]);
+                    v3 = UInt32::steal(var_indices[3]);
+                    v4 = UInt32::steal(var_indices[4]);
+                    v5 = UInt32::steal(var_indices[5]);
+                    v6 = UInt32::steal(var_indices[6]);
+                    record_guard.disarm();
+                    break;
+                }
+            } while (true);
+        }
+
+        jit_assert(count == (i == 0 ? 1 : 2));
+        if (i == 1) {
+            jit_assert(jit_var_state(v1.index()) == VarState::Literal && v1.index() == v1_orig.index());
+            jit_assert(jit_var_state(v2.index()) != VarState::Literal && v2.index() == v2_orig.index());
+            jit_assert(jit_var_state(v3.index()) == VarState::Literal && v3.index() == v3_orig.index());
+            jit_assert(jit_var_state(v4.index()) != VarState::Literal && v4.index() != v4_orig.index());
+            jit_assert(jit_var_state(v5.index()) == VarState::Literal && v5.index() == v5_orig.index());
+            jit_assert(jit_var_state(v6.index()) != VarState::Literal && v6.index() != v6_orig.index());
+        }
+
+        v4.schedule();
+        v6.schedule();
+        jit_eval();
+        jit_assert(v4.read(0) == 100);
+        jit_assert(v6.read(0) == 10);
+    }
+
+    // 4. Nested Collatz loop (05_collatz)
+    auto collatz = [](const char *name, UInt32 value, bool symbolic) -> UInt32 {
+        UInt32 counter = 0;
+        {
+            uint32_t var_indices[2] = { value.index(), counter.index() };
+            ScopedRecord record_guard(Backend);
+            VarRef loop = VarRef::steal(
+                jit_var_loop_start(name, symbolic, 2, var_indices));
+
+            UInt32 valuel   = UInt32::steal(var_indices[0]),
+                   counterl = UInt32::steal(var_indices[1]);
+            do {
+                Mask active_i = neq(valuel, 1);
+                Mask active = Mask::steal(jit_var_mask_apply(
+                    active_i.index(), (uint32_t) jit_var_size(active_i.index())));
+
+                VarRef loop_cond = VarRef::steal(
+                    jit_var_loop_cond(loop, active.index()));
+
+                Mask is_even = eq(valuel & UInt32(1), 0);
+                valuel = select(is_even, valuel / 2, valuel * 3 + 1);
+                counterl += 1;
+
+                var_indices[0] = valuel.index();
+                var_indices[1] = counterl.index();
+
+                int rv = jit_var_loop_end(loop, loop_cond, var_indices,
+                                          record_guard.checkpoint);
+                if (rv) {
+                    value   = UInt32::steal(var_indices[0]);
+                    counter = UInt32::steal(var_indices[1]);
+                    record_guard.disarm();
+                    break;
+                }
+            } while (true);
+        }
+        return counter;
+    };
+
+    for (uint32_t i = 0; i < 2; ++i) {
+        jit_set_flag(JitFlag::LoopOptimize, i == 1);
+        for (uint32_t j = 0; j < 2; ++j) {
+            UInt32 buf = full<UInt32>(1000, 11);
+            if (j == 0) {
+                UInt32 k = 1;
+                {
+                    uint32_t var_indices[1] = { k.index() };
+                    ScopedRecord record_guard(Backend);
+                    VarRef loop = VarRef::steal(
+                        jit_var_loop_start("Outer", false, 1, var_indices));
+                    UInt32 kl = UInt32::steal(var_indices[0]);
+
+                    do {
+                        Mask active_i = kl <= 10;
+                        Mask active = Mask::steal(jit_var_mask_apply(
+                            active_i.index(), (uint32_t) jit_var_size(active_i.index())));
+                        VarRef loop_cond = VarRef::steal(
+                            jit_var_loop_cond(loop, active.index()));
+
+                        scatter(buf, collatz("Inner", kl, true), kl - 1, active);
+                        kl += 1;
+                        var_indices[0] = kl.index();
+
+                        int rv = jit_var_loop_end(loop, loop_cond, var_indices,
+                                                  record_guard.checkpoint);
+                        if (rv) {
+                            k = UInt32::steal(var_indices[0]);
+                            record_guard.disarm();
+                            break;
+                        }
+                    } while (true);
+                }
+            } else {
+                for (uint32_t k = 1; k <= 10; ++k) {
+                    char tmpname[20];
+                    snprintf(tmpname, sizeof(tmpname), "Inner [%u]", k);
+                    scatter(buf, collatz(tmpname, k, false), UInt32(k - 1));
+                }
+            }
+            jit_assert(strcmp(buf.str(), "[0, 1, 7, 2, 5, 8, 16, 3, 19, 6, 1000]") == 0);
+        }
+    }
+
+    // 5. Nested loop writing to the same variable (06_nested_write)
+    auto inner_loop = [](UInt32 k) -> UInt32 {
+        uint32_t var_indices[1] = { k.index() };
+        ScopedRecord record_guard(Backend);
+        VarRef loop = VarRef::steal(
+            jit_var_loop_start("Inner", true, 1, var_indices));
+        UInt32 kl = UInt32::steal(var_indices[0]);
+
+        do {
+            Mask active_i = neq(kl % 3, 0);
+            Mask active = Mask::steal(jit_var_mask_apply(
+                active_i.index(), (uint32_t) jit_var_size(active_i.index())));
+            VarRef loop_cond = VarRef::steal(
+                jit_var_loop_cond(loop, active.index()));
+
+            kl += 1;
+            var_indices[0] = kl.index();
+            int rv = jit_var_loop_end(loop, loop_cond, var_indices,
+                                      record_guard.checkpoint);
+            if (rv) {
+                k = UInt32::steal(var_indices[0]);
+                record_guard.disarm();
+                break;
+            }
+        } while (true);
+        return k;
+    };
+
+    for (uint32_t i = 0; i < 2; ++i) {
+        jit_set_flag(JitFlag::LoopOptimize, i == 1);
+        UInt32 k = arange<UInt32>(10) * 12;
+        {
+            uint32_t var_indices[1] = { k.index() };
+            ScopedRecord record_guard(Backend);
+            VarRef loop = VarRef::steal(
+                jit_var_loop_start("Outer", false, 1, var_indices));
+            UInt32 kl = UInt32::steal(var_indices[0]);
+
+            do {
+                Mask active_i = neq(kl % 7, 0);
+                Mask active = Mask::steal(jit_var_mask_apply(
+                    active_i.index(), (uint32_t) jit_var_size(active_i.index())));
+                VarRef loop_cond = VarRef::steal(
+                    jit_var_loop_cond(loop, active.index()));
+
+                kl = inner_loop(kl);
+                kl += 1;
+                var_indices[0] = kl.index();
+
+                int rv = jit_var_loop_end(loop, loop_cond, var_indices,
+                                          record_guard.checkpoint);
+                if (rv) {
+                    k = UInt32::steal(var_indices[0]);
+                    record_guard.disarm();
+                    break;
+                }
+            } while (true);
+        }
+        jit_assert(strcmp(k.str(), "[0, 28, 28, 49, 49, 70, 91, 84, 112, 112]") == 0);
+    }
+
+    // 6. Multiple scatters before, inside, and after a loop (09_test_multiple_scatter_loop)
+    {
+        jit_set_flag(JitFlag::KernelHistory, true);
+        jit_set_flag(JitFlag::LoopOptimize, false);
+
+        UInt32 i = zeros<UInt32>(10);
+        UInt32 target = zeros<UInt32>(10);
+        jit_kernel_history_clear();
+
+        scatter(target, UInt32(1), UInt32(0), true);
+        {
+            uint32_t var_indices[1] = { i.index() };
+            ScopedRecord record_guard(Backend);
+            VarRef loop = VarRef::steal(
+                jit_var_loop_start("MultiScatterLoop", false, 1, var_indices));
+            UInt32 il = UInt32::steal(var_indices[0]);
+
+            do {
+                Mask active_i = il < 1;
+                Mask active = Mask::steal(jit_var_mask_apply(
+                    active_i.index(), (uint32_t) jit_var_size(active_i.index())));
+                VarRef loop_cond = VarRef::steal(
+                    jit_var_loop_cond(loop, active.index()));
+
+                scatter(target, UInt32(1), UInt32(1), active);
+                scatter(target, UInt32(1), UInt32(2), active);
+                scatter(target, UInt32(1), UInt32(3), active);
+                il += 1;
+                var_indices[0] = il.index();
+
+                int rv = jit_var_loop_end(loop, loop_cond, var_indices,
+                                          record_guard.checkpoint);
+                if (rv) {
+                    i = UInt32::steal(var_indices[0]);
+                    record_guard.disarm();
+                    break;
+                }
+            } while (true);
+        }
+        scatter(target, UInt32(1), UInt32(4), true);
+
+        jit_assert(strcmp(target.str(), "[1, 1, 1, 1, 1, 0, 0, 0, 0, 0]") == 0);
+
+        size_t kernel_launches = 0;
+        {
+            KernelHistory *h = jit_kernel_history_view(0);
+            for (size_t k = 0; k < jit_kernel_history_size(h); ++k) {
+                KernelType type = (KernelType) (uint32_t) jit_kernel_history_query(
+                    h, k, KernelHistoryField::Type);
+                if (type == KernelType::JIT)
+                    kernel_launches++;
+            }
+            jit_kernel_history_free(h);
+        }
+        jit_kernel_history_clear();
+        jit_assert(kernel_launches == 3);
+        jit_set_flag(JitFlag::KernelHistory, false);
+        jit_set_flag(JitFlag::LoopOptimize, true);
+    }
+}
+
+TEST_VULKAN(26_local_arrays) {
+    // 1. Literal index read/write
+    {
+        LocalArr<Float> x(10);
+        for (int i = 0; i < 10; ++i)
+            x.write(i, i);
+        Float result = 0;
+        for (int i = 0; i < 10; ++i)
+            result += x.read(i);
+        jit_assert(result.read(0) == 45);
+        jit_assert(x.length() == 10);
+    }
+
+    // 2. Opaque dynamic index read/write + LVN check
+    {
+        LocalArr<Float> x(10);
+        UInt32 opaque_0 = opaque<UInt32>(0);
+        for (int i = 0; i < 10; ++i)
+            x.write(UInt32(i) + opaque_0, i);
+        Float result = 0;
+        for (int i = 0; i < 10; ++i) {
+            Float a = x.read(UInt32(i) + opaque_0);
+            Float b = x.read(UInt32(i) + opaque_0);
+            jit_assert(a.index() == b.index());
+            result += a;
+        }
+        jit_assert(result.read(0) == 45);
+    }
+
+    // 3. Literal & dynamic index masked read/write
+    {
+        UInt32 opaque_0 = opaque<UInt32>(0);
+        UInt32 opaque_1 = opaque<UInt32>(1);
+
+        LocalArr<Float> x(10);
+        for (int i = 0; i < 10; ++i)
+            x.write(i, i);
+        Float r1 = 0, r2 = 0;
+        for (int i = 0; i < 10; ++i) {
+            r1 += x.read(i, Mask(UInt32(i) & opaque_1));
+            r2 += x.read(UInt32(i) + opaque_0, Mask(UInt32(i) & opaque_1));
+        }
+        jit_assert(r1.read(0) == 25);
+        jit_assert(r2.read(0) == 25);
+
+        LocalArr<Float> y(10, 0);
+        LocalArr<Float> z(10, 0);
+        for (int i = 0; i < 10; ++i) {
+            y.write(i, i, Mask(UInt32(i) & opaque_1));
+            z.write(UInt32(i) + opaque_0, Float(i), Mask(UInt32(i) & opaque_1));
+        }
+        Float ry = 0, rz = 0;
+        for (int i = 0; i < 10; ++i) {
+            ry += y.read(i);
+            rz += z.read(UInt32(i) + opaque_0);
+        }
+        jit_assert(ry.read(0) == 25);
+        jit_assert(rz.read(0) == 25);
+    }
+
+    // 4. Conflict copy-on-write (05_conflict) and eval conflict (09_write_eval_conflict)
+    {
+        LocalArr<Float> x(10);
+        for (int i = 0; i < 10; ++i)
+            x.write(i, i);
+
+        LocalArr<Float> y(x);
+        for (int i = 0; i < 10; ++i)
+            y.write(i, UInt32(i) + 10);
+
+        Float result_1 = 0, result_2 = 0;
+        for (int i = 0; i < 10; ++i) {
+            result_1 += x.read(UInt32(i));
+            result_2 += y.read(UInt32(i));
+        }
+        result_1.schedule();
+        result_2.schedule();
+        assemble_and_validate_spirv();
+        jit_assert(result_1.read(0) == 45 && result_2.read(0) == 145);
+
+        LocalArr<Float> a(2, 1);
+        LocalArr<Float> b(a);
+        a.write(0, 2);
+        a.write(1, 3);
+        a.schedule();
+        b.schedule();
+        assemble_and_validate_spirv();
+
+        Float aa = a.read(0) + a.read(1);
+        Float bb = b.read(0) + b.read(1);
+        aa.schedule();
+        bb.schedule();
+        assemble_and_validate_spirv();
+        jit_assert(aa.read(0) == 5 && bb.read(0) == 2);
+    }
+
+    // 5. Evaluate multi-lane array to global memory and read back (06_eval_array)
+    {
+        LocalArr<Float> x(10);
+        Float offset = arange<Float>(3);
+        for (int i = 0; i < 10; ++i)
+            x.write(i, Float(i) + offset);
+        x.eval();
+
+        Float result = 0;
+        for (int i = 0; i < 10; ++i)
+            result += x.read(UInt32(i));
+        jit_assert(result.read(0) == 45);
+        jit_assert(result.read(1) == 55);
+        jit_assert(result.read(2) == 65);
+    }
+
+    // 6. Per-lane complex modulo indexing (08_complex_indexing)
+    {
+        LocalArr<Float> x(10, 0);
+        UInt32 index = arange<UInt32>(3);
+        for (int i = 0; i < 10; ++i)
+            x.write((index + UInt32(i)) % 10, Float(i), Mask(UInt32(i) & 1));
+        Float r = 0;
+        for (int i = 0; i < 10; ++i)
+            r += x.read((index + UInt32(i)) % 10);
+        jit_assert(r.read(0) == 25 && r.read(1) == 25 && r.read(2) == 25);
+    }
+
+    // 7. Boolean mask arrays (10_mask_simple, 11_mask_eval, 13_mask_conflict)
+    {
+        LocalArr<Mask> x(10, false);
+        LocalArr<Mask> y(10, true);
+        for (int i = 0; i < 10; ++i)
+            x.write(i, Mask(i & 1));
+        x.schedule();
+        y.schedule();
+        assemble_and_validate_spirv();
+
+        UInt32 ctr_1 = 0, ctr_2 = 0;
+        for (int i = 0; i < 10; ++i) {
+            ctr_1 += UInt32(x.read(i));
+            ctr_2 += UInt32(y.read(i));
+        }
+        ctr_1.schedule();
+        ctr_2.schedule();
+        assemble_and_validate_spirv();
+        jit_assert(ctr_1.read(0) == 5 && ctr_2.read(0) == 10);
+
+        LocalArr<Mask> m1(2, true);
+        LocalArr<Mask> m2(m1);
+        m1.write(0, false);
+        UInt32 mc1 = UInt32(m1.read(0)) + UInt32(m1.read(1));
+        UInt32 mc2 = UInt32(m2.read(0)) + UInt32(m2.read(1));
+        mc1.schedule();
+        mc2.schedule();
+        jit_assert(mc1.read(0) == 1 && mc2.read(0) == 2);
+    }
+
+    // 8. ArraySelect (select between two local arrays)
+    {
+        UInt32 lane = arange<UInt32>(4);
+        LocalArr<Float> a(4, 0.f);
+        LocalArr<Float> b(4, 0.f);
+        for (uint32_t i = 0; i < 4; ++i) {
+            a.write(i, Float(lane) + Float(i * 10));
+            b.write(i, Float(lane) + Float(i * 100));
+        }
+        Mask m = eq(lane & UInt32(1), UInt32(0));
+        LocalArr<Float> s = LocalArr<Float>::steal(
+            jit_var_select(m.index(), a.m_index, b.m_index));
+
+        Float total = 0.f;
+        for (uint32_t i = 0; i < 4; ++i)
+            total += s.read(i);
+        assemble_and_validate_spirv(total.index());
+
+        for (uint32_t l = 0; l < 4; ++l) {
+            float exp = 0.f;
+            for (uint32_t i = 0; i < 4; ++i)
+                exp += (l % 2 == 0) ? (l + i * 10.f) : (l + i * 100.f);
+            jit_assert(total.read(l) == exp);
+        }
+    }
+
+    // 9. Local array inside a symbolic loop (LoopPhi + ArrayPhi)
+    {
+        UInt32 lane = arange<UInt32>(4);
+        LocalArr<UInt32> arr(4, 0u);
+        UInt32 i = zeros<UInt32>(4);
+        {
+            uint32_t var_indices[2] = { i.index(), arr.m_index };
+            ScopedRecord record_guard(Backend);
+            VarRef loop = VarRef::steal(
+                jit_var_loop_start("ArrayLoop", false, 2, var_indices));
+
+            UInt32 il = UInt32::steal(var_indices[0]);
+            LocalArr<UInt32> arrl = LocalArr<UInt32>::steal(var_indices[1]);
+
+            do {
+                Mask active_i = il < 4;
+                Mask active = Mask::steal(jit_var_mask_apply(
+                    active_i.index(), (uint32_t) jit_var_size(active_i.index())));
+                VarRef loop_cond = VarRef::steal(
+                    jit_var_loop_cond(loop, active.index()));
+
+                arrl.write(il, (lane + 1u) * (il + 10u), active);
+                il += 1;
+
+                var_indices[0] = il.index();
+                var_indices[1] = arrl.m_index;
+
+                int rv = jit_var_loop_end(loop, loop_cond, var_indices,
+                                          record_guard.checkpoint);
+                if (rv) {
+                    i   = UInt32::steal(var_indices[0]);
+                    arr = LocalArr<UInt32>::steal(var_indices[1]);
+                    record_guard.disarm();
+                    break;
+                } else {
+                    il   = UInt32::steal(var_indices[0]);
+                    arrl = LocalArr<UInt32>::steal(var_indices[1]);
+                }
+            } while (true);
+        }
+
+        UInt32 sum = 0u;
+        for (uint32_t k = 0; k < 4; ++k)
+            sum += arr.read(k);
+        assemble_and_validate_spirv(sum.index());
+
+        for (uint32_t l = 0; l < 4; ++l) {
+            uint32_t exp = (l + 1u) * (10u + 11u + 12u + 13u);
+            jit_assert(sum.read(l) == exp);
+        }
+    }
+
+    // 10. tile and repeat
+    {
+        UInt32 x = tile(arange<UInt32>(3), 3);
+        jit_assert(strcmp(x.str(), "[0, 1, 2, 0, 1, 2, 0, 1, 2]") == 0);
+        UInt32 y = repeat(arange<UInt32>(3), 3);
+        jit_assert(strcmp(y.str(), "[0, 0, 0, 1, 1, 1, 2, 2, 2]") == 0);
+    }
+}
+

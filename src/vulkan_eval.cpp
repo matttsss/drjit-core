@@ -28,6 +28,9 @@
 #include "vulkan_eval.h"
 #include "op.h"
 #include "call.h"
+#include "cond.h"
+#include "loop.h"
+#include "array.h"
 #include <tsl/robin_set.h>
 #include <algorithm>
 
@@ -47,124 +50,60 @@ static void jitc_vulkan_render(Variable *v);
 
 static const VulkanDevice *active_vulkan_dev = nullptr;
 
-static bool emitted_types         [(size_t) VarType::Count];
-static bool emitted_psb_ptrs      [(size_t) VarType::Count];
-static bool emitted_fn_ptrs       [(size_t) VarType::Count];
-static bool emitted_zero_consts   [(size_t) VarType::Count];
-static bool emitted_one_consts    [(size_t) VarType::Count];
-static bool emitted_ones_consts   [(size_t) VarType::Count];
-static bool emitted_nan_consts    [(size_t) VarType::Count];
-static bool emitted_sign_consts   [(size_t) VarType::Count];
-static bool emitted_mul_structs   [(size_t) VarType::Count];
-static bool emitted_vec2_types    [(size_t) VarType::Count];
-static bool emitted_vec4_types    [(size_t) VarType::Count];
-static bool emitted_psb_vec2_ptrs [(size_t) VarType::Count];
-static bool emitted_psb_vec4_ptrs [(size_t) VarType::Count];
-static bool emitted_vec2_zeros    [(size_t) VarType::Count];
-static bool emitted_vec4_zeros    [(size_t) VarType::Count];
+enum EmittedFlag : uint16_t {
+    EmittedType       = 1u << 0,
+    EmittedPsbPtr     = 1u << 1,
+    EmittedFnPtr      = 1u << 2,
+    EmittedZero       = 1u << 3,
+    EmittedOne        = 1u << 4,
+    EmittedOnes       = 1u << 5,
+    EmittedNan        = 1u << 6,
+    EmittedSign       = 1u << 7,
+    EmittedMulStruct  = 1u << 8,
+    EmittedVec2Type   = 1u << 9,
+    EmittedVec4Type   = 1u << 10,
+    EmittedPsbVec2Ptr = 1u << 11,
+    EmittedPsbVec4Ptr = 1u << 12,
+    EmittedVec2Zero   = 1u << 13,
+    EmittedVec4Zero   = 1u << 14,
+};
 
+enum SpvFlag : uint32_t {
+    SpvCapInt8           = 1u << 0,
+    SpvCapStorage8Bit    = 1u << 1,
+    SpvCapInt16          = 1u << 2,
+    SpvCapStorage16Bit   = 1u << 3,
+    SpvCapFloat16        = 1u << 4,
+    SpvCapFloat64        = 1u << 5,
+    SpvCapInt64Atomics   = 1u << 6,
+    SpvCapAtomicF32Add   = 1u << 7,
+    SpvCapAtomicF64Add   = 1u << 8,
+    SpvCapSubgroup       = 1u << 9,
+    SpvNeedGlsl450       = 1u << 10,
+    SpvBoolStorageConsts = 1u << 11,
+};
+
+static uint16_t emitted_flags[(size_t) VarType::Count];
+static uint32_t spv_flags = 0;
 static tsl::robin_set<uint32_t> emitted_u32_consts;
-
-static bool has_bool_storage_consts = false;
-static bool need_glsl450 = false;
-
-static bool cap_int8            = false;
-static bool cap_storage_8bit    = false;
-static bool cap_int16           = false;
-static bool cap_storage_16bit   = false;
-static bool cap_float16         = false;
-static bool cap_float64         = false;
-static bool cap_int64_atomics   = false;
-static bool cap_atomic_f32_add  = false;
-static bool cap_atomic_f64_add  = false;
-static bool ext_atomic_float_add = false;
-static bool cap_subgroup        = false;
+static tsl::robin_set<uint32_t> emitted_fn_arr_types;
+static uint32_t spv_aux_id = 0;
 
 static char current_block_label[64];
 
-static const char *psb_ptr_names[(size_t) VarType::Count] = {
-    "???",           "%ptr_psb_u8",  "???",           "%ptr_psb_i8",
-    "%ptr_psb_u8",   "%ptr_psb_i16", "%ptr_psb_u16",  "%ptr_psb_i32",
-    "%ptr_psb_u32",  "%ptr_psb_i64", "%ptr_psb_u64",  "%ptr_psb_u64",
-    "???",           "%ptr_psb_f16", "%ptr_psb_f32",  "%ptr_psb_f64"
-};
+static bool jitc_vulkan_mark_emitted(uint32_t idx, EmittedFlag flag) {
+    bool already = (emitted_flags[idx] & flag) != 0;
+    emitted_flags[idx] |= flag;
+    return already;
+}
 
-static const char *fn_ptr_names[(size_t) VarType::Count] = {
-    "???",          "%ptr_fn_bool", "???",          "%ptr_fn_i8",
-    "%ptr_fn_u8",   "%ptr_fn_i16",  "%ptr_fn_u16",  "%ptr_fn_i32",
-    "%ptr_fn_u32",  "%ptr_fn_i64",  "%ptr_fn_u64",  "%ptr_fn_u64",
-    "???",          "%ptr_fn_f16",  "%ptr_fn_f32",  "%ptr_fn_f64"
-};
-
-static const char *zero_const_names[(size_t) VarType::Count] = {
-    "???",          "%c_zero_bool", "???",          "%c_zero_i8",
-    "%c_zero_u8",   "%c_zero_i16",  "%c_zero_u16",  "%c_zero_i32",
-    "%c_zero_u32",  "%c_zero_i64",  "%c_zero_u64",  "%c_zero_u64",
-    "???",          "%c_zero_f16",  "%c_zero_f32",  "%c_zero_f64"
-};
-
-static const char *one_const_names[(size_t) VarType::Count] = {
-    "???",          "%c_one_bool",  "???",          "%c_one_i8",
-    "%c_one_u8",    "%c_one_i16",   "%c_one_u16",   "%c_one_i32",
-    "%c_one_u32",   "%c_one_i64",   "%c_one_u64",   "%c_one_u64",
-    "???",          "%c_one_f16",   "%c_one_f32",   "%c_one_f64"
-};
-
-static const char *ones_const_names[(size_t) VarType::Count] = {
-    "???",          "%c_one_bool",  "???",          "%c_ones_i8",
-    "%c_ones_u8",   "%c_ones_i16",  "%c_ones_u16",  "%c_ones_i32",
-    "%c_ones_u32",  "%c_ones_i64",  "%c_ones_u64",  "%c_ones_u64",
-    "???",          "???",          "???",          "???"
-};
-
-static const char *mul_struct_names[(size_t) VarType::Count] = {
-    "???",              "???",              "???",              "%struct_mul_i8",
-    "%struct_mul_u8",   "%struct_mul_i16",  "%struct_mul_u16",  "%struct_mul_i32",
-    "%struct_mul_u32",  "%struct_mul_i64",  "%struct_mul_u64",  "%struct_mul_u64",
-    "???",              "???",              "???",              "???"
-};
-
-static const char *vec2_type_names[(size_t) VarType::Count] = {
-    "???",       "%v2_u8",  "???",       "%v2_i8",
-    "%v2_u8",    "%v2_i16", "%v2_u16",   "%v2_i32",
-    "%v2_u32",   "%v2_i64", "%v2_u64",   "%v2_u64",
-    "???",       "%v2_f16", "%v2_f32",   "%v2_f64"
-};
-
-static const char *vec4_type_names[(size_t) VarType::Count] = {
-    "???",       "%v4_u8",  "???",       "%v4_i8",
-    "%v4_u8",    "%v4_i16", "%v4_u16",   "%v4_i32",
-    "%v4_u32",   "%v4_i64", "%v4_u64",   "%v4_u64",
-    "???",       "%v4_f16", "%v4_f32",   "%v4_f64"
-};
-
-static const char *psb_vec2_ptr_names[(size_t) VarType::Count] = {
-    "???",               "%ptr_psb_v2_u8",  "???",               "%ptr_psb_v2_i8",
-    "%ptr_psb_v2_u8",    "%ptr_psb_v2_i16", "%ptr_psb_v2_u16",   "%ptr_psb_v2_i32",
-    "%ptr_psb_v2_u32",   "%ptr_psb_v2_i64", "%ptr_psb_v2_u64",   "%ptr_psb_v2_u64",
-    "???",               "%ptr_psb_v2_f16", "%ptr_psb_v2_f32",   "%ptr_psb_v2_f64"
-};
-
-static const char *psb_vec4_ptr_names[(size_t) VarType::Count] = {
-    "???",               "%ptr_psb_v4_u8",  "???",               "%ptr_psb_v4_i8",
-    "%ptr_psb_v4_u8",    "%ptr_psb_v4_i16", "%ptr_psb_v4_u16",   "%ptr_psb_v4_i32",
-    "%ptr_psb_v4_u32",   "%ptr_psb_v4_i64", "%ptr_psb_v4_u64",   "%ptr_psb_v4_u64",
-    "???",               "%ptr_psb_v4_f16", "%ptr_psb_v4_f32",   "%ptr_psb_v4_f64"
-};
-
-static const char *vec2_zero_names[(size_t) VarType::Count] = {
-    "???",              "%c_zero_v2_u8",  "???",              "%c_zero_v2_i8",
-    "%c_zero_v2_u8",    "%c_zero_v2_i16", "%c_zero_v2_u16",   "%c_zero_v2_i32",
-    "%c_zero_v2_u32",   "%c_zero_v2_i64", "%c_zero_v2_u64",   "%c_zero_v2_u64",
-    "???",              "%c_zero_v2_f16", "%c_zero_v2_f32",   "%c_zero_v2_f64"
-};
-
-static const char *vec4_zero_names[(size_t) VarType::Count] = {
-    "???",              "%c_zero_v4_u8",  "???",              "%c_zero_v4_i8",
-    "%c_zero_v4_u8",    "%c_zero_v4_i16", "%c_zero_v4_u16",   "%c_zero_v4_i32",
-    "%c_zero_v4_u32",   "%c_zero_v4_i64", "%c_zero_v4_u64",   "%c_zero_v4_u64",
-    "???",              "%c_zero_v4_f16", "%c_zero_v4_f32",   "%c_zero_v4_f64"
-};
+static const char *jitc_vulkan_id(const char *prefix, uint32_t idx) {
+    static char bufs[16][24];
+    static uint32_t slot = 0;
+    char *buf = bufs[slot++ & 15];
+    snprintf(buf, sizeof(bufs[0]), "%s%s", prefix, type_name_vulkan[idx] + 1);
+    return buf;
+}
 
 static void jitc_vulkan_set_label(const char *prefix, uint32_t reg_index) {
     snprintf(current_block_label, sizeof(current_block_label),
@@ -178,43 +117,17 @@ void jitc_vulkan_assemble_reset() {
     spv_func_locals.clear();
     spv_body.clear();
 
-    memset(emitted_types, 0, sizeof(emitted_types));
-    memset(emitted_psb_ptrs, 0, sizeof(emitted_psb_ptrs));
-    memset(emitted_fn_ptrs, 0, sizeof(emitted_fn_ptrs));
-    memset(emitted_zero_consts, 0, sizeof(emitted_zero_consts));
-    memset(emitted_one_consts, 0, sizeof(emitted_one_consts));
-    memset(emitted_ones_consts, 0, sizeof(emitted_ones_consts));
-    memset(emitted_nan_consts, 0, sizeof(emitted_nan_consts));
-    memset(emitted_sign_consts, 0, sizeof(emitted_sign_consts));
-    memset(emitted_mul_structs, 0, sizeof(emitted_mul_structs));
-    memset(emitted_vec2_types, 0, sizeof(emitted_vec2_types));
-    memset(emitted_vec4_types, 0, sizeof(emitted_vec4_types));
-    memset(emitted_psb_vec2_ptrs, 0, sizeof(emitted_psb_vec2_ptrs));
-    memset(emitted_psb_vec4_ptrs, 0, sizeof(emitted_psb_vec4_ptrs));
-    memset(emitted_vec2_zeros, 0, sizeof(emitted_vec2_zeros));
-    memset(emitted_vec4_zeros, 0, sizeof(emitted_vec4_zeros));
+    memset(emitted_flags, 0, sizeof(emitted_flags));
+    spv_flags = 0;
     emitted_u32_consts.clear();
-
-    has_bool_storage_consts = false;
-    need_glsl450 = false;
-
-    cap_int8             = false;
-    cap_storage_8bit     = false;
-    cap_int16            = false;
-    cap_storage_16bit    = false;
-    cap_float16          = false;
-    cap_float64          = false;
-    cap_int64_atomics    = false;
-    cap_atomic_f32_add   = false;
-    cap_atomic_f64_add   = false;
-    ext_atomic_float_add = false;
-    cap_subgroup         = false;
+    emitted_fn_arr_types.clear();
+    spv_aux_id = 0;
 
     snprintf(current_block_label, sizeof(current_block_label), "%%loop_body");
 }
 
 void jitc_vulkan_require_glsl450() {
-    need_glsl450 = true;
+    spv_flags |= SpvNeedGlsl450;
 }
 
 void jitc_vulkan_require_type(VarType vt) {
@@ -222,7 +135,7 @@ void jitc_vulkan_require_type(VarType vt) {
         vt = VarType::UInt64;
 
     uint32_t idx = (uint32_t) vt;
-    if (emitted_types[idx])
+    if (jitc_vulkan_mark_emitted(idx, EmittedType))
         return;
 
     const VulkanDevice &dev = *active_vulkan_dev;
@@ -237,51 +150,35 @@ void jitc_vulkan_require_type(VarType vt) {
             break;
 
         case VarType::Int8:
-            if (unlikely(!dev.shader_int8))
-                jitc_raise("jit_eval(): the Vulkan device \"%s\" does not "
-                           "support 8-bit integers (shaderInt8)!", dev.name);
-            cap_int8 = true;
-            put_tc("%i8 = OpTypeInt 8 1\n");
-            break;
-
         case VarType::UInt8:
             if (unlikely(!dev.shader_int8))
                 jitc_raise("jit_eval(): the Vulkan device \"%s\" does not "
                            "support 8-bit integers (shaderInt8)!", dev.name);
-            cap_int8 = true;
-            put_tc("%u8 = OpTypeInt 8 0\n");
+            spv_flags |= SpvCapInt8;
+            fmt_tc("$s = OpTypeInt 8 $u\n", type_name_vulkan[idx],
+                   vt == VarType::Int8 ? 1u : 0u);
             break;
 
         case VarType::Int16:
-            if (unlikely(!dev.shader_int16))
-                jitc_raise("jit_eval(): the Vulkan device \"%s\" does not "
-                           "support 16-bit integers (shaderInt16)!", dev.name);
-            cap_int16 = true;
-            put_tc("%i16 = OpTypeInt 16 1\n");
-            break;
-
         case VarType::UInt16:
             if (unlikely(!dev.shader_int16))
                 jitc_raise("jit_eval(): the Vulkan device \"%s\" does not "
                            "support 16-bit integers (shaderInt16)!", dev.name);
-            cap_int16 = true;
-            put_tc("%u16 = OpTypeInt 16 0\n");
+            spv_flags |= SpvCapInt16;
+            fmt_tc("$s = OpTypeInt 16 $u\n", type_name_vulkan[idx],
+                   vt == VarType::Int16 ? 1u : 0u);
             break;
 
         case VarType::Int32:
-            put_tc("%i32 = OpTypeInt 32 1\n");
-            break;
-
         case VarType::UInt32:
-            put_tc("%u32 = OpTypeInt 32 0\n");
+            fmt_tc("$s = OpTypeInt 32 $u\n", type_name_vulkan[idx],
+                   vt == VarType::Int32 ? 1u : 0u);
             break;
 
         case VarType::Int64:
-            put_tc("%i64 = OpTypeInt 64 1\n");
-            break;
-
         case VarType::UInt64:
-            put_tc("%u64 = OpTypeInt 64 0\n");
+            fmt_tc("$s = OpTypeInt 64 $u\n", type_name_vulkan[idx],
+                   vt == VarType::Int64 ? 1u : 0u);
             break;
 
         case VarType::Float16:
@@ -289,7 +186,7 @@ void jitc_vulkan_require_type(VarType vt) {
                 jitc_raise("jit_eval(): the Vulkan device \"%s\" does not "
                            "support 16-bit floating-point arithmetic (shaderFloat16)!",
                            dev.name);
-            cap_float16 = true;
+            spv_flags |= SpvCapFloat16;
             put_tc("%f16 = OpTypeFloat 16\n");
             break;
 
@@ -302,15 +199,13 @@ void jitc_vulkan_require_type(VarType vt) {
                 jitc_raise("jit_eval(): the Vulkan device \"%s\" does not "
                            "support 64-bit floating-point arithmetic (shaderFloat64)!",
                            dev.name);
-            cap_float64 = true;
+            spv_flags |= SpvCapFloat64;
             put_tc("%f64 = OpTypeFloat 64\n");
             break;
 
         default:
             jitc_fail("jitc_vulkan_require_type(): unsupported type %u!", idx);
     }
-
-    emitted_types[idx] = true;
 }
 
 const char *jitc_vulkan_require_psb_ptr(VarType vt) {
@@ -320,8 +215,8 @@ const char *jitc_vulkan_require_psb_ptr(VarType vt) {
         vt = VarType::UInt64;
 
     uint32_t idx = (uint32_t) vt;
-    const char *ptr_name = psb_ptr_names[idx];
-    if (emitted_psb_ptrs[idx])
+    const char *ptr_name = jitc_vulkan_id("%ptr_psb_", idx);
+    if (jitc_vulkan_mark_emitted(idx, EmittedPsbPtr))
         return ptr_name;
 
     jitc_vulkan_require_type(vt);
@@ -333,20 +228,18 @@ const char *jitc_vulkan_require_psb_ptr(VarType vt) {
             jitc_raise("jit_eval(): the Vulkan device \"%s\" does not "
                        "support 8-bit storage buffer access "
                        "(storageBuffer8BitAccess)!", dev.name);
-        cap_storage_8bit = true;
+        spv_flags |= SpvCapStorage8Bit;
     } else if (elem_size == 2) {
         if (unlikely(!dev.storage_buffer_16bit))
             jitc_raise("jit_eval(): the Vulkan device \"%s\" does not "
                        "support 16-bit storage buffer access "
                        "(storageBuffer16BitAccess)!", dev.name);
-        cap_storage_16bit = true;
+        spv_flags |= SpvCapStorage16Bit;
     }
 
     fmt_annot("OpDecorate $s ArrayStride $u\n", ptr_name, elem_size);
     fmt_tc("$s = OpTypePointer PhysicalStorageBuffer $s\n",
            ptr_name, type_name_vulkan[idx]);
-
-    emitted_psb_ptrs[idx] = true;
     return ptr_name;
 }
 
@@ -355,14 +248,12 @@ const char *jitc_vulkan_require_fn_ptr(VarType vt) {
         vt = VarType::UInt64;
 
     uint32_t idx = (uint32_t) vt;
-    const char *ptr_name = fn_ptr_names[idx];
-    if (emitted_fn_ptrs[idx])
+    const char *ptr_name = jitc_vulkan_id("%ptr_fn_", idx);
+    if (jitc_vulkan_mark_emitted(idx, EmittedFnPtr))
         return ptr_name;
 
     jitc_vulkan_require_type(vt);
     fmt_tc("$s = OpTypePointer Function $s\n", ptr_name, type_name_vulkan[idx]);
-
-    emitted_fn_ptrs[idx] = true;
     return ptr_name;
 }
 
@@ -375,10 +266,10 @@ void jitc_vulkan_require_u32_const(uint32_t value) {
 void jitc_vulkan_require_bool_storage() {
     jitc_vulkan_require_type(VarType::Bool);
     jitc_vulkan_require_psb_ptr(VarType::UInt8);
-    if (!has_bool_storage_consts) {
+    if (!(spv_flags & SpvBoolStorageConsts)) {
         put_tc("%c_u8_0 = OpConstant %u8 0\n"
                "%c_u8_1 = OpConstant %u8 1\n");
-        has_bool_storage_consts = true;
+        spv_flags |= SpvBoolStorageConsts;
     }
 }
 
@@ -411,14 +302,12 @@ const char *jitc_vulkan_require_zero(VarType vt) {
         vt = VarType::UInt64;
 
     uint32_t idx = (uint32_t) vt;
-    const char *name = zero_const_names[idx];
-    if (emitted_zero_consts[idx])
+    const char *name = jitc_vulkan_id("%c_zero_", idx);
+    if (jitc_vulkan_mark_emitted(idx, EmittedZero))
         return name;
 
     jitc_vulkan_require_type(vt);
     fmt_tc("$s = OpConstantNull $s\n", name, type_name_vulkan[idx]);
-
-    emitted_zero_consts[idx] = true;
     return name;
 }
 
@@ -427,8 +316,8 @@ static const char *jitc_vulkan_require_one(VarType vt) {
         vt = VarType::UInt64;
 
     uint32_t idx = (uint32_t) vt;
-    const char *name = one_const_names[idx];
-    if (emitted_one_consts[idx])
+    const char *name = jitc_vulkan_id("%c_one_", idx);
+    if (jitc_vulkan_mark_emitted(idx, EmittedOne))
         return name;
 
     jitc_vulkan_require_type(vt);
@@ -449,8 +338,6 @@ static const char *jitc_vulkan_require_one(VarType vt) {
             fmt_tc("$s = OpConstant $s 1\n", name, type_name_vulkan[idx]);
             break;
     }
-
-    emitted_one_consts[idx] = true;
     return name;
 }
 
@@ -461,8 +348,8 @@ static const char *jitc_vulkan_require_ones(VarType vt) {
         return jitc_vulkan_require_one(VarType::Bool);
 
     uint32_t idx = (uint32_t) vt;
-    const char *name = ones_const_names[idx];
-    if (emitted_ones_consts[idx])
+    const char *name = jitc_vulkan_id("%c_ones_", idx);
+    if (jitc_vulkan_mark_emitted(idx, EmittedOnes))
         return name;
 
     jitc_vulkan_require_type(vt);
@@ -477,71 +364,47 @@ static const char *jitc_vulkan_require_ones(VarType vt) {
     }
 
     fmt_tc("$s = OpConstant $s $s\n", name, type_name_vulkan[idx], val_str);
-
-    emitted_ones_consts[idx] = true;
     return name;
 }
 
 static const char *jitc_vulkan_require_nan(VarType vt) {
     uint32_t idx = (uint32_t) vt;
-    const char *name = nullptr;
+    const char *name = jitc_vulkan_id("%c_nan_", idx);
     const char *val_str = nullptr;
     switch (vt) {
-        case VarType::Float16:
-            name = "%c_nan_f16";
-            val_str = "!0x7e00";
-            break;
-        case VarType::Float32:
-            name = "%c_nan_f32";
-            val_str = "!0x7fc00000";
-            break;
-        case VarType::Float64:
-            name = "%c_nan_f64";
-            val_str = "!0x0 !0x7ff80000";
-            break;
+        case VarType::Float16: val_str = "!0x7e00";            break;
+        case VarType::Float32: val_str = "!0x7fc00000";        break;
+        case VarType::Float64: val_str = "!0x0 !0x7ff80000";   break;
         default:
             jitc_fail("jitc_vulkan_require_nan(): unsupported type %u!", idx);
     }
 
-    if (emitted_nan_consts[idx])
+    if (jitc_vulkan_mark_emitted(idx, EmittedNan))
         return name;
 
     jitc_vulkan_require_type(vt);
     fmt_tc("$s = OpConstant $s $s\n", name, type_name_vulkan[idx], val_str);
-
-    emitted_nan_consts[idx] = true;
     return name;
 }
 
 static const char *jitc_vulkan_require_sign_mask(VarType vt) {
     VarType ut = jitc_vulkan_uint_type(vt);
     uint32_t idx = (uint32_t) ut;
-    const char *name = nullptr;
+    const char *name = jitc_vulkan_id("%c_sign_", idx);
     const char *val_str = nullptr;
     switch (ut) {
-        case VarType::UInt16:
-            name = "%c_sign_u16";
-            val_str = "0x8000";
-            break;
-        case VarType::UInt32:
-            name = "%c_sign_u32";
-            val_str = "0x80000000";
-            break;
-        case VarType::UInt64:
-            name = "%c_sign_u64";
-            val_str = "0x8000000000000000";
-            break;
+        case VarType::UInt16: val_str = "0x8000";             break;
+        case VarType::UInt32: val_str = "0x80000000";         break;
+        case VarType::UInt64: val_str = "0x8000000000000000"; break;
         default:
             jitc_fail("jitc_vulkan_require_sign_mask(): unsupported type %u!", idx);
     }
 
-    if (emitted_sign_consts[idx])
+    if (jitc_vulkan_mark_emitted(idx, EmittedSign))
         return name;
 
     jitc_vulkan_require_type(ut);
     fmt_tc("$s = OpConstant $s $s\n", name, type_name_vulkan[idx], val_str);
-
-    emitted_sign_consts[idx] = true;
     return name;
 }
 
@@ -550,15 +413,13 @@ static const char *jitc_vulkan_require_mul_struct(VarType vt) {
         vt = VarType::UInt64;
 
     uint32_t idx = (uint32_t) vt;
-    const char *name = mul_struct_names[idx];
-    if (emitted_mul_structs[idx])
+    const char *name = jitc_vulkan_id("%struct_mul_", idx);
+    if (jitc_vulkan_mark_emitted(idx, EmittedMulStruct))
         return name;
 
     jitc_vulkan_require_type(vt);
     const char *tname = type_name_vulkan[idx];
     fmt_tc("$s = OpTypeStruct $s $s\n", name, tname, tname);
-
-    emitted_mul_structs[idx] = true;
     return name;
 }
 
@@ -569,15 +430,12 @@ static const char *jitc_vulkan_require_vec_type(VarType vt, uint32_t lanes) {
         vt = VarType::UInt64;
 
     uint32_t idx = (uint32_t) vt;
-    bool *emitted = (lanes == 4) ? emitted_vec4_types : emitted_vec2_types;
-    const char *name =
-        (lanes == 4) ? vec4_type_names[idx] : vec2_type_names[idx];
-    if (emitted[idx])
+    const char *name = jitc_vulkan_id((lanes == 4) ? "%v4_" : "%v2_", idx);
+    if (jitc_vulkan_mark_emitted(idx, (lanes == 4) ? EmittedVec4Type : EmittedVec2Type))
         return name;
 
     jitc_vulkan_require_type(vt);
     fmt_tc("$s = OpTypeVector $s $u\n", name, type_name_vulkan[idx], lanes);
-    emitted[idx] = true;
     return name;
 }
 
@@ -588,11 +446,10 @@ static const char *jitc_vulkan_require_psb_vec_ptr(VarType vt, uint32_t lanes) {
         vt = VarType::UInt64;
 
     uint32_t idx = (uint32_t) vt;
-    bool *emitted =
-        (lanes == 4) ? emitted_psb_vec4_ptrs : emitted_psb_vec2_ptrs;
     const char *ptr_name =
-        (lanes == 4) ? psb_vec4_ptr_names[idx] : psb_vec2_ptr_names[idx];
-    if (emitted[idx])
+        jitc_vulkan_id((lanes == 4) ? "%ptr_psb_v4_" : "%ptr_psb_v2_", idx);
+    if (jitc_vulkan_mark_emitted(idx, (lanes == 4) ? EmittedPsbVec4Ptr
+                                                   : EmittedPsbVec2Ptr))
         return ptr_name;
 
     jitc_vulkan_require_psb_ptr(vt);
@@ -601,7 +458,6 @@ static const char *jitc_vulkan_require_psb_vec_ptr(VarType vt, uint32_t lanes) {
 
     fmt_annot("OpDecorate $s ArrayStride $u\n", ptr_name, stride);
     fmt_tc("$s = OpTypePointer PhysicalStorageBuffer $s\n", ptr_name, vec_name);
-    emitted[idx] = true;
     return ptr_name;
 }
 
@@ -612,15 +468,14 @@ static const char *jitc_vulkan_require_vec_zero(VarType vt, uint32_t lanes) {
         vt = VarType::UInt64;
 
     uint32_t idx = (uint32_t) vt;
-    bool *emitted = (lanes == 4) ? emitted_vec4_zeros : emitted_vec2_zeros;
     const char *name =
-        (lanes == 4) ? vec4_zero_names[idx] : vec2_zero_names[idx];
-    if (emitted[idx])
+        jitc_vulkan_id((lanes == 4) ? "%c_zero_v4_" : "%c_zero_v2_", idx);
+    if (jitc_vulkan_mark_emitted(idx, (lanes == 4) ? EmittedVec4Zero
+                                                   : EmittedVec2Zero))
         return name;
 
     const char *vec_name = jitc_vulkan_require_vec_type(vt, lanes);
     fmt_tc("$s = OpConstantNull $s\n", name, vec_name);
-    emitted[idx] = true;
     return name;
 }
 
@@ -630,26 +485,473 @@ static void jitc_vulkan_require_int64_atomics() {
         jitc_raise("jit_eval(): the Vulkan device \"%s\" does not "
                    "support 64-bit buffer atomics "
                    "(shaderBufferInt64Atomics)!", dev.name);
-    cap_int64_atomics = true;
+    spv_flags |= SpvCapInt64Atomics;
 }
 
 static void jitc_vulkan_require_atomic_float_add(VarType vt) {
-    ext_atomic_float_add = true;
-    if (vt == VarType::Float32)
-        cap_atomic_f32_add = true;
-    else
-        cap_atomic_f64_add = true;
+    spv_flags |= (vt == VarType::Float32) ? SpvCapAtomicF32Add
+                                          : SpvCapAtomicF64Add;
 }
 
 static void jitc_vulkan_require_subgroup() {
-    if (cap_subgroup)
+    if (spv_flags & SpvCapSubgroup)
         return;
     jitc_vulkan_require_type(VarType::UInt32);
     put_annot("OpDecorate %gl_SubgroupLocalInvocationId BuiltIn "
               "SubgroupLocalInvocationId\n");
     put_tc("%ptr_in_u32 = OpTypePointer Input %u32\n"
            "%gl_SubgroupLocalInvocationId = OpVariable %ptr_in_u32 Input\n");
-    cap_subgroup = true;
+    spv_flags |= SpvCapSubgroup;
+}
+
+// ----------------------------------------------------------------------------
+//  Local array code generation helpers
+// ----------------------------------------------------------------------------
+
+static void jitc_vulkan_require_fn_arr_type(VarType vt, uint32_t len) {
+    if (vt == VarType::Pointer)
+        vt = VarType::UInt64;
+    uint32_t idx = (uint32_t) vt;
+    uint32_t key = (idx << 16) | (len & 0xffffu);
+    if (!emitted_fn_arr_types.insert(key).second)
+        return;
+
+    jitc_vulkan_require_type(vt);
+    jitc_vulkan_require_fn_ptr(vt);
+    jitc_vulkan_require_u32_const(len);
+    const char *elem_type = type_name_vulkan[idx];
+    const char *short_name = elem_type + 1;
+    fmt_tc("%arr_$s_$u = OpTypeArray $s %c_u32_$u\n"
+           "%ptr_fn_arr_$s_$u = OpTypePointer Function %arr_$s_$u\n",
+           short_name, len, elem_type, len,
+           short_name, len, short_name, len);
+}
+
+static void jitc_vulkan_declare_local_array(VarType vt, uint32_t len,
+                                            uint32_t reg_index) {
+    if (vt == VarType::Pointer)
+        vt = VarType::UInt64;
+    jitc_vulkan_require_fn_arr_type(vt, len);
+    const char *short_name = type_name_vulkan[(uint32_t) vt] + 1;
+    fmt_local("%arr_r$u = OpVariable %ptr_fn_arr_$s_$u Function\n",
+              reg_index, short_name, len);
+}
+
+static void jitc_vulkan_render_array(Variable *v, Variable *pred) {
+    if (pred && pred->array_state != (uint32_t) ArrayState::Conflicted) {
+        v->reg_index = pred->reg_index;
+        return;
+    }
+    jitc_vulkan_declare_local_array((VarType) v->type, v->array_length,
+                                    v->reg_index);
+}
+
+static void jitc_vulkan_render_array_init(Variable *v, Variable *pred,
+                                          Variable *value) {
+    uint32_t id = ++spv_aux_id;
+    v->reg_index = pred->reg_index;
+    VarType vt = (VarType) v->type;
+    uint32_t len = v->array_length;
+    const char *fn_ptr = jitc_vulkan_require_fn_ptr(vt);
+    jitc_vulkan_require_type(VarType::Bool);
+    jitc_vulkan_require_u32_const(0);
+    jitc_vulkan_require_u32_const(1);
+    jitc_vulkan_require_u32_const(len);
+
+    fmt("OpBranch %arr_init_hdr_r$u\n"
+        "%arr_init_hdr_r$u = OpLabel\n"
+        "%arr_init_i_r$u = OpPhi %u32 %c_u32_0 $s %arr_init_next_r$u %arr_init_body_r$u\n"
+        "%arr_init_cmp_r$u = OpULessThan %bool %arr_init_i_r$u %c_u32_$u\n"
+        "OpLoopMerge %arr_init_exit_r$u %arr_init_body_r$u None\n"
+        "OpBranchConditional %arr_init_cmp_r$u %arr_init_body_r$u %arr_init_exit_r$u\n"
+        "%arr_init_body_r$u = OpLabel\n"
+        "%arr_init_ptr_r$u = OpAccessChain $s %arr_r$u %arr_init_i_r$u\n"
+        "OpStore %arr_init_ptr_r$u $v\n"
+        "%arr_init_next_r$u = OpIAdd %u32 %arr_init_i_r$u %c_u32_1\n"
+        "OpBranch %arr_init_hdr_r$u\n"
+        "%arr_init_exit_r$u = OpLabel\n",
+        id,
+        id,
+        id, current_block_label, id, id,
+        id, id, len,
+        id, id,
+        id, id, id,
+        id,
+        id, fn_ptr, v->reg_index, id,
+        id, value,
+        id, id,
+        id,
+        id);
+
+    jitc_vulkan_set_label("arr_init_exit", id);
+}
+
+static void jitc_vulkan_render_array_read(Variable *v, Variable *source,
+                                          Variable *mask, Variable *offset) {
+    VarType vt = (VarType) v->type;
+    const char *fn_ptr = jitc_vulkan_require_fn_ptr(vt);
+    jitc_vulkan_require_type(vt);
+
+    if (!offset)
+        jitc_vulkan_require_u32_const((uint32_t) v->literal);
+
+    if (mask->is_literal()) {
+        if (offset) {
+            fmt("$v_ptr = OpAccessChain $s %arr_r$u $v\n"
+                "$v = OpLoad $t $v_ptr\n",
+                v, fn_ptr, source->reg_index, offset,
+                v, v, v);
+        } else {
+            fmt("$v_ptr = OpAccessChain $s %arr_r$u %c_u32_$u\n"
+                "$v = OpLoad $t $v_ptr\n",
+                v, fn_ptr, source->reg_index, (uint32_t) v->literal,
+                v, v, v);
+        }
+    } else {
+        jitc_vulkan_require_type(VarType::Bool);
+        const char *zero_c = jitc_vulkan_require_zero(vt);
+        if (offset) {
+            fmt("OpSelectionMerge %arr_rd_done_r$u None\n"
+                "OpBranchConditional $v %arr_rd_then_r$u %arr_rd_done_r$u\n"
+                "%arr_rd_then_r$u = OpLabel\n"
+                "$v_ptr = OpAccessChain $s %arr_r$u $v\n"
+                "$v_val = OpLoad $t $v_ptr\n"
+                "OpBranch %arr_rd_done_r$u\n"
+                "%arr_rd_done_r$u = OpLabel\n"
+                "$v = OpPhi $t $v_val %arr_rd_then_r$u $s $s\n",
+                v->reg_index,
+                mask, v->reg_index, v->reg_index,
+                v->reg_index,
+                v, fn_ptr, source->reg_index, offset,
+                v, v, v,
+                v->reg_index,
+                v->reg_index,
+                v, v, v, v->reg_index, zero_c, current_block_label);
+        } else {
+            fmt("OpSelectionMerge %arr_rd_done_r$u None\n"
+                "OpBranchConditional $v %arr_rd_then_r$u %arr_rd_done_r$u\n"
+                "%arr_rd_then_r$u = OpLabel\n"
+                "$v_ptr = OpAccessChain $s %arr_r$u %c_u32_$u\n"
+                "$v_val = OpLoad $t $v_ptr\n"
+                "OpBranch %arr_rd_done_r$u\n"
+                "%arr_rd_done_r$u = OpLabel\n"
+                "$v = OpPhi $t $v_val %arr_rd_then_r$u $s $s\n",
+                v->reg_index,
+                mask, v->reg_index, v->reg_index,
+                v->reg_index,
+                v, fn_ptr, source->reg_index, (uint32_t) v->literal,
+                v, v, v,
+                v->reg_index,
+                v->reg_index,
+                v, v, v, v->reg_index, zero_c, current_block_label);
+        }
+        jitc_vulkan_set_label("arr_rd_done", v->reg_index);
+    }
+}
+
+static void jitc_vulkan_render_array_write(Variable *v, Variable *target,
+                                           Variable *value, Variable *mask,
+                                           Variable *offset) {
+    if (offset && offset->is_array())
+        offset = nullptr;
+
+    uint32_t id = ++spv_aux_id;
+    bool copy = target->array_state == (uint32_t) ArrayState::Conflicted;
+    uint32_t target_buffer = target->reg_index;
+    VarType vt = (VarType) v->type;
+    const char *fn_ptr = jitc_vulkan_require_fn_ptr(vt);
+    jitc_vulkan_require_type(vt);
+
+    if (copy) {
+        target_buffer = jitc_array_buffer(v)->reg_index;
+        uint32_t len = v->array_length;
+        jitc_vulkan_require_type(VarType::Bool);
+        jitc_vulkan_require_u32_const(0);
+        jitc_vulkan_require_u32_const(1);
+        jitc_vulkan_require_u32_const(len);
+
+        fmt("OpBranch %arr_cp_hdr_r$u\n"
+            "%arr_cp_hdr_r$u = OpLabel\n"
+            "%arr_cp_i_r$u = OpPhi %u32 %c_u32_0 $s %arr_cp_next_r$u %arr_cp_body_r$u\n"
+            "%arr_cp_cmp_r$u = OpULessThan %bool %arr_cp_i_r$u %c_u32_$u\n"
+            "OpLoopMerge %arr_cp_exit_r$u %arr_cp_body_r$u None\n"
+            "OpBranchConditional %arr_cp_cmp_r$u %arr_cp_body_r$u %arr_cp_exit_r$u\n"
+            "%arr_cp_body_r$u = OpLabel\n"
+            "%arr_cp_sp_r$u = OpAccessChain $s %arr_r$u %arr_cp_i_r$u\n"
+            "%arr_cp_val_r$u = OpLoad $t %arr_cp_sp_r$u\n"
+            "%arr_cp_dp_r$u = OpAccessChain $s %arr_r$u %arr_cp_i_r$u\n"
+            "OpStore %arr_cp_dp_r$u %arr_cp_val_r$u\n"
+            "%arr_cp_next_r$u = OpIAdd %u32 %arr_cp_i_r$u %c_u32_1\n"
+            "OpBranch %arr_cp_hdr_r$u\n"
+            "%arr_cp_exit_r$u = OpLabel\n",
+            id,
+            id,
+            id, current_block_label, id, id,
+            id, id, len,
+            id, id,
+            id, id, id,
+            id,
+            id, fn_ptr, target->reg_index, id,
+            id, v, id,
+            id, fn_ptr, target_buffer, id,
+            id, id,
+            id, id,
+            id,
+            id);
+
+        jitc_vulkan_set_label("arr_cp_exit", id);
+    }
+
+    if (!offset)
+        jitc_vulkan_require_u32_const((uint32_t) v->literal);
+
+    if (mask->is_literal()) {
+        if (offset) {
+            fmt("%arr_wr_ptr_r$u = OpAccessChain $s %arr_r$u $v\n"
+                "OpStore %arr_wr_ptr_r$u $v\n",
+                id, fn_ptr, target_buffer, offset,
+                id, value);
+        } else {
+            fmt("%arr_wr_ptr_r$u = OpAccessChain $s %arr_r$u %c_u32_$u\n"
+                "OpStore %arr_wr_ptr_r$u $v\n",
+                id, fn_ptr, target_buffer, (uint32_t) v->literal,
+                id, value);
+        }
+    } else {
+        jitc_vulkan_require_type(VarType::Bool);
+        if (offset) {
+            fmt("OpSelectionMerge %arr_wr_done_r$u None\n"
+                "OpBranchConditional $v %arr_wr_then_r$u %arr_wr_done_r$u\n"
+                "%arr_wr_then_r$u = OpLabel\n"
+                "%arr_wr_ptr_r$u = OpAccessChain $s %arr_r$u $v\n"
+                "OpStore %arr_wr_ptr_r$u $v\n"
+                "OpBranch %arr_wr_done_r$u\n"
+                "%arr_wr_done_r$u = OpLabel\n",
+                id,
+                mask, id, id,
+                id,
+                id, fn_ptr, target_buffer, offset,
+                id, value,
+                id,
+                id);
+        } else {
+            fmt("OpSelectionMerge %arr_wr_done_r$u None\n"
+                "OpBranchConditional $v %arr_wr_then_r$u %arr_wr_done_r$u\n"
+                "%arr_wr_then_r$u = OpLabel\n"
+                "%arr_wr_ptr_r$u = OpAccessChain $s %arr_r$u %c_u32_$u\n"
+                "OpStore %arr_wr_ptr_r$u $v\n"
+                "OpBranch %arr_wr_done_r$u\n"
+                "%arr_wr_done_r$u = OpLabel\n",
+                id,
+                mask, id, id,
+                id,
+                id, fn_ptr, target_buffer, (uint32_t) v->literal,
+                id, value,
+                id,
+                id);
+        }
+        jitc_vulkan_set_label("arr_wr_done", id);
+    }
+
+    v->reg_index = target_buffer;
+}
+
+static void jitc_vulkan_render_array_select(Variable *v, Variable *mask,
+                                            Variable *t, Variable *f) {
+    uint32_t id = ++spv_aux_id;
+    uint32_t reg_index = jitc_array_buffer(v)->reg_index;
+    VarType vt = (VarType) v->type;
+    uint32_t len = f->array_length;
+    const char *fn_ptr = jitc_vulkan_require_fn_ptr(vt);
+    jitc_vulkan_require_type(vt);
+    jitc_vulkan_require_type(VarType::Bool);
+    jitc_vulkan_require_u32_const(0);
+    jitc_vulkan_require_u32_const(1);
+    jitc_vulkan_require_u32_const(len);
+
+    fmt("OpBranch %arr_sel_hdr_r$u\n"
+        "%arr_sel_hdr_r$u = OpLabel\n"
+        "%arr_sel_i_r$u = OpPhi %u32 %c_u32_0 $s %arr_sel_next_r$u %arr_sel_body_r$u\n"
+        "%arr_sel_cmp_r$u = OpULessThan %bool %arr_sel_i_r$u %c_u32_$u\n"
+        "OpLoopMerge %arr_sel_exit_r$u %arr_sel_body_r$u None\n"
+        "OpBranchConditional %arr_sel_cmp_r$u %arr_sel_body_r$u %arr_sel_exit_r$u\n"
+        "%arr_sel_body_r$u = OpLabel\n"
+        "%arr_sel_tp_r$u = OpAccessChain $s %arr_r$u %arr_sel_i_r$u\n"
+        "%arr_sel_tv_r$u = OpLoad $t %arr_sel_tp_r$u\n"
+        "%arr_sel_fp_r$u = OpAccessChain $s %arr_r$u %arr_sel_i_r$u\n"
+        "%arr_sel_fv_r$u = OpLoad $t %arr_sel_fp_r$u\n"
+        "%arr_sel_sv_r$u = OpSelect $t $v %arr_sel_tv_r$u %arr_sel_fv_r$u\n"
+        "%arr_sel_dp_r$u = OpAccessChain $s %arr_r$u %arr_sel_i_r$u\n"
+        "OpStore %arr_sel_dp_r$u %arr_sel_sv_r$u\n"
+        "%arr_sel_next_r$u = OpIAdd %u32 %arr_sel_i_r$u %c_u32_1\n"
+        "OpBranch %arr_sel_hdr_r$u\n"
+        "%arr_sel_exit_r$u = OpLabel\n",
+        id,
+        id,
+        id, current_block_label, id, id,
+        id, id, len,
+        id, id,
+        id, id, id,
+        id,
+        id, fn_ptr, t->reg_index, id,
+        id, v, id,
+        id, fn_ptr, f->reg_index, id,
+        id, v, id,
+        id, v, mask, id, id,
+        id, fn_ptr, reg_index, id,
+        id, id,
+        id, id,
+        id,
+        id);
+
+    jitc_vulkan_set_label("arr_sel_exit", id);
+    v->reg_index = reg_index;
+}
+
+static void jitc_vulkan_render_array_memcpy_in(const Variable *v) {
+    uint32_t id = ++spv_aux_id;
+    VarType vt = (VarType) v->type;
+    uint32_t len = v->array_length;
+
+    jitc_vulkan_declare_local_array(vt, len, v->reg_index);
+
+    const char *fn_ptr = jitc_vulkan_require_fn_ptr(vt);
+    const char *psb_ptr = nullptr;
+    if (vt == VarType::Bool) {
+        jitc_vulkan_require_bool_storage();
+        psb_ptr = "%ptr_psb_u8";
+    } else {
+        psb_ptr = jitc_vulkan_require_psb_ptr(vt);
+    }
+
+    jitc_vulkan_require_type(VarType::Bool);
+    jitc_vulkan_require_u32_const(0);
+    jitc_vulkan_require_u32_const(1);
+    jitc_vulkan_require_u32_const(len);
+
+    fmt("%b_in_r$u = OpConvertUToPtr $s %a_r$u\n"
+        "OpBranch %arr_in_hdr_r$u\n"
+        "%arr_in_hdr_r$u = OpLabel\n"
+        "%arr_in_i_r$u = OpPhi %u32 %c_u32_0 $s %arr_in_next_r$u %arr_in_body_r$u\n"
+        "%arr_in_cmp_r$u = OpULessThan %bool %arr_in_i_r$u %c_u32_$u\n"
+        "OpLoopMerge %arr_in_exit_r$u %arr_in_body_r$u None\n"
+        "OpBranchConditional %arr_in_cmp_r$u %arr_in_body_r$u %arr_in_exit_r$u\n"
+        "%arr_in_body_r$u = OpLabel\n",
+        id, psb_ptr, v->reg_index,
+        id,
+        id,
+        id, current_block_label, id, id,
+        id, id, len,
+        id, id,
+        id, id, id,
+        id);
+
+    if (v->size > 1) {
+        fmt("%arr_in_mul_r$u = OpIMul %u32 %arr_in_i_r$u %size\n"
+            "%arr_in_gidx_r$u = OpIAdd %u32 %arr_in_mul_r$u %idx\n"
+            "%arr_in_gp_r$u = OpPtrAccessChain $s %b_in_r$u %arr_in_gidx_r$u\n",
+            id, id,
+            id, id,
+            id, psb_ptr, id, id);
+    } else {
+        fmt("%arr_in_gp_r$u = OpPtrAccessChain $s %b_in_r$u %arr_in_i_r$u\n",
+            id, psb_ptr, id, id);
+    }
+
+    if (vt == VarType::Bool) {
+        fmt("%arr_in_raw_r$u = OpLoad %u8 %arr_in_gp_r$u Aligned 1\n"
+            "%arr_in_val_r$u = OpINotEqual %bool %arr_in_raw_r$u %c_u8_0\n",
+            id, id,
+            id, id);
+    } else {
+        fmt("%arr_in_val_r$u = OpLoad $t %arr_in_gp_r$u Aligned $a\n",
+            id, v, id, v);
+    }
+
+    fmt("%arr_in_lp_r$u = OpAccessChain $s %arr_r$u %arr_in_i_r$u\n"
+        "OpStore %arr_in_lp_r$u %arr_in_val_r$u\n"
+        "%arr_in_next_r$u = OpIAdd %u32 %arr_in_i_r$u %c_u32_1\n"
+        "OpBranch %arr_in_hdr_r$u\n"
+        "%arr_in_exit_r$u = OpLabel\n",
+        id, fn_ptr, v->reg_index, id,
+        id, id,
+        id, id,
+        id,
+        id);
+
+    jitc_vulkan_set_label("arr_in_exit", id);
+}
+
+static void jitc_vulkan_render_array_memcpy_out(
+    const Variable *v, const char *param_u64_ptr_type,
+    const char *param_u64_load_align) {
+    uint32_t id = ++spv_aux_id;
+    VarType vt = (VarType) v->type;
+    uint32_t len = v->array_length;
+
+    const char *fn_ptr = jitc_vulkan_require_fn_ptr(vt);
+    const char *psb_ptr = nullptr;
+    if (vt == VarType::Bool) {
+        jitc_vulkan_require_bool_storage();
+        psb_ptr = "%ptr_psb_u8";
+    } else {
+        psb_ptr = jitc_vulkan_require_psb_ptr(vt);
+    }
+
+    jitc_vulkan_require_type(VarType::Bool);
+    jitc_vulkan_require_u32_const(0);
+    jitc_vulkan_require_u32_const(1);
+    jitc_vulkan_require_u32_const(len);
+
+    fmt("%out_p_r$u = OpAccessChain $s %params %c_u32_1 %c_u32_$o\n"
+        "%out_a_r$u = OpLoad %u64 %out_p_r$u$s\n"
+        "%out_b_r$u = OpConvertUToPtr $s %out_a_r$u\n"
+        "OpBranch %arr_out_hdr_r$u\n"
+        "%arr_out_hdr_r$u = OpLabel\n"
+        "%arr_out_i_r$u = OpPhi %u32 %c_u32_0 $s %arr_out_next_r$u %arr_out_body_r$u\n"
+        "%arr_out_cmp_r$u = OpULessThan %bool %arr_out_i_r$u %c_u32_$u\n"
+        "OpLoopMerge %arr_out_exit_r$u %arr_out_body_r$u None\n"
+        "OpBranchConditional %arr_out_cmp_r$u %arr_out_body_r$u %arr_out_exit_r$u\n"
+        "%arr_out_body_r$u = OpLabel\n"
+        "%arr_out_lp_r$u = OpAccessChain $s %arr_r$u %arr_out_i_r$u\n"
+        "%arr_out_val_r$u = OpLoad $t %arr_out_lp_r$u\n"
+        "%arr_out_mul_r$u = OpIMul %u32 %arr_out_i_r$u %size\n"
+        "%arr_out_gidx_r$u = OpIAdd %u32 %arr_out_mul_r$u %idx\n"
+        "%arr_out_gp_r$u = OpPtrAccessChain $s %out_b_r$u %arr_out_gidx_r$u\n",
+        id, param_u64_ptr_type, v,
+        id, id, param_u64_load_align,
+        id, psb_ptr, id,
+        id,
+        id,
+        id, current_block_label, id, id,
+        id, id, len,
+        id, id,
+        id, id, id,
+        id,
+        id, fn_ptr, v->reg_index, id,
+        id, v, id,
+        id, id,
+        id, id,
+        id, psb_ptr, id, id);
+
+    if (vt == VarType::Bool) {
+        fmt("%arr_out_st_r$u = OpSelect %u8 %arr_out_val_r$u %c_u8_1 %c_u8_0\n"
+            "OpStore %arr_out_gp_r$u %arr_out_st_r$u Aligned 1\n",
+            id, id,
+            id, id);
+    } else {
+        fmt("OpStore %arr_out_gp_r$u %arr_out_val_r$u Aligned $a\n",
+            id, id, v);
+    }
+
+    fmt("%arr_out_next_r$u = OpIAdd %u32 %arr_out_i_r$u %c_u32_1\n"
+        "OpBranch %arr_out_hdr_r$u\n"
+        "%arr_out_exit_r$u = OpLabel\n",
+        id, id,
+        id,
+        id);
+
+    jitc_vulkan_set_label("arr_out_exit", id);
 }
 
 // ----------------------------------------------------------------------------
@@ -765,11 +1067,6 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
                 continue;
             }
 
-            if (unlikely(v->is_array()))
-                jitc_raise("jitc_vulkan_assemble(): variable arrays are not "
-                           "supported yet (the Vulkan backend cannot compile "
-                           "kernels with this operation yet)!");
-
             uint32_t arg_idx = v->param_offset / (uint32_t) sizeof(void *) - 1;
             jitc_vulkan_require_u32_const(arg_idx);
 
@@ -777,6 +1074,11 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
                 "%a_r$u = OpLoad %u64 %p_r$u$s\n",
                 v->reg_index, param_u64_ptr_type, v,
                 v->reg_index, v->reg_index, param_u64_load_align);
+
+            if (unlikely(v->is_array())) {
+                jitc_vulkan_render_array_memcpy_in(v);
+                continue;
+            }
 
             if (vt == VarType::Bool) {
                 jitc_vulkan_require_bool_storage();
@@ -814,13 +1116,14 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
         jitc_vulkan_render(v);
 
         if (ptype == ParamType::Output) {
-            if (unlikely(v->is_array()))
-                jitc_raise("jitc_vulkan_assemble(): variable arrays are not "
-                           "supported yet (the Vulkan backend cannot compile "
-                           "kernels with this operation yet)!");
-
             uint32_t arg_idx = v->param_offset / (uint32_t) sizeof(void *) - 1;
             jitc_vulkan_require_u32_const(arg_idx);
+
+            if (unlikely(v->is_array())) {
+                jitc_vulkan_render_array_memcpy_out(v, param_u64_ptr_type,
+                                                    param_u64_load_align);
+                continue;
+            }
 
             fmt("%out_p_r$u = OpAccessChain $s %params %c_u32_1 %c_u32_$o\n"
                 "%out_a_r$u = OpLoad %u64 %out_p_r$u$s\n",
@@ -850,37 +1153,35 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
     }
 
     // 4. Emit the SPIR-V module header with all required capabilities
-    put_header("OpCapability Shader\n");
-    if (cap_int8)
-        put_header("OpCapability Int8\n");
-    if (cap_storage_8bit)
-        put_header("OpCapability StorageBuffer8BitAccess\n");
-    if (cap_int16)
-        put_header("OpCapability Int16\n");
-    if (cap_storage_16bit)
-        put_header("OpCapability StorageBuffer16BitAccess\n");
-    if (cap_float16)
-        put_header("OpCapability Float16\n");
-    if (cap_float64)
-        put_header("OpCapability Float64\n");
-    put_header("OpCapability Int64\n");
-    if (cap_int64_atomics)
-        put_header("OpCapability Int64Atomics\n");
-    if (cap_atomic_f32_add)
-        put_header("OpCapability AtomicFloat32AddEXT\n");
-    if (cap_atomic_f64_add)
-        put_header("OpCapability AtomicFloat64AddEXT\n");
-    if (cap_subgroup)
-        put_header("OpCapability GroupNonUniform\n"
-                   "OpCapability GroupNonUniformVote\n"
-                   "OpCapability GroupNonUniformBallot\n"
-                   "OpCapability GroupNonUniformArithmetic\n");
-    put_header("OpCapability PhysicalStorageBufferAddresses\n");
+    struct CapEntry { uint32_t flag; const char *str; };
+    static const CapEntry optional_caps[] = {
+        { SpvCapInt8,         "OpCapability Int8\n" },
+        { SpvCapStorage8Bit,  "OpCapability StorageBuffer8BitAccess\n" },
+        { SpvCapInt16,        "OpCapability Int16\n" },
+        { SpvCapStorage16Bit, "OpCapability StorageBuffer16BitAccess\n" },
+        { SpvCapFloat16,      "OpCapability Float16\n" },
+        { SpvCapFloat64,      "OpCapability Float64\n" },
+        { SpvCapInt64Atomics, "OpCapability Int64Atomics\n" },
+        { SpvCapAtomicF32Add, "OpCapability AtomicFloat32AddEXT\n" },
+        { SpvCapAtomicF64Add, "OpCapability AtomicFloat64AddEXT\n" },
+        { SpvCapSubgroup,     "OpCapability GroupNonUniform\n"
+                              "OpCapability GroupNonUniformVote\n"
+                              "OpCapability GroupNonUniformBallot\n"
+                              "OpCapability GroupNonUniformArithmetic\n" },
+    };
 
-    if (ext_atomic_float_add)
+    put_header("OpCapability Shader\n"
+               "OpCapability Int64\n"
+               "OpCapability PhysicalStorageBufferAddresses\n");
+    for (const CapEntry &c : optional_caps) {
+        if (spv_flags & c.flag)
+            fmt_header("$s", c.str);
+    }
+
+    if (spv_flags & (SpvCapAtomicF32Add | SpvCapAtomicF64Add))
         put_header("OpExtension \"SPV_EXT_shader_atomic_float_add\"\n");
 
-    if (need_glsl450)
+    if (spv_flags & SpvNeedGlsl450)
         put_header("%glsl450 = OpExtInstImport \"GLSL.std.450\"\n");
 
     put_header("OpMemoryModel PhysicalStorageBuffer64 GLSL450\n");
@@ -888,7 +1189,8 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
                "\"drjit_^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\" "
                "%gl_GlobalInvocationID %gl_NumWorkGroups$s $s\n"
                "OpExecutionMode %main LocalSize $u 1 1\n",
-               cap_subgroup ? " %gl_SubgroupLocalInvocationId" : "",
+               (spv_flags & SpvCapSubgroup) ? " %gl_SubgroupLocalInvocationId"
+                                            : "",
                params_in_pc ? "%params" : "%pc", wg_size);
 
     // 5. Concatenate all SPIR-V sections in order into 'buffer'
@@ -912,7 +1214,7 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
         "%stride = OpIMul %u32 %nwg %c_u32_$u\n",
         wg_size);
 
-    if (cap_subgroup)
+    if (spv_flags & SpvCapSubgroup)
         put("%sg_inv_id = OpLoad %u32 %gl_SubgroupLocalInvocationId\n");
 
     if (params_in_pc) {
@@ -2419,6 +2721,222 @@ static void jitc_vulkan_render(Variable *v) {
             v->consumed = 1;
             break;
         }
+
+        // ================ Structured Control Flow: Loops ================
+
+        case VarKind::LoopStart: {
+            const LoopData *ld = (const LoopData *) v->data;
+            for (size_t i = 0; i < ld->size; ++i) {
+                Variable *inner_in = jitc_var(ld->inner_in[i]),
+                         *outer_in = jitc_var(ld->outer_in[i]);
+                if (inner_in == outer_in || !inner_in->reg_index ||
+                    inner_in->is_array())
+                    continue;
+
+                VarType ivt = (VarType) inner_in->type;
+                const char *fn_ptr = jitc_vulkan_require_fn_ptr(ivt);
+                fmt_local("%loop_var_r$u = OpVariable $s Function\n",
+                          inner_in->reg_index, fn_ptr);
+                if (outer_in && outer_in->reg_index) {
+                    fmt("OpStore %loop_var_r$u $v\n",
+                        inner_in->reg_index, outer_in);
+                } else {
+                    const char *zero_c = jitc_vulkan_require_zero(ivt);
+                    fmt("OpStore %loop_var_r$u $s\n",
+                        inner_in->reg_index, zero_c);
+                }
+            }
+
+            fmt("OpBranch %loop_header_r$u\n"
+                "%loop_header_r$u = OpLabel\n"
+                "OpLoopMerge %loop_exit_r$u %loop_cont_r$u None\n"
+                "OpBranch %loop_body_r$u\n"
+                "%loop_body_r$u = OpLabel\n",
+                v->reg_index,
+                v->reg_index,
+                v->reg_index, v->reg_index,
+                v->reg_index,
+                v->reg_index);
+            jitc_vulkan_set_label("loop_body", v->reg_index);
+
+            for (size_t i = 0; i < ld->size; ++i) {
+                Variable *inner_in = jitc_var(ld->inner_in[i]),
+                         *outer_in = jitc_var(ld->outer_in[i]);
+                if (inner_in == outer_in || !inner_in->reg_index ||
+                    inner_in->is_array())
+                    continue;
+                jitc_vulkan_require_type((VarType) inner_in->type);
+                fmt("$v = OpLoad $t %loop_var_r$u\n",
+                    inner_in, inner_in, inner_in->reg_index);
+            }
+            break;
+        }
+
+        case VarKind::LoopPhi:
+            if (v->is_array())
+                v->reg_index = a3->reg_index;
+            break;
+
+        case VarKind::LoopCond:
+            jitc_vulkan_require_type(VarType::Bool);
+            fmt("OpSelectionMerge %loop_cond_ok_r$u None\n"
+                "OpBranchConditional $v %loop_cond_ok_r$u %loop_exit_r$u\n"
+                "%loop_cond_ok_r$u = OpLabel\n",
+                a0->reg_index,
+                a1, a0->reg_index, a0->reg_index,
+                a0->reg_index);
+            jitc_vulkan_set_label("loop_cond_ok", a0->reg_index);
+            break;
+
+        case VarKind::LoopEnd: {
+            const LoopData *ld = (const LoopData *) a0->data;
+            fmt("OpBranch %loop_cont_r$u\n"
+                "%loop_cont_r$u = OpLabel\n",
+                a0->reg_index,
+                a0->reg_index);
+            for (size_t i = 0; i < ld->size; ++i) {
+                Variable *in  = jitc_var(ld->inner_in[i]),
+                         *out = jitc_var(ld->inner_out[i]);
+                if (in == out || !in->reg_index || !out->reg_index ||
+                    in->is_array())
+                    continue;
+                fmt("OpStore %loop_var_r$u $v\n", in->reg_index, out);
+            }
+            fmt("OpBranch %loop_header_r$u\n"
+                "%loop_exit_r$u = OpLabel\n",
+                a0->reg_index,
+                a0->reg_index);
+            jitc_vulkan_set_label("loop_exit", a0->reg_index);
+            break;
+        }
+
+        case VarKind::LoopOutput: {
+            const LoopData *ld = (const LoopData *) a0->data;
+            size_t i = (size_t) v->literal;
+            Variable *inner_in = jitc_var(ld->inner_in[i]),
+                     *outer_in = jitc_var(ld->outer_in[i]);
+            if (v->reg_index && inner_in && inner_in->reg_index) {
+                jitc_vulkan_require_type((VarType) v->type);
+                if (inner_in == outer_in)
+                    fmt("$v = OpCopyObject $t $v\n", v, v, inner_in);
+                else
+                    fmt("$v = OpLoad $t %loop_var_r$u\n",
+                        v, v, inner_in->reg_index);
+            }
+            break;
+        }
+
+        // ================ Structured Control Flow: Conditionals ================
+
+        case VarKind::CondStart: {
+            const CondData *cd = (const CondData *) v->data;
+            for (size_t i = 0; i < cd->indices_out.size(); ++i) {
+                Variable *vo = jitc_var(cd->indices_out[i]);
+                if (jitc_cond_output_active(vo)) {
+                    const char *fn_ptr =
+                        jitc_vulkan_require_fn_ptr((VarType) vo->type);
+                    fmt_local("%cond_out_r$u = OpVariable $s Function\n",
+                              vo->reg_index, fn_ptr);
+                }
+            }
+            jitc_vulkan_require_type(VarType::Bool);
+            fmt("OpSelectionMerge %cond_merge_r$u None\n"
+                "OpBranchConditional $v %cond_true_r$u %cond_false_r$u\n"
+                "%cond_true_r$u = OpLabel\n",
+                v->reg_index,
+                a0, v->reg_index, v->reg_index,
+                v->reg_index);
+            jitc_vulkan_set_label("cond_true", v->reg_index);
+            break;
+        }
+
+        case VarKind::CondMid: {
+            const CondData *cd = (const CondData *) a0->data;
+            for (size_t i = 0; i < cd->indices_out.size(); ++i) {
+                Variable *vt_var = jitc_var(cd->indices_t[i]),
+                         *vo     = jitc_var(cd->indices_out[i]);
+                if (jitc_cond_output_active(vo)) {
+                    if (vt_var && vt_var->reg_index) {
+                        fmt("OpStore %cond_out_r$u $v\n",
+                            vo->reg_index, vt_var);
+                    } else {
+                        const char *zero_c =
+                            jitc_vulkan_require_zero((VarType) vo->type);
+                        fmt("OpStore %cond_out_r$u $s\n",
+                            vo->reg_index, zero_c);
+                    }
+                }
+            }
+            fmt("OpBranch %cond_merge_r$u\n"
+                "%cond_false_r$u = OpLabel\n",
+                a0->reg_index,
+                a0->reg_index);
+            jitc_vulkan_set_label("cond_false", a0->reg_index);
+            break;
+        }
+
+        case VarKind::CondEnd: {
+            const CondData *cd = (const CondData *) a0->data;
+            for (size_t i = 0; i < cd->indices_out.size(); ++i) {
+                Variable *vf_var = jitc_var(cd->indices_f[i]),
+                         *vo     = jitc_var(cd->indices_out[i]);
+                if (jitc_cond_output_active(vo)) {
+                    if (vf_var && vf_var->reg_index) {
+                        fmt("OpStore %cond_out_r$u $v\n",
+                            vo->reg_index, vf_var);
+                    } else {
+                        const char *zero_c =
+                            jitc_vulkan_require_zero((VarType) vo->type);
+                        fmt("OpStore %cond_out_r$u $s\n",
+                            vo->reg_index, zero_c);
+                    }
+                }
+            }
+            fmt("OpBranch %cond_merge_r$u\n"
+                "%cond_merge_r$u = OpLabel\n",
+                a0->reg_index,
+                a0->reg_index);
+            jitc_vulkan_set_label("cond_merge", a0->reg_index);
+
+            for (size_t i = 0; i < cd->indices_out.size(); ++i) {
+                Variable *vo = jitc_var(cd->indices_out[i]);
+                if (jitc_cond_output_active(vo)) {
+                    jitc_vulkan_require_type((VarType) vo->type);
+                    fmt("$v = OpLoad $t %cond_out_r$u\n",
+                        vo, vo, vo->reg_index);
+                }
+            }
+            break;
+        }
+
+        case VarKind::CondOutput:
+            break;
+
+        // ================ Local Arrays ================
+
+        case VarKind::Array:
+            jitc_vulkan_render_array(v, a0);
+            break;
+
+        case VarKind::ArrayInit:
+            jitc_vulkan_render_array_init(v, a0, a1);
+            break;
+
+        case VarKind::ArrayWrite:
+            jitc_vulkan_render_array_write(v, a0, a1, a2, a3);
+            break;
+
+        case VarKind::ArrayRead:
+            jitc_vulkan_render_array_read(v, a0, a1, a2);
+            break;
+
+        case VarKind::ArrayPhi:
+            v->reg_index = a0->reg_index;
+            break;
+
+        case VarKind::ArraySelect:
+            jitc_vulkan_render_array_select(v, a0, a1, a2);
+            break;
 
         default:
             jitc_raise("jitc_vulkan_render(): unhandled variable kind \"%s\" "
