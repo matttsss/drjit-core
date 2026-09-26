@@ -1683,7 +1683,7 @@ typedef const char *(*PFN_spvSoftwareVersionString)(void);
     X(vkCreateDevice)                                                          \
     X(vkGetDeviceProcAddr)
 
-/// Device-level functions of Vulkan 1.0-1.2 (required)
+/// Device-level functions of Vulkan 1.0-1.3 (required)
 #define DRJIT_VK_DEVICE_FUNCS(X)                                               \
     X(vkDestroyDevice)                                                         \
     X(vkDeviceWaitIdle)                                                        \
@@ -1781,7 +1781,7 @@ extern uint32_t jitc_vulkan_api_version;
 /// Were the VK_KHR_acceleration_structure entry points found?
 extern bool jitc_vulkan_has_accel_api;
 
-/// SPIRV-Tools context targeting the Vulkan 1.2 environment (SPIR-V 1.5)
+/// SPIRV-Tools context targeting the Vulkan 1.3 environment (SPIR-V 1.6)
 extern spv_context jitc_vulkan_spv_context;
 
 /**

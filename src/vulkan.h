@@ -46,10 +46,6 @@ struct VulkanBuffer {
     std::vector<VkDeviceMemory> sparse_memories;
 };
 
-/// Byte range [start, end) of a memory access (in terms of Dr.Jit pointers)
-struct VulkanRange {
-    uintptr_t start, end;
-};
 
 /// Host callback registered via \ref jit_enqueue_host_func()
 struct VulkanCallback {
@@ -114,8 +110,8 @@ struct VulkanStream {
     /// Host callbacks of finished work that have not run yet
     std::vector<VulkanCallback> ready_callbacks;
 
-    /// Memory accessed by the commands recorded since the last barrier
-    std::vector<VulkanRange> reads, writes;
+    /// Has any command written to memory since the last pipeline barrier?
+    bool write_pending = false;
 
     /// Must the next command be preceded by a barrier? (e.g. at the
     /// beginning of a command buffer, to order it after earlier submissions)
@@ -177,15 +173,13 @@ extern void jitc_vulkan_sync_all();
 extern VkCommandBuffer jitc_vulkan_cmd(VulkanDevice &dev);
 
 /**
- * \brief Declare the memory accessed by the next command
+ * \brief Declare a memory access by the next command
  *
- * Inserts a pipeline barrier if the command conflicts with commands recorded
- * since the last barrier (RAW, WAR, and WAW hazards). Must be called after
- * \ref jitc_vulkan_cmd().
+ * Inserts a pipeline barrier if the command conflicts with earlier commands
+ * (e.g. read-after-write or write-after-write hazards, or at the start of a
+ * command buffer). Must be called after \ref jitc_vulkan_cmd().
  */
-extern void jitc_vulkan_access(VulkanDevice &dev, const VulkanRange *reads,
-                               uint32_t n_reads, const VulkanRange *writes,
-                               uint32_t n_writes);
+extern void jitc_vulkan_access(VulkanDevice &dev, bool is_write = true);
 
 /// Submit the command buffer being recorded (if any)
 extern void jitc_vulkan_submit(VulkanDevice &dev);

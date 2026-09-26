@@ -23,9 +23,6 @@
 /// Size of the shared memory chunks used by jitc_vulkan_stage()
 static constexpr size_t VulkanArenaSize = 65536;
 
-/// Maximum number of memory ranges tracked per hazard list. Commands with
-/// more complex access patterns are separated by a barrier.
-static constexpr size_t VulkanMaxHazardRanges = 16;
 
 /// Submit the command buffer being recorded once it contains this many
 /// commands or references this much staging memory (see
@@ -111,6 +108,9 @@ bool jitc_vulkan_owns(const void *ptr) {
 
 VulkanBuffer *vulkan_buffer_new(const VulkanDevice &dev, size_t size,
                                 bool shared) {
+    jitc_assert(size > 0 && (size & (size - 1)) == 0,
+                "vulkan_buffer_new(): buffer size (%zu) must be a power of two!", size);
+
     VkDevice device = (VkDevice) dev.device;
 
     VkBufferCreateInfo buffer_info {};
@@ -396,42 +396,14 @@ VkCommandBuffer jitc_vulkan_cmd(VulkanDevice &dev) {
     s.cmd = cmd;
     s.cmd_count = 0;
     s.barrier_pending = true;
-    s.reads.clear();
-    s.writes.clear();
+    s.write_pending = false;
     return cmd;
 }
 
-/// Does the range 'r' overlap with any of the ranges in 'list'?
-static bool vulkan_overlaps(const std::vector<VulkanRange> &list,
-                            const VulkanRange &r) {
-    for (const VulkanRange &r2 : list) {
-        if (r.start < r2.end && r2.start < r.end)
-            return true;
-    }
-    return false;
-}
-
-void jitc_vulkan_access(VulkanDevice &dev, const VulkanRange *reads,
-                        uint32_t n_reads, const VulkanRange *writes,
-                        uint32_t n_writes) {
+void jitc_vulkan_access(VulkanDevice &dev, bool is_write) {
     VulkanStream &s = *dev.stream;
-    bool barrier = s.barrier_pending;
 
-    // Read-after-write hazards
-    for (uint32_t i = 0; i < n_reads && !barrier; ++i)
-        barrier = vulkan_overlaps(s.writes, reads[i]);
-
-    // Write-after-write and write-after-read hazards
-    for (uint32_t i = 0; i < n_writes && !barrier; ++i)
-        barrier = vulkan_overlaps(s.writes, writes[i]) ||
-                  vulkan_overlaps(s.reads, writes[i]);
-
-    // Limit the cost of hazard tracking
-    if (s.reads.size() + n_reads > VulkanMaxHazardRanges ||
-        s.writes.size() + n_writes > VulkanMaxHazardRanges)
-        barrier = true;
-
-    if (barrier) {
+    if (s.barrier_pending || s.write_pending) {
         /* A global memory barrier that orders all preceding commands before
            all subsequent ones. At the beginning of a command buffer, this
            also orders the commands after those of earlier submissions. */
@@ -442,13 +414,13 @@ void jitc_vulkan_access(VulkanDevice &dev, const VulkanRange *reads,
         vkCmdPipelineBarrier(s.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                              nullptr, 0, nullptr);
-        s.reads.clear();
-        s.writes.clear();
         s.barrier_pending = false;
+        s.write_pending = false;
     }
 
-    s.reads.insert(s.reads.end(), reads, reads + n_reads);
-    s.writes.insert(s.writes.end(), writes, writes + n_writes);
+    if (is_write)
+        s.write_pending = true;
+
     s.cmd_count++;
 }
 
@@ -480,8 +452,8 @@ void jitc_vulkan_submit(VulkanDevice &dev) {
     s.cmd = nullptr;
     s.cmd_count = 0;
     s.cmd_staging = 0;
-    s.reads.clear();
-    s.writes.clear();
+    s.write_pending = false;
+    s.barrier_pending = true;
 
     uint64_t value = dev.timeline_value + 1;
     VkResult rv = vkEndCommandBuffer(cmd);

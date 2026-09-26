@@ -181,6 +181,8 @@ void* jitc_malloc(JitBackend backend, size_t size, bool shared) {
        wasteful, but reduces the number of different sizes that an allocation
        can have to a manageable amount that facilitates re-use. */
     size = round_pow2(size);
+    jitc_assert((size & (size - 1)) == 0,
+                "jit_malloc(): allocation size (%zu) must be a power of two!", size);
 
     ThreadState *ts = nullptr;
     int device = 0;
@@ -206,15 +208,10 @@ void* jitc_malloc(JitBackend backend, size_t size, bool shared) {
         /* Vulkan buffers are backed by dedicated memory allocations, whose
            size is limited by the device */
         const VulkanDevice &dev = state.vulkan_devices[device];
-        uint64_t max_size;
-        if (shared || !dev.sparse_binding) {
-            max_size = dev.max_memory_allocation_size;
-            if (dev.max_buffer_size > 0 && dev.max_buffer_size < max_size)
-                max_size = dev.max_buffer_size;
-        } else {
-            max_size = dev.max_buffer_size > 0 ? dev.max_buffer_size
-                                               : dev.max_memory_allocation_size;
-        }
+        uint64_t max_size = (shared || !dev.sparse_binding)
+                                ? std::min(dev.max_memory_allocation_size,
+                                           dev.max_buffer_size)
+                                : dev.max_buffer_size;
         if (size > max_size)
             jitc_raise("jit_malloc(): the allocation size (%zu bytes, i.e., "
                        "the requested size rounded up to a power of two) "

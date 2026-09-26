@@ -69,7 +69,6 @@ static void vulkan_fill(VulkanDevice &dev, void *ptr, size_t size,
         jitc_raise("%s(): " DRJIT_PTR " is not a Vulkan allocation!", func,
                    (uintptr_t) ptr);
 
-    VulkanRange write { (uintptr_t) ptr, (uintptr_t) ptr + size };
     uint8_t *staging = nullptr;
     void *staging_alloc = nullptr;
     size_t staging_size = 0;
@@ -107,7 +106,7 @@ static void vulkan_fill(VulkanDevice &dev, void *ptr, size_t size,
             staging_buf = jitc_vulkan_find_buffer(staging, &staging_offset);
 
         VkCommandBuffer cmd = jitc_vulkan_cmd(dev);
-        jitc_vulkan_access(dev, nullptr, 0, &write, 1);
+        jitc_vulkan_access(dev, true);
 
         if (body_start < body_end) {
             // The 4-byte word covering an aligned position of the body
@@ -143,7 +142,7 @@ static void vulkan_fill(VulkanDevice &dev, void *ptr, size_t size,
 
         VulkanBuffer *buf = jitc_vulkan_find_buffer(ptr);
         VkCommandBuffer cmd = jitc_vulkan_cmd(dev);
-        jitc_vulkan_access(dev, nullptr, 0, &write, 1);
+        jitc_vulkan_access(dev, true);
         vkCmdUpdateBuffer(cmd, buf->buffer, offset, size, data.get());
     } else {
         /* Non-repeating 8-byte pattern: stage a chunk containing multiple
@@ -179,7 +178,7 @@ static void vulkan_fill(VulkanDevice &dev, void *ptr, size_t size,
         }
 
         VkCommandBuffer cmd = jitc_vulkan_cmd(dev);
-        jitc_vulkan_access(dev, nullptr, 0, &write, 1);
+        jitc_vulkan_access(dev, true);
         vkCmdCopyBuffer(cmd, staging_buf->buffer, buf->buffer,
                         (uint32_t) n_regions, regions.get());
     }
@@ -199,13 +198,12 @@ static void vulkan_upload(VulkanDevice &dev, void *dst, const void *src,
                           size_t size) {
     size_t dst_offset = 0;
     jitc_vulkan_find_buffer(dst, &dst_offset);
-    VulkanRange write { (uintptr_t) dst, (uintptr_t) dst + size };
 
     if (dst_offset % 4 == 0 && size % 4 == 0 && size <= VulkanMaxUpdateSize) {
         // Embed the data into the command buffer
         VulkanBuffer *dst_buf = jitc_vulkan_find_buffer(dst);
         VkCommandBuffer cmd = jitc_vulkan_cmd(dev);
-        jitc_vulkan_access(dev, nullptr, 0, &write, 1);
+        jitc_vulkan_access(dev, true);
         vkCmdUpdateBuffer(cmd, dst_buf->buffer, dst_offset, size, src);
     } else {
         void *staging_alloc = nullptr;
@@ -231,7 +229,7 @@ static void vulkan_upload(VulkanDevice &dev, void *dst, const void *src,
                          jitc_vulkan_find_buffer(staging, &staging_offset);
 
         VkCommandBuffer cmd = jitc_vulkan_cmd(dev);
-        jitc_vulkan_access(dev, nullptr, 0, &write, 1);
+        jitc_vulkan_access(dev, true);
         VkBufferCopy region { staging_offset, dst_offset, size };
         vkCmdCopyBuffer(cmd, staging_buf->buffer, dst_buf->buffer, 1, &region);
 
@@ -252,15 +250,15 @@ static void vulkan_copy_buffer(VulkanDevice &dev, void *dst, const void *src,
     VulkanBuffer *dst_buf = jitc_vulkan_find_buffer(dst, &dst_offset),
                  *src_buf = jitc_vulkan_find_buffer(src, &src_offset);
 
-    VulkanRange read { (uintptr_t) src, (uintptr_t) src + size },
-                write { (uintptr_t) dst, (uintptr_t) dst + size };
+    uintptr_t src_addr = (uintptr_t) src,
+              dst_addr = (uintptr_t) dst;
 
-    if (dst_buf == src_buf && read.start < write.end && write.start < read.end)
+    if (dst_buf == src_buf && src_addr < dst_addr + size && dst_addr < src_addr + size)
         jitc_raise("%s(): the source and destination ranges overlap, which is "
                    "not supported by the Vulkan backend!", func);
 
     VkCommandBuffer cmd = jitc_vulkan_cmd(dev);
-    jitc_vulkan_access(dev, &read, 1, &write, 1);
+    jitc_vulkan_access(dev, true);
     VkBufferCopy region { src_offset, dst_offset, size };
     vkCmdCopyBuffer(cmd, src_buf->buffer, dst_buf->buffer, 1, &region);
 
