@@ -987,7 +987,7 @@ static void capture_spirv_cb(LogLevel, const char *msg) {
 /// Schedule 'var_idx', run jit_eval() with PrintIR enabled to capture the
 /// assembled SPIR-V module, and validate it using SPIRV-Tools (Vulkan 1.3 /
 /// SPIR-V 1.6).
-static std::string assemble_and_validate_spirv(uint32_t var_idx) {
+static std::string assemble_and_validate_spirv(uint32_t var_idx = 0) {
     g_captured_spirv.clear();
 
     LogLevel prev_stderr   = jit_log_level_stderr(),
@@ -998,7 +998,8 @@ static std::string assemble_and_validate_spirv(uint32_t var_idx) {
     jit_set_log_level_callback(LogLevel::Warn, capture_spirv_cb);
     jit_set_flag(JitFlag::PrintIR, 1);
 
-    jit_var_schedule(var_idx);
+    if (var_idx)
+        jit_var_schedule(var_idx);
     bool threw = raises([] { jit_eval(); }, "cannot compile kernels");
 
     jit_set_flag(JitFlag::PrintIR, prev_print_ir);
@@ -1572,5 +1573,387 @@ TEST_VULKAN(19_spirv_ops) {
     jit_var_dec_ref(m1);
     jit_var_dec_ref(m0);
 }
+
+TEST_VULKAN(20_spirv_memory_ops) {
+    const uint32_t n = 16;
+    int prev_cp  = jit_flag(JitFlag::ConstantPropagation);
+    int prev_pkt = jit_flag(JitFlag::PacketOps);
+    int prev_dbg = jit_flag(JitFlag::Debug);
+    jit_set_flag(JitFlag::ConstantPropagation, 0);
+    jit_set_flag(JitFlag::PacketOps, 1);
+
+    auto make_buf = [&](VarType vt, uint32_t count, uint8_t seed) -> uint32_t {
+        size_t esize = 1;
+        switch (vt) {
+            case VarType::Bool:
+            case VarType::Int8:
+            case VarType::UInt8:   esize = 1; break;
+            case VarType::Int16:
+            case VarType::UInt16:
+            case VarType::Float16: esize = 2; break;
+            case VarType::Int32:
+            case VarType::UInt32:
+            case VarType::Float32: esize = 4; break;
+            case VarType::Int64:
+            case VarType::UInt64:
+            case VarType::Float64: esize = 8; break;
+            default: break;
+        }
+        std::vector<uint8_t> bytes(count * esize, seed);
+        return jit_var_mem_copy(Backend, vt, bytes.data(), count, 0);
+    };
+
+    uint8_t mask_data[n];
+    uint32_t idx_data[n], idx2_data[n];
+    int32_t sidx_data[n];
+    for (uint32_t i = 0; i < n; ++i) {
+        mask_data[i] = (uint8_t) (i & 1);
+        idx_data[i]  = (n - 1 - i);
+        idx2_data[i] = (i * 3) % n;
+        sidx_data[i] = (int32_t) ((n - 1 - i));
+    }
+    uint32_t mask_vec = jit_var_mem_copy(Backend, VarType::Bool, mask_data, n, 0);
+    uint8_t mask_true_val = 1;
+    uint32_t mask_true = jit_var_literal(Backend, VarType::Bool, &mask_true_val, n, 0);
+    uint32_t idx_vec  = jit_var_mem_copy(Backend, VarType::UInt32, idx_data, n, 0),
+             idx2_vec = jit_var_mem_copy(Backend, VarType::UInt32, idx2_data, n, 0),
+             sidx_vec = jit_var_mem_copy(Backend, VarType::Int32, sidx_data, n, 0);
+
+    const VarType all_types[] = {
+        VarType::Bool,    VarType::Int8,    VarType::UInt8,   VarType::Int16,
+        VarType::UInt16,  VarType::Int32,   VarType::UInt32,  VarType::Int64,
+        VarType::UInt64,  VarType::Float16, VarType::Float32, VarType::Float64
+    };
+
+    // 1. Gather across all 12 scalar types (chained unmasked + masked in same kernel)
+    for (VarType vt : all_types) {
+        uint32_t src = make_buf(vt, n * 2, 1);
+        uint32_t g1  = jit_var_gather(src, idx_vec, mask_true);
+        uint32_t g2  = jit_var_gather(src, idx2_vec, mask_vec);
+        uint32_t out = (vt == VarType::Bool) ? jit_var_xor(g1, g2)
+                                             : jit_var_add(g1, g2);
+
+        std::string spv = assemble_and_validate_spirv(out);
+        jit_assert(spv.find("OpConvertUToPtr ") != std::string::npos);
+        jit_assert(spv.find("OpPtrAccessChain ") != std::string::npos);
+        jit_assert(spv.find("OpLoad ") != std::string::npos);
+        jit_assert(spv.find("OpPhi ") != std::string::npos);
+
+        jit_var_dec_ref(out);
+        jit_var_dec_ref(g2);
+        jit_var_dec_ref(g1);
+        jit_var_dec_ref(src);
+    }
+
+    // 2. PacketGather + Extract for packet sizes 2, 4, 8 across all 12 scalar types
+    for (size_t pkt_n : { (size_t) 2, (size_t) 4, (size_t) 8 }) {
+        for (VarType vt : all_types) {
+            uint32_t src = make_buf(vt, (uint32_t) (n * pkt_n), 2);
+            uint32_t outs[8] = { };
+            jit_var_gather_packet(pkt_n, src, idx_vec, mask_vec, outs);
+
+            jit_var_inc_ref(outs[0]);
+            uint32_t acc = outs[0];
+            for (size_t k = 1; k < pkt_n; ++k) {
+                uint32_t next = (vt == VarType::Bool) ? jit_var_xor(acc, outs[k])
+                                                      : jit_var_add(acc, outs[k]);
+                jit_var_dec_ref(acc);
+                acc = next;
+            }
+
+            std::string spv = assemble_and_validate_spirv(acc);
+            jit_assert(spv.find("OpTypeVector ") != std::string::npos);
+            jit_assert(spv.find("OpCompositeExtract ") != std::string::npos);
+            jit_assert(spv.find("OpPhi ") != std::string::npos);
+
+            jit_var_dec_ref(acc);
+            for (size_t k = 0; k < pkt_n; ++k)
+                jit_var_dec_ref(outs[k]);
+            jit_var_dec_ref(src);
+        }
+    }
+
+    // 3. Scatter (ReduceOp::Identity) across all 12 scalar types
+    for (VarType vt : all_types) {
+        uint32_t dst = make_buf(vt, n * 2, 0),
+                 val = make_buf(vt, n, 3);
+        uint32_t out_dst = jit_var_scatter(dst, val, idx_vec, mask_vec,
+                                           ReduceOp::Identity, ReduceMode::Auto);
+        jit_var_dec_ref(dst);
+
+        std::string spv = assemble_and_validate_spirv();
+        jit_assert(spv.find("OpConvertUToPtr ") != std::string::npos);
+        jit_assert(spv.find("OpPtrAccessChain ") != std::string::npos);
+        jit_assert(spv.find("OpStore ") != std::string::npos);
+
+        jit_var_dec_ref(val);
+        jit_var_dec_ref(out_dst);
+    }
+
+    // 4. PacketScatter for packet sizes 2, 4, 8 across all 12 scalar types
+    for (size_t pkt_n : { (size_t) 2, (size_t) 4, (size_t) 8 }) {
+        for (VarType vt : all_types) {
+            uint32_t dst = make_buf(vt, (uint32_t) (n * pkt_n), 0);
+            uint32_t vals[8] = { };
+            for (size_t k = 0; k < pkt_n; ++k)
+                vals[k] = make_buf(vt, n, (uint8_t) (k + 1));
+
+            uint32_t out_dst = jit_var_scatter_packet(
+                pkt_n, dst, vals, idx_vec, mask_vec,
+                ReduceOp::Identity, ReduceMode::Auto);
+            jit_var_dec_ref(dst);
+
+            std::string spv = assemble_and_validate_spirv();
+            jit_assert(spv.find("OpCompositeConstruct ") != std::string::npos);
+            jit_assert(spv.find("OpShiftRightLogical %u32 ") != std::string::npos);
+            jit_assert(spv.find("OpStore ") != std::string::npos);
+
+            for (size_t k = 0; k < pkt_n; ++k)
+                jit_var_dec_ref(vals[k]);
+            jit_var_dec_ref(out_dst);
+        }
+    }
+
+    // 5. ScatterReduce capability queries and SPIR-V validation
+    for (VarType unsupported_vt : { VarType::Bool, VarType::Int8, VarType::UInt8,
+                                    VarType::Int16, VarType::UInt16, VarType::Float16 }) {
+        jit_assert(jit_can_scatter_reduce(Backend, unsupported_vt, ReduceOp::Identity) == 1);
+        jit_assert(jit_can_scatter_reduce(Backend, unsupported_vt, ReduceOp::Add) == 0);
+        jit_assert(jit_can_scatter_reduce(Backend, unsupported_vt, ReduceOp::Min) == 0);
+    }
+    jit_assert(jit_can_scatter_reduce(Backend, VarType::UInt32, ReduceOp::Mul) == 0);
+    jit_assert(jit_can_scatter_reduce(Backend, VarType::Float32, ReduceOp::And) == 0);
+    jit_assert(jit_can_scatter_reduce(Backend, VarType::Float32, ReduceOp::Or) == 0);
+
+    const ReduceOp int_red_ops[] = {
+        ReduceOp::Add, ReduceOp::Min, ReduceOp::Max, ReduceOp::And, ReduceOp::Or
+    };
+    const ReduceMode red_modes[] = {
+        ReduceMode::Direct, ReduceMode::Local, ReduceMode::NoConflicts
+    };
+
+    for (VarType vt : { VarType::Int32, VarType::UInt32, VarType::Int64, VarType::UInt64 }) {
+        for (ReduceOp op : int_red_ops) {
+            if (!jit_can_scatter_reduce(Backend, vt, op))
+                continue;
+            for (ReduceMode mode : red_modes) {
+                uint32_t dst = make_buf(vt, n * 2, 0),
+                         val = make_buf(vt, n, 5);
+                uint32_t out_dst = jit_var_scatter(dst, val, idx_vec, mask_vec, op, mode);
+                jit_var_dec_ref(dst);
+
+                std::string spv = assemble_and_validate_spirv();
+                if (mode == ReduceMode::NoConflicts) {
+                    jit_assert(spv.find("OpLoad ") != std::string::npos);
+                    jit_assert(spv.find("OpStore ") != std::string::npos);
+                } else {
+                    jit_assert(spv.find("OpAtomic") != std::string::npos);
+                    if (vt == VarType::Int64 || vt == VarType::UInt64)
+                        jit_assert(spv.find("OpCapability Int64Atomics\n") != std::string::npos);
+                    if (mode == ReduceMode::Local &&
+                        (vt == VarType::Int32 || vt == VarType::UInt32)) {
+                        jit_assert(spv.find("OpCapability GroupNonUniformBallot\n") != std::string::npos);
+                        jit_assert(spv.find("OpCapability GroupNonUniformArithmetic\n") != std::string::npos);
+                        jit_assert(spv.find("OpGroupNonUniformBallot ") != std::string::npos);
+                        jit_assert(spv.find("OpGroupNonUniformBroadcastFirst ") != std::string::npos);
+                        jit_assert(spv.find("OpGroupNonUniformAll ") != std::string::npos);
+                    }
+                }
+
+                jit_var_dec_ref(val);
+                jit_var_dec_ref(out_dst);
+            }
+        }
+    }
+
+    const ReduceOp float_red_ops[] = {
+        ReduceOp::Add, ReduceOp::Min, ReduceOp::Max
+    };
+    for (VarType vt : { VarType::Float32, VarType::Float64 }) {
+        for (ReduceOp op : float_red_ops) {
+            if (!jit_can_scatter_reduce(Backend, vt, op))
+                continue;
+            for (ReduceMode mode : red_modes) {
+                uint32_t dst = make_buf(vt, n * 2, 0),
+                         val = make_buf(vt, n, 0x3f);
+                uint32_t out_dst = jit_var_scatter(dst, val, idx_vec, mask_vec, op, mode);
+                jit_var_dec_ref(dst);
+
+                std::string spv = assemble_and_validate_spirv();
+                if (mode == ReduceMode::NoConflicts) {
+                    jit_assert(spv.find("OpLoad ") != std::string::npos);
+                    jit_assert(spv.find("OpStore ") != std::string::npos);
+                } else if (op == ReduceOp::Add) {
+                    bool has_ext = spv.find("OpAtomicFAddEXT ") != std::string::npos;
+                    bool has_cas = spv.find("OpAtomicCompareExchange ") != std::string::npos;
+                    jit_assert(has_ext || has_cas);
+                    if (has_ext) {
+                        jit_assert(spv.find("OpExtension \"SPV_EXT_shader_atomic_float_add\"\n") !=
+                                   std::string::npos);
+                        jit_assert(spv.find(vt == VarType::Float32
+                                                ? "OpCapability AtomicFloat32AddEXT\n"
+                                                : "OpCapability AtomicFloat64AddEXT\n") !=
+                                   std::string::npos);
+                    } else {
+                        jit_assert(spv.find("OpLoopMerge ") != std::string::npos);
+                    }
+                } else {
+                    jit_assert(spv.find("OpSGreaterThanEqual %bool ") != std::string::npos);
+                    jit_assert(spv.find(op == ReduceOp::Min ? "OpAtomicSMin " : "OpAtomicSMax ") !=
+                               std::string::npos);
+                    jit_assert(spv.find(op == ReduceOp::Min ? "OpAtomicUMax " : "OpAtomicUMin ") !=
+                               std::string::npos);
+                }
+
+                if (mode == ReduceMode::Local && vt == VarType::Float32) {
+                    jit_assert(spv.find("OpGroupNonUniformF") != std::string::npos);
+                }
+
+                jit_var_dec_ref(val);
+                jit_var_dec_ref(out_dst);
+            }
+        }
+    }
+
+    // 6. ScatterInc, ScatterExch, and ScatterCAS (including chained ops in same kernel)
+    {
+        uint32_t dst1 = make_buf(VarType::UInt32, n * 2, 0),
+                 dst2 = make_buf(VarType::UInt32, n * 2, 0);
+        uint32_t inc1 = jit_var_scatter_inc(&dst1, idx_vec, mask_vec);
+        uint32_t inc2 = jit_var_scatter_inc(&dst2, idx2_vec, mask_true);
+        uint32_t tot  = jit_var_add(inc1, inc2);
+
+        std::string spv = assemble_and_validate_spirv(tot);
+        jit_assert(spv.find("OpAtomicIAdd %u32 ") != std::string::npos);
+        jit_assert(spv.find("OpPhi %u32 ") != std::string::npos);
+
+        jit_var_dec_ref(tot);
+        jit_var_dec_ref(inc2);
+        jit_var_dec_ref(inc1);
+        jit_var_dec_ref(dst2);
+        jit_var_dec_ref(dst1);
+    }
+
+    for (VarType vt : { VarType::Int32, VarType::UInt32, VarType::Float32,
+                        VarType::Int64, VarType::UInt64, VarType::Float64 }) {
+        // ScatterExch
+        {
+            uint32_t dst = make_buf(vt, n * 2, 1),
+                     val = make_buf(vt, n, 2);
+            uint32_t old_val = jit_var_scatter_exch(&dst, val, idx_vec, mask_vec);
+
+            std::string spv = assemble_and_validate_spirv(old_val);
+            jit_assert(spv.find("OpAtomicExchange ") != std::string::npos);
+            jit_assert(spv.find("OpPhi ") != std::string::npos);
+
+            jit_var_dec_ref(old_val);
+            jit_var_dec_ref(val);
+            jit_var_dec_ref(dst);
+        }
+
+        // ScatterCAS
+        {
+            uint32_t dst = make_buf(vt, n * 2, 1),
+                     cmp = make_buf(vt, n, 1),
+                     val = make_buf(vt, n, 2),
+                     old_val = 0,
+                     success = 0;
+            jit_var_scatter_cas(&dst, cmp, val, idx_vec, mask_vec, &old_val, &success);
+            uint32_t combined = jit_var_select(success, old_val, val);
+
+            std::string spv = assemble_and_validate_spirv(combined);
+            jit_assert(spv.find("OpAtomicCompareExchange ") != std::string::npos);
+            jit_assert(spv.find("OpIEqual %bool ") != std::string::npos);
+            jit_assert(spv.find("OpPhi %bool ") != std::string::npos);
+
+            jit_var_dec_ref(combined);
+            jit_var_dec_ref(success);
+            jit_var_dec_ref(old_val);
+            jit_var_dec_ref(val);
+            jit_var_dec_ref(cmp);
+            jit_var_dec_ref(dst);
+        }
+    }
+
+    // 7. BoundsCheck (JitFlag::Debug enabled) across Gather (unsigned + signed index),
+    //    PacketGather, Scatter, PacketScatter, ScatterReduce, ScatterInc, ScatterExch, ScatterCAS
+    jit_set_flag(JitFlag::Debug, 1);
+    {
+        uint32_t src = make_buf(VarType::UInt32, n * 4, 1);
+        uint32_t g_u = jit_var_gather(src, idx_vec, mask_vec);
+        uint32_t g_s = jit_var_gather(src, sidx_vec, mask_vec);
+        uint32_t pg_outs[4] = { };
+        jit_var_gather_packet(4, src, idx_vec, mask_vec, pg_outs);
+
+        uint32_t sum1 = jit_var_add(g_u, g_s),
+                 sum2 = jit_var_add(pg_outs[0], pg_outs[3]),
+                 tot  = jit_var_add(sum1, sum2);
+
+        std::string spv = assemble_and_validate_spirv(tot);
+        jit_assert(spv.find("OpULessThan %bool ") != std::string::npos);
+        jit_assert(spv.find("%bchk_err_") != std::string::npos);
+        jit_assert(spv.find("%bchk_done_") != std::string::npos);
+
+        jit_var_dec_ref(tot);
+        jit_var_dec_ref(sum2);
+        jit_var_dec_ref(sum1);
+        for (int k = 0; k < 4; ++k)
+            jit_var_dec_ref(pg_outs[k]);
+        jit_var_dec_ref(g_s);
+        jit_var_dec_ref(g_u);
+        jit_var_dec_ref(src);
+    }
+    {
+        uint32_t dst1 = make_buf(VarType::UInt32, n * 4, 0),
+                 dst2 = make_buf(VarType::UInt32, n * 4, 0),
+                 dst3 = make_buf(VarType::UInt32, n * 4, 0),
+                 dst4 = make_buf(VarType::UInt32, n * 4, 0),
+                 dst5 = make_buf(VarType::UInt32, n * 4, 0),
+                 dst6 = make_buf(VarType::UInt32, n * 4, 0),
+                 val  = make_buf(VarType::UInt32, n, 7),
+                 vals[2] = { val, val };
+        uint32_t out_dst1 = jit_var_scatter(dst1, val, sidx_vec, mask_vec, ReduceOp::Identity, ReduceMode::Auto);
+        jit_var_dec_ref(dst1);
+        uint32_t out_dst2 = jit_var_scatter_packet(2, dst2, vals, idx_vec, mask_vec, ReduceOp::Identity, ReduceMode::Auto);
+        jit_var_dec_ref(dst2);
+        uint32_t out_dst3 = jit_var_scatter(dst3, val, idx_vec, mask_vec, ReduceOp::Add, ReduceMode::Direct);
+        jit_var_dec_ref(dst3);
+        uint32_t inc_v  = jit_var_scatter_inc(&dst4, idx_vec, mask_vec);
+        uint32_t exch_v = jit_var_scatter_exch(&dst5, val, idx_vec, mask_vec);
+        uint32_t cas_old = 0, cas_ok = 0;
+        jit_var_scatter_cas(&dst6, val, val, idx_vec, mask_vec, &cas_old, &cas_ok);
+        uint32_t s0  = jit_var_add(inc_v, exch_v),
+                 tot = jit_var_select(cas_ok, s0, cas_old);
+
+        std::string spv = assemble_and_validate_spirv(tot);
+        jit_assert(spv.find("%bchk_err_") != std::string::npos);
+        jit_assert(spv.find("%bchk_done_") != std::string::npos);
+
+        jit_var_dec_ref(tot);
+        jit_var_dec_ref(s0);
+        jit_var_dec_ref(cas_ok);
+        jit_var_dec_ref(cas_old);
+        jit_var_dec_ref(exch_v);
+        jit_var_dec_ref(inc_v);
+        jit_var_dec_ref(val);
+        jit_var_dec_ref(dst6);
+        jit_var_dec_ref(dst5);
+        jit_var_dec_ref(dst4);
+        jit_var_dec_ref(out_dst3);
+        jit_var_dec_ref(out_dst2);
+        jit_var_dec_ref(out_dst1);
+    }
+
+    jit_set_flag(JitFlag::Debug, prev_dbg);
+    jit_set_flag(JitFlag::PacketOps, prev_pkt);
+    jit_set_flag(JitFlag::ConstantPropagation, prev_cp);
+
+    jit_var_dec_ref(sidx_vec);
+    jit_var_dec_ref(idx2_vec);
+    jit_var_dec_ref(idx_vec);
+    jit_var_dec_ref(mask_true);
+    jit_var_dec_ref(mask_vec);
+}
+
 
 

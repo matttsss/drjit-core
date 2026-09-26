@@ -2890,9 +2890,32 @@ bool jitc_can_scatter_reduce(JitBackend backend, VarType vt, ReduceOp op) {
     is_metal = jitc_is_metal(backend);
 #endif
 
+#if defined(DRJIT_ENABLE_VULKAN)
+    bool is_vulkan = jitc_is_vulkan(backend);
+    bool vk_int64_atomics = false, vk_f64_atomic_add = false;
+    if (is_vulkan) {
+        const VulkanDevice &dev =
+            state.vulkan_devices[thread_state(backend)->device];
+        vk_int64_atomics = dev.shader_int64_atomics;
+        vk_f64_atomic_add = dev.shader_float64_atomic_add;
+    }
+#else
+    bool is_vulkan = false, vk_int64_atomics = false, vk_f64_atomic_add = false;
+    (void) is_vulkan; (void) vk_int64_atomics; (void) vk_f64_atomic_add;
+#endif
+
     // Metal does not support 64-bit atomics
     if (is_metal && (vt == VarType::Int64 || vt == VarType::UInt64 ||
                      vt == VarType::Float64))
+        return false;
+
+    // Vulkan does not support 16-bit atomics
+    if (is_vulkan && (vt == VarType::Int16 || vt == VarType::UInt16 ||
+                      vt == VarType::Float16))
+        return false;
+
+    if (is_vulkan && (vt == VarType::Int64 || vt == VarType::UInt64) &&
+        !vk_int64_atomics)
         return false;
 
 
@@ -2922,12 +2945,16 @@ bool jitc_can_scatter_reduce(JitBackend backend, VarType vt, ReduceOp op) {
             break;
 
         case VarType::Float32:
-            // CUDA/Metal emulate float32 min/max using integer atomics
+            // CUDA/Metal/Vulkan emulate float32 min/max using integer atomics
             break;
 
         case VarType::Float64:
             // Double precision addition requires sm_60, min/max are emulated
             if (is_cuda && op == ReduceOp::Add && compute_capability < 60)
+                return false;
+            if (is_vulkan && !(op == ReduceOp::Add
+                                   ? (vk_f64_atomic_add || vk_int64_atomics)
+                                   : vk_int64_atomics))
                 return false;
             break;
 

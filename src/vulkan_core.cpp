@@ -986,6 +986,7 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
     features12.shaderFloat16 = f12.shaderFloat16;
     features12.storageBuffer8BitAccess = f12.storageBuffer8BitAccess;
     features12.shaderBufferInt64Atomics = f12.shaderBufferInt64Atomics;
+    features12.shaderSubgroupExtendedTypes = f12.shaderSubgroupExtendedTypes;
     features12.vulkanMemoryModel = f12.vulkanMemoryModel;
     features12.vulkanMemoryModelDeviceScope = f12.vulkanMemoryModelDeviceScope;
     features13.maintenance4 = VK_TRUE;
