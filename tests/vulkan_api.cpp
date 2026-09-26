@@ -144,7 +144,7 @@ static void check_loaded() {
     CHECK(jit_vulkan_instance() != nullptr);
     int major = 0, minor = 0, patch = -1;
     jit_vulkan_version(&major, &minor, &patch);
-    CHECK(major == 1 && minor >= 2 && patch >= 0);
+    CHECK(major == 1 && minor >= 3 && patch >= 0);
     CHECK(jit_vulkan_lookup("vkCreateDevice") != nullptr);
     CHECK(jit_vulkan_lookup("spvTextToBinary") != nullptr);
 
@@ -234,18 +234,17 @@ static void test02_physical_devices(bool require) {
     if (require)
         CHECK(count > 0);
 
-    // The instance targets Vulkan 1.3 if the loader supports it (else 1.2)
+    // The instance requires Vulkan 1.3
     int major = 0, minor = 0, patch = 0;
     jit_vulkan_version(&major, &minor, &patch);
-    bool instance13 = major > 1 || minor >= 3;
+    CHECK(major > 1 || (major == 1 && minor >= 3));
 
     for (VkPhysicalDevice dev : devices) {
         VkPhysicalDeviceProperties props;
         memset(&props, 0, sizeof(props));
         GetPhysicalDeviceProperties(dev, &props);
         uint32_t version = props.apiVersion;
-        bool vk12 = version >= VK_API_VERSION_1_2,
-             vk13 = version >= VK_API_VERSION_1_3 && instance13;
+        bool vk13 = version >= VK_API_VERSION_1_3;
 
         // Spec-mandated minimum limits (these fields span the whole struct)
         const VkPhysicalDeviceLimits &l = props.limits;
@@ -268,9 +267,12 @@ static void test02_physical_devices(bool require) {
         char driver_name[VK_MAX_DRIVER_NAME_SIZE] = "?";
         uint32_t subgroup_size = 0;
 
-        if (vk12) {
+        if (vk13) {
+            VkPhysicalDeviceVulkan13Properties p13 {};
+            p13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES;
             VkPhysicalDeviceVulkan12Properties p12 {};
             p12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES;
+            p12.pNext = &p13;
             VkPhysicalDeviceVulkan11Properties p11 {};
             p11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES;
             p11.pNext = &p12;
@@ -279,7 +281,7 @@ static void test02_physical_devices(bool require) {
             p2.pNext = &p11;
             GetPhysicalDeviceProperties2(dev, &p2);
 
-            CHECK(p2.pNext == &p11 && p11.pNext == &p12 && !p12.pNext);
+            CHECK(p2.pNext == &p11 && p11.pNext == &p12 && p12.pNext == &p13 && !p13.pNext);
             CHECK(p2.properties.apiVersion == props.apiVersion &&
                   p2.properties.vendorID == props.vendorID &&
                   p2.properties.deviceID == props.deviceID &&
@@ -290,16 +292,17 @@ static void test02_physical_devices(bool require) {
             CHECK(p11.maxMemoryAllocationSize >= (1u << 30));
             CHECK(p12.driverID != 0 && p12.driverName[0] != '\0');
             CHECK(p12.maxTimelineSemaphoreValueDifference >= 0x7FFFFFFFull);
+            CHECK(p13.maxBufferSize >= (1u << 30));
 
             memcpy(driver_name, p12.driverName, sizeof(driver_name));
             subgroup_size = p11.subgroupSize;
 
-            // Features that Vulkan 1.0/1.2/1.3 devices must support
+            // Features that Vulkan 1.3 devices must support
             VkPhysicalDeviceVulkan13Features f13 {};
             f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
             VkPhysicalDeviceVulkan12Features f12 {};
             f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-            f12.pNext = vk13 ? &f13 : nullptr;
+            f12.pNext = &f13;
             VkPhysicalDeviceVulkan11Features f11 {};
             f11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
             f11.pNext = &f12;
@@ -312,12 +315,11 @@ static void test02_physical_devices(bool require) {
             CHECK(f12.timelineSemaphore == VK_TRUE &&
                   f12.uniformBufferStandardLayout == VK_TRUE &&
                   f12.hostQueryReset == VK_TRUE);
-            if (vk13)
-                CHECK(f12.bufferDeviceAddress == VK_TRUE &&
-                      f12.vulkanMemoryModel == VK_TRUE &&
-                      f13.synchronization2 == VK_TRUE &&
-                      f13.dynamicRendering == VK_TRUE &&
-                      f13.maintenance4 == VK_TRUE);
+            CHECK(f12.bufferDeviceAddress == VK_TRUE &&
+                  f12.vulkanMemoryModel == VK_TRUE &&
+                  f13.synchronization2 == VK_TRUE &&
+                  f13.dynamicRendering == VK_TRUE &&
+                  f13.maintenance4 == VK_TRUE);
         }
 
         uint32_t n_families = 0;
@@ -420,7 +422,7 @@ static void test03_spirv_tools() {
     auto DiagnosticDestroy =
         lookup<PFN_spvDiagnosticDestroy>("spvDiagnosticDestroy");
 
-    spv_context ctx = ContextCreate(SPV_ENV_VULKAN_1_2);
+    spv_context ctx = ContextCreate(SPV_ENV_VULKAN_1_3);
     CHECK(ctx != nullptr);
 
     // Assemble, validate, and disassemble a valid kernel
@@ -430,7 +432,7 @@ static void test03_spirv_tools() {
           SPV_SUCCESS);
     CHECK(binary && !diag && binary->wordCount > 5);
     CHECK(binary->code[0] == 0x07230203u); // SPIR-V magic number
-    CHECK(binary->code[1] == 0x00010500u); // SPIR-V 1.5 (Vulkan 1.2)
+    CHECK(binary->code[1] == 0x00010600u); // SPIR-V 1.6 (Vulkan 1.3)
     CHECK(ValidateBinary(ctx, binary->code, binary->wordCount, &diag) ==
           SPV_SUCCESS);
     CHECK(!diag);

@@ -185,7 +185,7 @@ TEST_VULKAN(01_device) {
     PhysicalDeviceProperties props;
     get_properties(devices[index], &props);
     jit_assert(strcmp(props.deviceName, name) == 0);
-    jit_assert(props.apiVersion >= ((1u << 22) | (2u << 12))); // >= 1.2
+    jit_assert(props.apiVersion >= ((1u << 22) | (3u << 12))); // >= 1.3
 
     jit_log(LogLevel::Info, "Using Vulkan device %i (\"%s\")", index, name);
 }
@@ -255,7 +255,22 @@ TEST_VULKAN(02_malloc) {
     }
     jit_flush_malloc_cache();
 
-    // Allocations exceeding the device limits raise an exception
+    // Large allocation (1 GiB)
+    {
+        size_t size = (size_t) 1 << 30;
+        uint8_t *q = (uint8_t *) jit_malloc(Backend, size, false);
+        jit_assert(q != nullptr);
+        jit_assert(jit_vulkan_lookup_buffer(q + size - 1, &offset) &&
+                   offset == size - 1);
+        jit_free(q);
+        jit_flush_malloc_cache();
+    }
+
+    // Allocations exceeding the device limits raise an exception.
+    // Under the power-of-two schema, a 3 GiB request rounds up to 4 GiB,
+    // which exceeds maxMemoryAllocationSize on NVIDIA (~3.998 GiB) and llvmpipe (2.0 GiB).
+    jit_assert(raises([&] { jit_malloc(Backend, (size_t) 3 << 30, false); },
+                      "exceeds the maximum allocation size"));
     for (int shared = 0; shared < 2; ++shared)
         jit_assert(raises([&] { jit_malloc(Backend, (size_t) 1 << 50, shared); },
                           "exceeds the maximum allocation size"));

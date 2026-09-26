@@ -821,6 +821,7 @@ struct VulkanDevice {
     uint32_t max_memory_allocation_count = 0;
     uint32_t max_storage_buffer_range = 0;
     uint64_t max_memory_allocation_size = 0;
+    uint64_t max_buffer_size = 0;
 
     /// Memory type indices for device-local and host-visible ("shared")
     /// allocations, in order of decreasing preference

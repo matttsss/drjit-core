@@ -412,7 +412,7 @@ ThreadState *jitc_init_thread_state(JitBackend backend) {
             jitc_raise(
                 "jit_init_thread_state(): the Vulkan backend has not been "
                 "initialized. Make sure to call jit_init(JitBackend::Vulkan) "
-                "first. The Vulkan backend requires a Vulkan 1.2 (or newer) "
+                "first. The Vulkan backend requires a Vulkan 1.3 (or newer) "
                 "capable device and driver.");
 
         if (state.vulkan_devices.empty())

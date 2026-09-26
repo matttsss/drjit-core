@@ -584,9 +584,11 @@ struct VulkanDeviceInfo {
     VkPhysicalDeviceProperties props {};
     VkPhysicalDeviceVulkan11Properties props11 {};
     VkPhysicalDeviceVulkan12Properties props12 {};
+    VkPhysicalDeviceVulkan13Properties props13 {};
     VkPhysicalDeviceFeatures2 features {};
     VkPhysicalDeviceVulkan11Features features11 {};
     VkPhysicalDeviceVulkan12Features features12 {};
+    VkPhysicalDeviceVulkan13Features features13 {};
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomic_float {};
     VkPhysicalDeviceAccelerationStructureFeaturesKHR accel {};
     VkPhysicalDeviceRayQueryFeaturesKHR ray_query {};
@@ -681,8 +683,8 @@ static void vulkan_query_device(VkPhysicalDevice handle,
     vkGetPhysicalDeviceMemoryProperties(handle, &info.mem_props);
     vulkan_rank_memory_types(info);
 
-    if (info.props.apiVersion < VK_API_VERSION_1_2) {
-        info.reason = "Vulkan 1.2 is not supported";
+    if (info.props.apiVersion < VK_API_VERSION_1_3) {
+        info.reason = "Vulkan 1.3 is not supported";
         return;
     }
 
@@ -721,7 +723,9 @@ static void vulkan_query_device(VkPhysicalDevice handle,
     info.props11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES;
     info.props11.pNext = &info.props12;
     info.props12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES;
-    info.props12.pNext = nullptr;
+    info.props12.pNext = &info.props13;
+    info.props13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES;
+    info.props13.pNext = nullptr;
     vkGetPhysicalDeviceProperties2(handle, &props2);
 
     // Features
@@ -729,8 +733,10 @@ static void vulkan_query_device(VkPhysicalDevice handle,
     info.features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     info.features11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
     info.features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    info.features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     *next = &info.features11; next = &info.features11.pNext;
     *next = &info.features12; next = &info.features12.pNext;
+    *next = &info.features13; next = &info.features13.pNext;
 
     if (info.has_atomic_float) {
         info.atomic_float.sType =
@@ -755,8 +761,9 @@ static void vulkan_query_device(VkPhysicalDevice handle,
 
     // The feature/property structures remain valid, but their chains don't
     info.features.pNext = info.features11.pNext = info.features12.pNext =
-        info.atomic_float.pNext = info.accel.pNext = info.ray_query.pNext =
-        info.props11.pNext = info.props12.pNext = nullptr;
+        info.features13.pNext = info.atomic_float.pNext = info.accel.pNext =
+        info.ray_query.pNext = info.props11.pNext = info.props12.pNext =
+        info.props13.pNext = nullptr;
 
     // Find a queue family supporting compute
     uint32_t n_families = 0;
@@ -782,6 +789,8 @@ static void vulkan_query_device(VkPhysicalDevice handle,
         info.reason = "the 'scalarBlockLayout' feature is not supported";
     else if (!info.features.features.shaderInt64)
         info.reason = "the 'shaderInt64' feature is not supported";
+    else if (!info.features13.maintenance4)
+        info.reason = "the 'maintenance4' feature is not supported";
     else if (info.device_mem_type_count == 0)
         info.reason = "no device-local memory type";
     else if (info.shared_mem_type_count == 0)
@@ -838,14 +847,17 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
     VkPhysicalDeviceFeatures2 features {};
     VkPhysicalDeviceVulkan11Features features11 {};
     VkPhysicalDeviceVulkan12Features features12 {};
+    VkPhysicalDeviceVulkan13Features features13 {};
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomic_float {};
     features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
     features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     atomic_float.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
     features.pNext = &features11;
     features11.pNext = &features12;
+    features12.pNext = &features13;
 
     const VkPhysicalDeviceFeatures &f = info.features.features;
     const VkPhysicalDeviceVulkan11Features &f11 = info.features11;
@@ -865,6 +877,8 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
     features12.shaderBufferInt64Atomics = f12.shaderBufferInt64Atomics;
     features12.vulkanMemoryModel = f12.vulkanMemoryModel;
     features12.vulkanMemoryModelDeviceScope = f12.vulkanMemoryModelDeviceScope;
+    features13.maintenance4 = VK_TRUE;
+    features13.synchronization2 = info.features13.synchronization2;
 
     const char *extensions[2] = { };
     uint32_t n_extensions = 0;
@@ -884,7 +898,7 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
         atomic_float.shaderBufferFloat64Atomics = faf.shaderBufferFloat64Atomics;
         atomic_float.shaderBufferFloat64AtomicAdd =
             faf.shaderBufferFloat64AtomicAdd;
-        features12.pNext = &atomic_float;
+        features13.pNext = &atomic_float;
     }
 
     VkDeviceCreateInfo device_info {};
@@ -964,6 +978,7 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
     dev.max_memory_allocation_count = limits.maxMemoryAllocationCount;
     dev.max_storage_buffer_range = limits.maxStorageBufferRange;
     dev.max_memory_allocation_size = info.props11.maxMemoryAllocationSize;
+    dev.max_buffer_size = info.props13.maxBufferSize;
     memcpy(dev.device_mem_types, info.device_mem_types,
            sizeof(dev.device_mem_types));
     memcpy(dev.shared_mem_types, info.shared_mem_types,

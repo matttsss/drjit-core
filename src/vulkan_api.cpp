@@ -204,7 +204,7 @@ bool jitc_vulkan_api_init() {
     if (!jitc_vulkan_handle)
         return jitc_vulkan_api_fail(
             "could not load the Vulkan loader (\"%s\"). Please install a "
-            "graphics driver with Vulkan 1.2 support, or set the "
+            "graphics driver with Vulkan 1.3 support, or set the "
             "DRJIT_LIBVULKAN_PATH environment variable to specify the path of "
             "the Vulkan loader", jitc_vulkan_fname);
 
@@ -228,7 +228,7 @@ bool jitc_vulkan_api_init() {
     if (!vkEnumerateInstanceVersion)
         return jitc_vulkan_api_fail(
             "the Vulkan loader only supports Vulkan 1.0, but Dr.Jit requires "
-            "Vulkan 1.2 or newer. Please update your graphics driver and "
+            "Vulkan 1.3 or newer. Please update your graphics driver and "
             "Vulkan loader");
 
     if (missing)
@@ -246,10 +246,10 @@ bool jitc_vulkan_api_init() {
              patch = VK_API_VERSION_PATCH(version);
 
     if (VK_API_VERSION_VARIANT(version) != 0 || major < 1 ||
-        (major == 1 && minor < 2))
+        (major == 1 && minor < 3))
         return jitc_vulkan_api_fail(
             "the Vulkan loader only supports Vulkan %u.%u, but Dr.Jit requires "
-            "Vulkan 1.2 or newer. Please update your graphics driver and "
+            "Vulkan 1.3 or newer. Please update your graphics driver and "
             "Vulkan loader", major, minor);
 
     // 2. Load SPIRV-Tools, which assembles the generated SPIR-V code
@@ -282,11 +282,11 @@ bool jitc_vulkan_api_init() {
             "could not find the function \"%s\" in the SPIRV-Tools library",
             missing);
 
-    jitc_vulkan_spv_context = spvContextCreate(SPV_ENV_VULKAN_1_2);
+    jitc_vulkan_spv_context = spvContextCreate(SPV_ENV_VULKAN_1_3);
     if (!jitc_vulkan_spv_context)
         return jitc_vulkan_api_fail(
             "spvContextCreate() failed. The SPIRV-Tools library is likely too "
-            "old (support for the Vulkan 1.2 target environment is required)");
+            "old (support for the Vulkan 1.3 target environment is required)");
 
     // 3. Create the Vulkan instance
     std::vector<VkExtensionProperties> extensions;
@@ -309,9 +309,7 @@ bool jitc_vulkan_api_init() {
             has_portability_enumeration = true;
     }
 
-    // Dr.Jit uses Vulkan 1.3 functionality when it is available
-    uint32_t api_version = (major == 1 && minor == 2) ? VK_API_VERSION_1_2
-                                                      : VK_API_VERSION_1_3;
+    uint32_t api_version = VK_API_VERSION_1_3;
 
     VkApplicationInfo app_info {};
     app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
