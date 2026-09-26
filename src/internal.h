@@ -837,6 +837,7 @@ struct VulkanDevice {
     bool shader_int64_atomics = false;
     bool shader_float32_atomic_add = false, shader_float64_atomic_add = false;
     bool vulkan_memory_model = false;
+    bool sparse_binding = false;
 
     /// Ray tracing support (only detected for now, enabled in the future)
     bool supports_ray_query = false, supports_accel = false;

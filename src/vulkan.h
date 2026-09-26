@@ -43,6 +43,7 @@ struct VulkanBuffer {
     VkDeviceMemory memory;
     VkDeviceAddress address;
     bool shared;
+    std::vector<VkDeviceMemory> sparse_memories;
 };
 
 /// Byte range [start, end) of a memory access (in terms of Dr.Jit pointers)

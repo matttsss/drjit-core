@@ -142,6 +142,20 @@ struct alignas(8) PhysicalDeviceProperties {
 
 using PFN_EnumeratePhysicalDevices = int32_t (*)(void *, uint32_t *, void **);
 using PFN_GetPhysicalDeviceProperties = void (*)(void *, void *);
+using PFN_GetPhysicalDeviceProperties2 = void (*)(void *, void *);
+
+struct PhysicalDeviceVulkan13Properties {
+    uint32_t sType = 54;
+    void *pNext = nullptr;
+    uint8_t padding[192] { };
+    uint64_t maxBufferSize = 0;
+};
+
+struct PhysicalDeviceProperties2 {
+    uint32_t sType = 1000059001;
+    void *pNext = nullptr;
+    PhysicalDeviceProperties properties { };
+};
 
 /// Enumerate the physical devices of the Vulkan instance of Dr.Jit
 static std::vector<void *> physical_devices() {
@@ -266,11 +280,42 @@ TEST_VULKAN(02_malloc) {
         jit_flush_malloc_cache();
     }
 
-    // Allocations exceeding the device limits raise an exception.
-    // Under the power-of-two schema, a 3 GiB request rounds up to 4 GiB,
-    // which exceeds maxMemoryAllocationSize on NVIDIA (~3.998 GiB) and llvmpipe (2.0 GiB).
-    jit_assert(raises([&] { jit_malloc(Backend, (size_t) 3 << 30, false); },
+    // Large allocation (3 GiB requested -> 4 GiB power-of-two buffer).
+    // On devices where maxMemoryAllocationSize < 4 GiB and maxBufferSize >= 4 GiB
+    // (such as NVIDIA, where maxMemoryAllocationSize is ~3.998 GiB and
+    // maxBufferSize is 1 TiB), this verifies allocation beyond maxMemoryAllocationSize
+    // via direct allocation or sparse binding.
+    {
+        auto get_properties2 = (PFN_GetPhysicalDeviceProperties2) jit_vulkan_lookup(
+            "vkGetPhysicalDeviceProperties2");
+        PhysicalDeviceVulkan13Properties props13;
+        PhysicalDeviceProperties2 props2;
+        props2.pNext = &props13;
+        get_properties2(jit_vulkan_physical_device(), &props2);
+
+        size_t size = (size_t) 3 << 30; // rounds up to 4 GiB
+        size_t rounded_size = (size_t) 4 << 30;
+
+        if (rounded_size <= props13.maxBufferSize) {
+            uint8_t *q = (uint8_t *) jit_malloc(Backend, size, false);
+            jit_assert(q != nullptr);
+            jit_assert(jit_vulkan_device_address(q) != 0);
+            jit_assert(jit_vulkan_lookup_buffer(q + rounded_size - 1, &offset) &&
+                       offset == rounded_size - 1);
+            jit_free(q);
+            jit_flush_malloc_cache();
+        } else {
+            jit_assert(raises([&] { jit_malloc(Backend, size, false); },
+                              "exceeds the maximum allocation size"));
+        }
+    }
+
+    // Shared allocation of 3 GiB (rounds up to 4 GiB) exceeds maxMemoryAllocationSize
+    // on NVIDIA (~3.998 GiB) and llvmpipe (2.0 GiB) and cannot be sparse.
+    jit_assert(raises([&] { jit_malloc(Backend, (size_t) 3 << 30, true); },
                       "exceeds the maximum allocation size"));
+
+    // Allocations exceeding the maximum buffer size raise an exception
     for (int shared = 0; shared < 2; ++shared)
         jit_assert(raises([&] { jit_malloc(Backend, (size_t) 1 << 50, shared); },
                           "exceeds the maximum allocation size"));

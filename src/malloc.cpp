@@ -206,9 +206,15 @@ void* jitc_malloc(JitBackend backend, size_t size, bool shared) {
         /* Vulkan buffers are backed by dedicated memory allocations, whose
            size is limited by the device */
         const VulkanDevice &dev = state.vulkan_devices[device];
-        uint64_t max_size = dev.max_memory_allocation_size;
-        if (dev.max_buffer_size > 0 && dev.max_buffer_size < max_size)
-            max_size = dev.max_buffer_size;
+        uint64_t max_size;
+        if (shared || !dev.sparse_binding) {
+            max_size = dev.max_memory_allocation_size;
+            if (dev.max_buffer_size > 0 && dev.max_buffer_size < max_size)
+                max_size = dev.max_buffer_size;
+        } else {
+            max_size = dev.max_buffer_size > 0 ? dev.max_buffer_size
+                                               : dev.max_memory_allocation_size;
+        }
         if (size > max_size)
             jitc_raise("jit_malloc(): the allocation size (%zu bytes, i.e., "
                        "the requested size rounded up to a power of two) "

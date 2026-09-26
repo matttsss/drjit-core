@@ -131,30 +131,28 @@ VulkanBuffer *vulkan_buffer_new(const VulkanDevice &dev, size_t size,
 
     // Try the compatible memory types in order of decreasing preference
     VkDeviceMemory memory = VK_NULL_HANDLE;
-    if (reqs.size <= dev.max_memory_allocation_size) {
-        VkMemoryAllocateFlagsInfo flags_info {};
-        flags_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
-        flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateFlagsInfo flags_info {};
+    flags_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
 
-        VkMemoryAllocateInfo alloc_info {};
-        alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        alloc_info.pNext = &flags_info;
-        alloc_info.allocationSize = reqs.size;
+    VkMemoryAllocateInfo alloc_info {};
+    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc_info.pNext = &flags_info;
+    alloc_info.allocationSize = reqs.size;
 
-        const uint8_t *types =
-            shared ? dev.shared_mem_types : dev.device_mem_types;
-        uint32_t type_count =
-            shared ? dev.shared_mem_type_count : dev.device_mem_type_count;
+    const uint8_t *types =
+        shared ? dev.shared_mem_types : dev.device_mem_types;
+    uint32_t type_count =
+        shared ? dev.shared_mem_type_count : dev.device_mem_type_count;
 
-        for (uint32_t i = 0; i < type_count; ++i) {
-            if (!(reqs.memoryTypeBits & (1u << types[i])))
-                continue;
-            alloc_info.memoryTypeIndex = types[i];
-            if (vkAllocateMemory(device, &alloc_info, nullptr, &memory) ==
-                VK_SUCCESS)
-                break;
-            memory = VK_NULL_HANDLE;
-        }
+    for (uint32_t i = 0; i < type_count; ++i) {
+        if (!(reqs.memoryTypeBits & (1u << types[i])))
+            continue;
+        alloc_info.memoryTypeIndex = types[i];
+        if (vkAllocateMemory(device, &alloc_info, nullptr, &memory) ==
+            VK_SUCCESS)
+            break;
+        memory = VK_NULL_HANDLE;
     }
 
     void *mapped = nullptr;
@@ -173,27 +171,160 @@ VulkanBuffer *vulkan_buffer_new(const VulkanDevice &dev, size_t size,
         success = address != 0;
     }
 
-    if (!success) {
-        vkDestroyBuffer(device, buffer, nullptr);
-        if (memory)
-            vkFreeMemory(device, memory, nullptr); // (also unmaps)
-        return nullptr;
+    if (success) {
+        VulkanBuffer *result = new VulkanBuffer();
+        result->base = shared ? (uintptr_t) mapped : (uintptr_t) address;
+        result->size = size;
+        result->device = device;
+        result->buffer = buffer;
+        result->memory = memory;
+        result->address = address;
+        result->shared = shared;
+        return result;
     }
 
-    VulkanBuffer *result = new VulkanBuffer();
-    result->base = shared ? (uintptr_t) mapped : (uintptr_t) address;
-    result->size = size;
-    result->device = device;
-    result->buffer = buffer;
-    result->memory = memory;
-    result->address = address;
-    result->shared = shared;
-    return result;
+    // Direct allocation failed. Clean up temporary buffer & memory if any.
+    if (buffer) {
+        vkDestroyBuffer(device, buffer, nullptr);
+        buffer = VK_NULL_HANDLE;
+    }
+    if (memory) {
+        vkFreeMemory(device, memory, nullptr);
+        memory = VK_NULL_HANDLE;
+    }
+
+    // Fall back to sparse buffer binding if supported and not shared
+    if (dev.sparse_binding && !shared) {
+        VkBufferCreateInfo sparse_info {};
+        sparse_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        sparse_info.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT |
+                            VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT;
+        sparse_info.size = size;
+        sparse_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                            VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        sparse_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        if (vkCreateBuffer(device, &sparse_info, nullptr, &buffer) !=
+            VK_SUCCESS)
+            return nullptr;
+
+        vkGetBufferMemoryRequirements(device, buffer, &reqs);
+
+        uint32_t mem_type_index = UINT32_MAX;
+        for (uint32_t i = 0; i < dev.device_mem_type_count; ++i) {
+            if (reqs.memoryTypeBits & (1u << dev.device_mem_types[i])) {
+                mem_type_index = dev.device_mem_types[i];
+                break;
+            }
+        }
+        if (mem_type_index == UINT32_MAX) {
+            vkDestroyBuffer(device, buffer, nullptr);
+            return nullptr;
+        }
+
+        VkDeviceSize max_chunk = dev.max_memory_allocation_size;
+        if (reqs.alignment > 0)
+            max_chunk = (max_chunk / reqs.alignment) * reqs.alignment;
+        if (max_chunk == 0) {
+            vkDestroyBuffer(device, buffer, nullptr);
+            return nullptr;
+        }
+
+        std::vector<VkDeviceMemory> chunks;
+        std::vector<VkSparseMemoryBind> binds;
+        VkDeviceSize offset = 0;
+        bool chunk_ok = true;
+
+        while (offset < reqs.size) {
+            VkDeviceSize cur_chunk = std::min(max_chunk, reqs.size - offset);
+
+            VkMemoryAllocateFlagsInfo chunk_flags {};
+            chunk_flags.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+            chunk_flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+
+            VkMemoryAllocateInfo chunk_alloc {};
+            chunk_alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            chunk_alloc.pNext = &chunk_flags;
+            chunk_alloc.allocationSize = cur_chunk;
+            chunk_alloc.memoryTypeIndex = mem_type_index;
+
+            VkDeviceMemory chunk_mem = VK_NULL_HANDLE;
+            if (vkAllocateMemory(device, &chunk_alloc, nullptr, &chunk_mem) !=
+                VK_SUCCESS) {
+                chunk_ok = false;
+                break;
+            }
+            chunks.push_back(chunk_mem);
+
+            VkSparseMemoryBind bind {};
+            bind.resourceOffset = offset;
+            bind.size = cur_chunk;
+            bind.memory = chunk_mem;
+            bind.memoryOffset = 0;
+            bind.flags = 0;
+            binds.push_back(bind);
+
+            offset += cur_chunk;
+        }
+
+        if (chunk_ok) {
+            VkSparseBufferMemoryBindInfo buf_bind {};
+            buf_bind.buffer = buffer;
+            buf_bind.bindCount = (uint32_t) binds.size();
+            buf_bind.pBinds = binds.data();
+
+            VkBindSparseInfo bind_info {};
+            bind_info.sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO;
+            bind_info.bufferBindCount = 1;
+            bind_info.pBufferBinds = &buf_bind;
+
+            VkResult rv;
+            {
+                lock_guard guard(state.lock);
+                rv = vkQueueBindSparse((VkQueue) dev.queue, 1, &bind_info,
+                                       VK_NULL_HANDLE);
+                if (rv == VK_SUCCESS)
+                    rv = vkQueueWaitIdle((VkQueue) dev.queue);
+            }
+
+            if (rv == VK_SUCCESS) {
+                VkBufferDeviceAddressInfo address_info {};
+                address_info.sType =
+                    VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+                address_info.buffer = buffer;
+                address = vkGetBufferDeviceAddress(device, &address_info);
+            }
+        }
+
+        if (address != 0) {
+            VulkanBuffer *result = new VulkanBuffer();
+            result->base = (uintptr_t) address;
+            result->size = size;
+            result->device = device;
+            result->buffer = buffer;
+            result->memory = VK_NULL_HANDLE;
+            result->address = address;
+            result->shared = false;
+            result->sparse_memories = std::move(chunks);
+            return result;
+        }
+
+        vkDestroyBuffer(device, buffer, nullptr);
+        for (VkDeviceMemory mem : chunks)
+            vkFreeMemory(device, mem, nullptr);
+    }
+
+    return nullptr;
 }
 
 void vulkan_buffer_free(VulkanBuffer *buffer) {
     vkDestroyBuffer(buffer->device, buffer->buffer, nullptr);
-    vkFreeMemory(buffer->device, buffer->memory, nullptr); // (also unmaps)
+    if (buffer->memory)
+        vkFreeMemory(buffer->device, buffer->memory, nullptr); // (also unmaps)
+    for (VkDeviceMemory mem : buffer->sparse_memories)
+        vkFreeMemory(buffer->device, mem, nullptr);
     delete buffer;
 }
 
@@ -596,6 +727,7 @@ struct VulkanDeviceInfo {
 
     /// Index of the first queue family supporting compute (or UINT32_MAX)
     uint32_t queue_family = UINT32_MAX;
+    uint32_t queue_flags = 0;
 
     /// Supported device extensions
     bool has_portability_subset = false, has_atomic_float = false,
@@ -775,6 +907,7 @@ static void vulkan_query_device(VkPhysicalDevice handle,
         if ((families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
             families[i].queueCount > 0) {
             info.queue_family = i;
+            info.queue_flags = families[i].queueFlags;
             break;
         }
     }
@@ -867,6 +1000,12 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
     features.features.shaderInt64 = VK_TRUE;
     features.features.shaderInt16 = f.shaderInt16;
     features.features.shaderFloat64 = f.shaderFloat64;
+    bool sparse_binding = f.sparseBinding && f.sparseResidencyBuffer &&
+                          (info.queue_flags & VK_QUEUE_SPARSE_BINDING_BIT);
+    if (sparse_binding) {
+        features.features.sparseBinding = VK_TRUE;
+        features.features.sparseResidencyBuffer = VK_TRUE;
+    }
     features11.storageBuffer16BitAccess = f11.storageBuffer16BitAccess;
     features12.bufferDeviceAddress = VK_TRUE;
     features12.timelineSemaphore = VK_TRUE;
@@ -979,6 +1118,7 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
     dev.max_storage_buffer_range = limits.maxStorageBufferRange;
     dev.max_memory_allocation_size = info.props11.maxMemoryAllocationSize;
     dev.max_buffer_size = info.props13.maxBufferSize;
+    dev.sparse_binding = sparse_binding;
     memcpy(dev.device_mem_types, info.device_mem_types,
            sizeof(dev.device_mem_types));
     memcpy(dev.shared_mem_types, info.shared_mem_types,
@@ -1009,7 +1149,7 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
 
     jitc_log(Info,
              "jit_vulkan_init(): using device %i (\"%s\", Vulkan %u.%u, "
-             "subgroup size %u, %s max. allocation)%s%s%s%s%s%s%s%s%s",
+             "subgroup size %u, %s max. allocation)%s%s%s%s%s%s%s%s%s%s",
              index, dev.name, VK_API_VERSION_MAJOR(dev.api_version),
              VK_API_VERSION_MINOR(dev.api_version), dev.subgroup_size,
              jitc_mem_string(dev.max_memory_allocation_size).c_str(),
@@ -1021,7 +1161,8 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
              dev.shader_float32_atomic_add ? ", fp32 atomic add" : "",
              dev.shader_float64_atomic_add ? ", fp64 atomic add" : "",
              dev.supports_accel ? ", accel. structures" : "",
-             dev.supports_ray_query ? ", ray queries" : "");
+             dev.supports_ray_query ? ", ray queries" : "",
+             dev.sparse_binding ? ", sparse binding" : "");
 
     return true;
 }

@@ -109,6 +109,7 @@ DRJIT_VK_HANDLE(VkSemaphore)
 DRJIT_VK_HANDLE(VkFence)
 DRJIT_VK_HANDLE(VkDeviceMemory)
 DRJIT_VK_HANDLE(VkBuffer)
+DRJIT_VK_HANDLE(VkImage)
 DRJIT_VK_HANDLE(VkShaderModule)
 DRJIT_VK_HANDLE(VkPipelineCache)
 DRJIT_VK_HANDLE(VkPipelineLayout)
@@ -169,6 +170,7 @@ typedef enum VkStructureType {
     VK_STRUCTURE_TYPE_SUBMIT_INFO = 4,
     VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO = 5,
     VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE = 6,
+    VK_STRUCTURE_TYPE_BIND_SPARSE_INFO = 7,
     VK_STRUCTURE_TYPE_FENCE_CREATE_INFO = 8,
     VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO = 9,
     VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO = 12,
@@ -266,6 +268,24 @@ typedef enum VkMemoryAllocateFlagBits {
 } VkMemoryAllocateFlagBits;
 typedef VkFlags VkMemoryAllocateFlags;
 
+typedef enum VkSparseMemoryBindFlagBits {
+    VK_SPARSE_MEMORY_BIND_METADATA_BIT = 0x00000001,
+    VK_SPARSE_MEMORY_BIND_FLAG_BITS_MAX_ENUM = 0x7FFFFFFF
+} VkSparseMemoryBindFlagBits;
+typedef VkFlags VkSparseMemoryBindFlags;
+
+typedef enum VkImageAspectFlagBits {
+    VK_IMAGE_ASPECT_COLOR_BIT = 0x00000001,
+    VK_IMAGE_ASPECT_DEPTH_BIT = 0x00000002,
+    VK_IMAGE_ASPECT_STENCIL_BIT = 0x00000004,
+    VK_IMAGE_ASPECT_METADATA_BIT = 0x00000008,
+    VK_IMAGE_ASPECT_PLANE_0_BIT = 0x00000010,
+    VK_IMAGE_ASPECT_PLANE_1_BIT = 0x00000020,
+    VK_IMAGE_ASPECT_PLANE_2_BIT = 0x00000040,
+    VK_IMAGE_ASPECT_FLAG_BITS_MAX_ENUM = 0x7FFFFFFF
+} VkImageAspectFlagBits;
+typedef VkFlags VkImageAspectFlags;
+
 typedef enum VkBufferUsageFlagBits {
     VK_BUFFER_USAGE_TRANSFER_SRC_BIT = 0x00000001,
     VK_BUFFER_USAGE_TRANSFER_DST_BIT = 0x00000002,
@@ -283,6 +303,14 @@ typedef enum VkBufferUsageFlagBits {
     VK_BUFFER_USAGE_FLAG_BITS_MAX_ENUM = 0x7FFFFFFF
 } VkBufferUsageFlagBits;
 typedef VkFlags VkBufferUsageFlags;
+typedef enum VkBufferCreateFlagBits {
+    VK_BUFFER_CREATE_SPARSE_BINDING_BIT = 0x00000001,
+    VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT = 0x00000002,
+    VK_BUFFER_CREATE_SPARSE_ALIASED_BIT = 0x00000004,
+    VK_BUFFER_CREATE_PROTECTED_BIT = 0x00000008,
+    VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT = 0x00000010,
+    VK_BUFFER_CREATE_FLAG_BITS_MAX_ENUM = 0x7FFFFFFF
+} VkBufferCreateFlagBits;
 typedef VkFlags VkBufferCreateFlags;
 
 typedef enum VkSharingMode {
@@ -506,6 +534,12 @@ typedef struct VkExtent3D {
     uint32_t height;
     uint32_t depth;
 } VkExtent3D;
+
+typedef struct VkOffset3D {
+    int32_t x;
+    int32_t y;
+    int32_t z;
+} VkOffset3D;
 
 typedef struct VkApplicationInfo {
     VkStructureType sType;
@@ -1129,6 +1163,62 @@ typedef struct VkMemoryRequirements {
     uint32_t memoryTypeBits;
 } VkMemoryRequirements;
 
+typedef struct VkImageSubresource {
+    VkImageAspectFlags aspectMask;
+    uint32_t mipLevel;
+    uint32_t arrayLayer;
+} VkImageSubresource;
+
+typedef struct VkSparseMemoryBind {
+    VkDeviceSize resourceOffset;
+    VkDeviceSize size;
+    VkDeviceMemory memory;
+    VkDeviceSize memoryOffset;
+    VkSparseMemoryBindFlags flags;
+} VkSparseMemoryBind;
+
+typedef struct VkSparseBufferMemoryBindInfo {
+    VkBuffer buffer;
+    uint32_t bindCount;
+    const VkSparseMemoryBind *pBinds;
+} VkSparseBufferMemoryBindInfo;
+
+typedef struct VkSparseImageOpaqueMemoryBindInfo {
+    VkImage image;
+    uint32_t bindCount;
+    const VkSparseMemoryBind *pBinds;
+} VkSparseImageOpaqueMemoryBindInfo;
+
+typedef struct VkSparseImageMemoryBind {
+    VkImageSubresource subresource;
+    VkOffset3D offset;
+    VkExtent3D extent;
+    VkDeviceMemory memory;
+    VkDeviceSize memoryOffset;
+    VkSparseMemoryBindFlags flags;
+} VkSparseImageMemoryBind;
+
+typedef struct VkSparseImageMemoryBindInfo {
+    VkImage image;
+    uint32_t bindCount;
+    const VkSparseImageMemoryBind *pBinds;
+} VkSparseImageMemoryBindInfo;
+
+typedef struct VkBindSparseInfo {
+    VkStructureType sType;
+    const void *pNext;
+    uint32_t waitSemaphoreCount;
+    const VkSemaphore *pWaitSemaphores;
+    uint32_t bufferBindCount;
+    const VkSparseBufferMemoryBindInfo *pBufferBinds;
+    uint32_t imageOpaqueBindCount;
+    const VkSparseImageOpaqueMemoryBindInfo *pImageOpaqueBinds;
+    uint32_t imageBindCount;
+    const VkSparseImageMemoryBindInfo *pImageBinds;
+    uint32_t signalSemaphoreCount;
+    const VkSemaphore *pSignalSemaphores;
+} VkBindSparseInfo;
+
 typedef struct VkMemoryAllocateInfo {
     VkStructureType sType;
     const void *pNext;
@@ -1426,6 +1516,7 @@ typedef VkResult (VKAPI_PTR *PFN_vkEndCommandBuffer)(VkCommandBuffer commandBuff
 typedef VkResult (VKAPI_PTR *PFN_vkResetCommandBuffer)(VkCommandBuffer commandBuffer, VkCommandBufferResetFlags flags);
 typedef VkResult (VKAPI_PTR *PFN_vkQueueSubmit)(VkQueue queue, uint32_t submitCount, const VkSubmitInfo *pSubmits, VkFence fence);
 typedef VkResult (VKAPI_PTR *PFN_vkQueueWaitIdle)(VkQueue queue);
+typedef VkResult (VKAPI_PTR *PFN_vkQueueBindSparse)(VkQueue queue, uint32_t bindInfoCount, const VkBindSparseInfo *pBindInfo, VkFence fence);
 typedef VkResult (VKAPI_PTR *PFN_vkCreateSemaphore)(VkDevice device, const VkSemaphoreCreateInfo *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkSemaphore *pSemaphore);
 typedef void (VKAPI_PTR *PFN_vkDestroySemaphore)(VkDevice device, VkSemaphore semaphore, const VkAllocationCallbacks *pAllocator);
 typedef VkResult (VKAPI_PTR *PFN_vkWaitSemaphores)(VkDevice device, const VkSemaphoreWaitInfo *pWaitInfo, uint64_t timeout);
@@ -1607,6 +1698,7 @@ typedef const char *(*PFN_spvSoftwareVersionString)(void);
     X(vkResetCommandBuffer)                                                    \
     X(vkQueueSubmit)                                                           \
     X(vkQueueWaitIdle)                                                         \
+    X(vkQueueBindSparse)                                                       \
     X(vkCreateSemaphore)                                                       \
     X(vkDestroySemaphore)                                                      \
     X(vkWaitSemaphores)                                                        \
