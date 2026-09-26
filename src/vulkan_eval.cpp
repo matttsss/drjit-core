@@ -87,7 +87,9 @@ static uint16_t emitted_flags[(size_t) VarType::Count];
 static uint32_t spv_flags = 0;
 static tsl::robin_set<uint32_t> emitted_u32_consts;
 static tsl::robin_set<uint32_t> emitted_fn_arr_types;
+static tsl::robin_set<XXH128_hash_t, XXH128Hasher, XXH128Eq> emitted_lit_consts;
 static uint32_t spv_aux_id = 0;
+static uint32_t spv_func_id = 0;
 
 static char current_block_label[64];
 
@@ -121,7 +123,9 @@ void jitc_vulkan_assemble_reset() {
     spv_flags = 0;
     emitted_u32_consts.clear();
     emitted_fn_arr_types.clear();
+    emitted_lit_consts.clear();
     spv_aux_id = 0;
+    spv_func_id = 0;
 
     snprintf(current_block_label, sizeof(current_block_label), "%%loop_body");
 }
@@ -339,6 +343,24 @@ static const char *jitc_vulkan_require_one(VarType vt) {
             break;
     }
     return name;
+}
+
+static void jitc_vulkan_render_literal(const Variable *v) {
+    VarType vt = (VarType) v->type;
+    if (vt == VarType::Pointer)
+        vt = VarType::UInt64;
+    jitc_vulkan_require_type(vt);
+    if (vt == VarType::Bool) {
+        const char *bc = v->literal ? jitc_vulkan_require_one(VarType::Bool)
+                                    : jitc_vulkan_require_zero(VarType::Bool);
+        fmt("$v = OpCopyObject $t $s\n", v, v, bc);
+        return;
+    }
+    const char *short_t = type_name_vulkan[(uint32_t) vt] + 1;
+    XXH128_hash_t key { v->literal, (uint64_t) vt };
+    if (emitted_lit_consts.insert(key).second)
+        fmt_tc("%c_lit_$s_$Q = OpConstant $t $l\n", short_t, v->literal, v, v);
+    fmt("$v = OpCopyObject $t %c_lit_$s_$Q\n", v, v, short_t, v->literal);
 }
 
 static const char *jitc_vulkan_require_ones(VarType vt) {
@@ -959,6 +981,7 @@ static void jitc_vulkan_render_array_memcpy_out(
 // ----------------------------------------------------------------------------
 
 static uint32_t active_vulkan_wg_size = 256;
+static void jitc_vulkan_append_unit_funcs(const StringBuffer &unit_src);
 
 void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
                           uint32_t /*n_regs*/, uint32_t n_params) {
@@ -1032,10 +1055,9 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
     if (call_buffer.base_v) {
         uint32_t arg_idx = call_buffer.base_param_index - 1;
         jitc_vulkan_require_u32_const(arg_idx);
-        fmt("%p_r$u = OpAccessChain $s %params %c_u32_1 %c_u32_$u\n"
-            "%r$u = OpLoad %u64 %p_r$u$s\n",
-            call_buffer.base_reg, param_u64_ptr_type, arg_idx,
-            call_buffer.base_reg, call_buffer.base_reg, param_u64_load_align);
+        fmt("%p_call_base = OpAccessChain $s %params %c_u32_1 %c_u32_$u\n"
+            "%call_base = OpLoad %u64 %p_call_base$s\n",
+            param_u64_ptr_type, arg_idx, param_u64_load_align);
     }
 
     // 3. Render every variable in the schedule
@@ -1214,9 +1236,6 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
         "%stride = OpIMul %u32 %nwg %c_u32_$u\n",
         wg_size);
 
-    if (spv_flags & SpvCapSubgroup)
-        put("%sg_inv_id = OpLoad %u32 %gl_SubgroupLocalInvocationId\n");
-
     if (params_in_pc) {
         put("%size_ptr = OpAccessChain %ptr_pc_u32 %params %c_u32_0\n"
             "%size = OpLoad %u32 %size_ptr\n");
@@ -1244,6 +1263,16 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
         "%loop_exit = OpLabel\n"
         "OpReturn\n"
         "OpFunctionEnd\n");
+
+    // 6. Merge direct callables (captured in unit_entry->src) and indirect
+    //    callable units into this single SPIR-V module.
+    jitc_unit_finalize(JitBackend::Vulkan);
+    jitc_vulkan_append_unit_funcs(unit_entry->src);
+    for (const CallableUnit &cu : callable_units)
+        jitc_vulkan_append_unit_funcs(cu.unit->src);
+
+    unit_entry->src.clear();
+    callable_units.clear();
 }
 
 static void jitc_vulkan_render_round(Variable *v, Variable *a0, const char *op) {
@@ -1294,19 +1323,14 @@ static void jitc_vulkan_render(Variable *v) {
         case VarKind::Nop:
             break;
 
-        case VarKind::Undefined:
-            fmt_tc("$v = OpConstantNull $t\n", v, v);
+        case VarKind::Undefined: {
+            const char *zero_c = jitc_vulkan_require_zero(vt);
+            fmt("$v = OpCopyObject $t $s\n", v, v, zero_c);
             break;
+        }
 
         case VarKind::Literal:
-            if (vt == VarType::Bool) {
-                if (v->literal)
-                    fmt_tc("$v = OpConstantTrue $t\n", v, v);
-                else
-                    fmt_tc("$v = OpConstantFalse $t\n", v, v);
-            } else {
-                fmt_tc("$v = OpConstant $t $l\n", v, v, v);
-            }
+            jitc_vulkan_render_literal(v);
             break;
 
         case VarKind::Counter:
@@ -2340,11 +2364,15 @@ static void jitc_vulkan_render(Variable *v) {
 
                 fmt("$v_ballot = OpGroupNonUniformBallot $s %c_u32_3 $s\n"
                     "$v_leader = OpGroupNonUniformBallotFindLSB %u32 %c_u32_3 $v_ballot\n"
+                    "$v_fptr = OpGroupNonUniformBroadcastFirst %u64 %c_u32_3 $v\n"
+                    "$v_same_ptr = OpIEqual %bool $v $v_fptr\n"
                     "$v_fidx = OpGroupNonUniformBroadcastFirst %u32 %c_u32_3 $v\n"
-                    "$v_sidx = OpIEqual %bool $v $v_fidx\n"
-                    "$v_all = OpGroupNonUniformAll %bool %c_u32_3 $v_sidx\n"
+                    "$v_same_idx = OpIEqual %bool $v $v_fidx\n"
+                    "$v_same = OpLogicalAnd %bool $v_same_ptr $v_same_idx\n"
+                    "$v_all = OpGroupNonUniformAll %bool %c_u32_3 $v_same\n"
                     "$v_sgred = $s $t %c_u32_3 Reduce $v\n"
-                    "$v_isldr = OpIEqual %bool %sg_inv_id $v_leader\n"
+                    "$v_sg_id = OpLoad %u32 %gl_SubgroupLocalInvocationId\n"
+                    "$v_isldr = OpIEqual %bool $v_sg_id $v_leader\n"
                     "$v_rval = OpSelect $t $v_all $v_sgred $v\n"
                     "$v_do = OpSelect %bool $v_all $v_isldr $s\n"
                     "OpSelectionMerge %sred_loc_done_r$u None\n"
@@ -2352,11 +2380,15 @@ static void jitc_vulkan_render(Variable *v) {
                     "%sred_loc_do_r$u = OpLabel\n",
                     v, v4u32_name, one_bool,
                     v, v,
+                    v, a0,
+                    v, a0, v,
                     v, a2,
                     v, a2, v,
+                    v, v, v,
                     v, v,
                     v, sg_op, a1, a1,
-                    v, v,
+                    v,
+                    v, v, v,
                     v, a1, v, v, a1,
                     v, v, v, one_bool,
                     v->reg_index,
@@ -2938,11 +2970,700 @@ static void jitc_vulkan_render(Variable *v) {
             jitc_vulkan_render_array_select(v, a0, a1, a2);
             break;
 
+        // ================ Polymorphic Calls ================
+
+        case VarKind::Call:
+            jitc_var_call_assemble((CallData *) v->data, v->reg_index,
+                                   a0->reg_index, a1->reg_index);
+            break;
+
+        case VarKind::CallGetter:
+            jitc_var_call_getter_assemble(v, a0, a1);
+            break;
+
+        case VarKind::CallOutput:
+        case VarKind::CallInput:
+            break;
+
+        case VarKind::CallSelf:
+            fmt("$v = OpCopyObject $t %self_r0\n", v, v);
+            break;
+
         default:
             jitc_raise("jitc_vulkan_render(): unhandled variable kind \"%s\" "
                        "(the Vulkan backend cannot compile kernels with this "
                        "operation yet)!",
                        var_kind_name[v->kind]);
+    }
+}
+
+// ----------------------------------------------------------------------------
+//  Polymorphic call & getter SPIR-V code generation
+// ----------------------------------------------------------------------------
+
+static void jitc_vulkan_append_unit_funcs(const StringBuffer &unit_src) {
+    const char *src = unit_src.get(), *end = src + unit_src.size();
+    while (src < end) {
+        if (*src == '\n') {
+            src++;
+            continue;
+        }
+        const char *fn_end = strstr(src, "OpFunctionEnd\n");
+        if (!fn_end)
+            break;
+        fn_end += strlen("OpFunctionEnd\n");
+
+        if (strncmp(src, "%func_unique_", 13) == 0) {
+            XXH128_hash_t h = XXH128(src, 45, 0);
+            if (!unit_entry->registered.insert(h).second) {
+                src = fn_end;
+                continue;
+            }
+        }
+
+        uint32_t fn_id = ++spv_func_id;
+        buffer.put('\n');
+        for (const char *p = src; p < fn_end; ) {
+            if (p + 2 < fn_end && (p[0] == '%' || p[0] == '_') &&
+                p[1] == 'r' && p[2] >= '0' && p[2] <= '9') {
+                buffer.put(p[0]);
+                buffer.put('f');
+                buffer.put_u32(fn_id);
+                buffer.put("_r", 2);
+                p += 2;
+            } else {
+                buffer.put(*p++);
+            }
+        }
+        src = fn_end;
+    }
+}
+
+static bool jitc_vulkan_call_has_out(const CallData *call) {
+    for (uint32_t i = 0; i < call->n_out; ++i)
+        if (call->out_offset[i] != (uint32_t) -1)
+            return true;
+    return false;
+}
+
+static void jitc_vulkan_put_ret_type(const CallData *call,
+                                     StringBuffer &b = buffer) {
+    if (!jitc_vulkan_call_has_out(call)) {
+        b.put("%void");
+        return;
+    }
+    b.put("%Tuple_");
+    for (uint32_t i = 0; i < call->n_out; ++i)
+        if (call->out_offset[i] != (uint32_t) -1)
+            b.put(type_mangle[jitc_var(call->inner_out[i])->type]);
+}
+
+static void jitc_vulkan_put_zero_tuple(const CallData *call,
+                                       StringBuffer &b = buffer) {
+    b.put("%c_zero_Tuple_");
+    for (uint32_t i = 0; i < call->n_out; ++i)
+        if (call->out_offset[i] != (uint32_t) -1)
+            b.put(type_mangle[jitc_var(call->inner_out[i])->type]);
+}
+
+static void jitc_vulkan_put_fn_type(const CallData *call,
+                                    StringBuffer &b = buffer) {
+    b.put("%fn_");
+    if (!jitc_vulkan_call_has_out(call)) {
+        b.put('v');
+    } else {
+        for (uint32_t i = 0; i < call->n_out; ++i)
+            if (call->out_offset[i] != (uint32_t) -1)
+                b.put(type_mangle[jitc_var(call->inner_out[i])->type]);
+    }
+    b.put('_');
+    if (call->use_index)     b.put('i');
+    if (call->use_self)      b.put('s');
+    if (!call->slots.empty()) b.put('d');
+    if (call->use_nested)    b.put('b');
+    b.put('_');
+    for (uint32_t i = 0; i < call->n_in; ++i)
+        if (call->in_active[i])
+            b.put(type_mangle[jitc_var(call->outer_in[i])->type]);
+}
+
+static bool jitc_vulkan_emit_ret_type(const CallData *call) {
+    if (!jitc_vulkan_call_has_out(call)) {
+        jitc_vulkan_require_type(VarType::Void);
+        return false;
+    }
+    for (uint32_t i = 0; i < call->n_out; ++i)
+        if (call->out_offset[i] != (uint32_t) -1)
+            jitc_vulkan_require_type((VarType) jitc_var(call->inner_out[i])->type);
+
+    size_t start = spv_types_consts.size();
+    jitc_vulkan_put_ret_type(call, spv_types_consts);
+    put_tc(" = OpTypeStruct");
+    for (uint32_t i = 0; i < call->n_out; ++i)
+        if (call->out_offset[i] != (uint32_t) -1)
+            fmt_tc(" $t", jitc_var(call->inner_out[i]));
+    put_tc("\n");
+    jitc_vulkan_put_zero_tuple(call, spv_types_consts);
+    put_tc(" = OpConstantNull ");
+    jitc_vulkan_put_ret_type(call, spv_types_consts);
+    put_tc("\n");
+
+    XXH128_hash_t h = XXH128(spv_types_consts.get() + start,
+                             spv_types_consts.size() - start, 0);
+    if (!emitted_lit_consts.insert(h).second)
+        spv_types_consts.rewind_to(start);
+    return true;
+}
+
+static void jitc_vulkan_emit_fn_type(const CallData *call) {
+    if (call->use_index || call->use_self)
+        jitc_vulkan_require_type(VarType::UInt32);
+    if (!call->slots.empty() || call->use_nested)
+        jitc_vulkan_require_type(VarType::UInt64);
+    for (uint32_t i = 0; i < call->n_in; ++i)
+        if (call->in_active[i])
+            jitc_vulkan_require_type((VarType) jitc_var(call->outer_in[i])->type);
+
+    size_t start = spv_types_consts.size();
+    jitc_vulkan_put_fn_type(call, spv_types_consts);
+    put_tc(" = OpTypeFunction ");
+    jitc_vulkan_put_ret_type(call, spv_types_consts);
+    if (call->use_index)     put_tc(" %u32");
+    if (call->use_self)      put_tc(" %u32");
+    if (!call->slots.empty()) put_tc(" %u64");
+    if (call->use_nested)    put_tc(" %u64");
+    for (uint32_t i = 0; i < call->n_in; ++i)
+        if (call->in_active[i])
+            fmt_tc(" $t", jitc_var(call->outer_in[i]));
+    put_tc("\n");
+
+    XXH128_hash_t h = XXH128(spv_types_consts.get() + start,
+                             spv_types_consts.size() - start, 0);
+    if (!emitted_lit_consts.insert(h).second)
+        spv_types_consts.rewind_to(start);
+}
+
+static void jitc_vulkan_render_func_body(const CallData *call, uint32_t inst) {
+    jitc_call_bind_slots(call, inst);
+
+    const CallData::InstanceLayout &call_layout = call->instance_layout[inst];
+    uint32_t numeric_end = call_layout.coalesce_end;
+    bool cd_coalesce = call_layout.coalesce_count >= 2;
+
+    if (cd_coalesce) {
+        uint32_t end = (numeric_end + 3u) & ~3u;
+        uint32_t p = 0;
+        while (p < end) {
+            uint32_t w_bytes = jitc_call_pick_word_chunk_size(p, end - p, 16u);
+            uint32_t w0 = p / 4;
+            if (w_bytes == 16) {
+                const char *vec_ptr =
+                    jitc_vulkan_require_psb_vec_ptr(VarType::UInt32, 4);
+                const char *vec_t =
+                    jitc_vulkan_require_vec_type(VarType::UInt32, 4);
+                jitc_vulkan_require_u32_const(p / 16);
+                fmt("%cdp_r0_$u = OpConvertUToPtr $s %data_r0\n"
+                    "%cdac_r0_$u = OpPtrAccessChain $s %cdp_r0_$u %c_u32_$u\n"
+                    "%cdv_r0_$u = OpLoad $s %cdac_r0_$u Aligned 16\n"
+                    "%cdw_r0_$u = OpCompositeExtract %u32 %cdv_r0_$u 0\n"
+                    "%cdw_r0_$u = OpCompositeExtract %u32 %cdv_r0_$u 1\n"
+                    "%cdw_r0_$u = OpCompositeExtract %u32 %cdv_r0_$u 2\n"
+                    "%cdw_r0_$u = OpCompositeExtract %u32 %cdv_r0_$u 3\n",
+                    w0, vec_ptr,
+                    w0, vec_ptr, w0, p / 16,
+                    w0, vec_t, w0,
+                    w0, w0,
+                    w0 + 1, w0,
+                    w0 + 2, w0,
+                    w0 + 3, w0);
+            } else if (w_bytes == 8) {
+                const char *vec_ptr =
+                    jitc_vulkan_require_psb_vec_ptr(VarType::UInt32, 2);
+                const char *vec_t =
+                    jitc_vulkan_require_vec_type(VarType::UInt32, 2);
+                jitc_vulkan_require_u32_const(p / 8);
+                fmt("%cdp_r0_$u = OpConvertUToPtr $s %data_r0\n"
+                    "%cdac_r0_$u = OpPtrAccessChain $s %cdp_r0_$u %c_u32_$u\n"
+                    "%cdv_r0_$u = OpLoad $s %cdac_r0_$u Aligned 8\n"
+                    "%cdw_r0_$u = OpCompositeExtract %u32 %cdv_r0_$u 0\n"
+                    "%cdw_r0_$u = OpCompositeExtract %u32 %cdv_r0_$u 1\n",
+                    w0, vec_ptr,
+                    w0, vec_ptr, w0, p / 8,
+                    w0, vec_t, w0,
+                    w0, w0,
+                    w0 + 1, w0);
+            } else {
+                const char *u32_ptr =
+                    jitc_vulkan_require_psb_ptr(VarType::UInt32);
+                jitc_vulkan_require_u32_const(w0);
+                fmt("%cdp_r0_$u = OpConvertUToPtr $s %data_r0\n"
+                    "%cdac_r0_$u = OpPtrAccessChain $s %cdp_r0_$u %c_u32_$u\n"
+                    "%cdw_r0_$u = OpLoad %u32 %cdac_r0_$u Aligned 4\n",
+                    w0, u32_ptr,
+                    w0, u32_ptr, w0, w0,
+                    w0, w0);
+            }
+            p += w_bytes;
+        }
+    }
+
+    auto put_cd_extract = [&](const Variable *v, uint32_t off, VarType svt) {
+        uint32_t s = type_size[(int) svt], j = off / 4;
+        jitc_vulkan_require_type(svt);
+        if (s == 8) {
+            jitc_vulkan_require_u32_const(32);
+            fmt("$v_lo = OpUConvert %u64 %cdw_r0_$u\n"
+                "$v_hi0 = OpUConvert %u64 %cdw_r0_$u\n"
+                "$v_hi = OpShiftLeftLogical %u64 $v_hi0 %c_u32_32\n",
+                v, j,
+                v, j + 1,
+                v, v);
+            if (svt == VarType::UInt64 || svt == VarType::Pointer) {
+                fmt("$v = OpBitwiseOr %u64 $v_lo $v_hi\n", v, v, v);
+            } else {
+                fmt("$v_u64 = OpBitwiseOr %u64 $v_lo $v_hi\n"
+                    "$v = OpBitcast $t $v_u64\n",
+                    v, v, v,
+                    v, v, v);
+            }
+        } else if (s == 4) {
+            if (svt == VarType::UInt32)
+                fmt("$v = OpCopyObject %u32 %cdw_r0_$u\n", v, j);
+            else
+                fmt("$v = OpBitcast $t %cdw_r0_$u\n", v, v, j);
+        } else if (s == 2) {
+            jitc_vulkan_require_type(VarType::UInt16);
+            uint32_t shift = (off % 4) * 8;
+            if (shift > 0) {
+                jitc_vulkan_require_u32_const(shift);
+                fmt("$v_sh = OpShiftRightLogical %u32 %cdw_r0_$u %c_u32_$u\n",
+                    v, j, shift);
+                if (svt == VarType::UInt16)
+                    fmt("$v = OpUConvert %u16 $v_sh\n", v, v);
+                else
+                    fmt("$v_u16 = OpUConvert %u16 $v_sh\n"
+                        "$v = OpBitcast $t $v_u16\n",
+                        v, v,
+                        v, v, v);
+            } else {
+                if (svt == VarType::UInt16)
+                    fmt("$v = OpUConvert %u16 %cdw_r0_$u\n", v, j);
+                else
+                    fmt("$v_u16 = OpUConvert %u16 %cdw_r0_$u\n"
+                        "$v = OpBitcast $t $v_u16\n",
+                        v, j,
+                        v, v, v);
+            }
+        } else {
+            jitc_vulkan_require_type(VarType::UInt8);
+            uint32_t shift = (off % 4) * 8;
+            if (shift > 0) {
+                jitc_vulkan_require_u32_const(shift);
+                fmt("$v_sh = OpShiftRightLogical %u32 %cdw_r0_$u %c_u32_$u\n",
+                    v, j, shift);
+                if (svt == VarType::UInt8) {
+                    fmt("$v = OpUConvert %u8 $v_sh\n", v, v);
+                } else if (svt == VarType::Int8) {
+                    fmt("$v_u8 = OpUConvert %u8 $v_sh\n"
+                        "$v = OpBitcast %i8 $v_u8\n",
+                        v, v,
+                        v, v);
+                } else {
+                    jitc_vulkan_require_bool_storage();
+                    fmt("$v_u8 = OpUConvert %u8 $v_sh\n"
+                        "$v = OpINotEqual %bool $v_u8 %c_u8_0\n",
+                        v, v,
+                        v, v);
+                }
+            } else {
+                if (svt == VarType::UInt8) {
+                    fmt("$v = OpUConvert %u8 %cdw_r0_$u\n", v, j);
+                } else if (svt == VarType::Int8) {
+                    fmt("$v_u8 = OpUConvert %u8 %cdw_r0_$u\n"
+                        "$v = OpBitcast %i8 $v_u8\n",
+                        v, j,
+                        v, v);
+                } else {
+                    jitc_vulkan_require_bool_storage();
+                    fmt("$v_u8 = OpUConvert %u8 %cdw_r0_$u\n"
+                        "$v = OpINotEqual %bool $v_u8 %c_u8_0\n",
+                        v, j,
+                        v, v);
+                }
+            }
+        }
+    };
+
+    for (size_t i = 0; i < schedule.size(); ++i) {
+        ScheduledVariable &sv = schedule[i];
+        Variable *v = jitc_var(sv.index);
+        VarType vt = (VarType) v->type;
+        VarKind kind = (VarKind) v->kind;
+
+        if (kind == VarKind::Counter) {
+            jitc_vulkan_require_type(vt);
+            fmt("$v = OpCopyObject $t %idx_r0\n", v, v);
+        } else if (kind == VarKind::CallInput) {
+            uint32_t in_i = 0;
+            for (; in_i < call->n_in; ++in_i) {
+                if (call->inner_in[in_i] == sv.index)
+                    break;
+            }
+            jitc_vulkan_require_type(vt);
+            fmt("$v = OpCopyObject $t %in_r0_$u\n", v, v, in_i);
+        } else if (kind == VarKind::CallSelf) {
+            jitc_vulkan_require_type(vt);
+            fmt("$v = OpCopyObject $t %self_r0\n", v, v);
+        } else if (v->is_evaluated() ||
+                   (vt == VarType::Pointer && kind == VarKind::Literal)) {
+            uint32_t offset = jitc_call_slot_rel_offset(call, inst, v, sv.index);
+            if (vt == VarType::Pointer &&
+                v->resource_kind() != ResourceKind::Buffer)
+                jitc_raise("jitc_vulkan_assemble_func(): resource handles "
+                           "are not supported yet!");
+
+            const CallData::CaptureSlot &capture = call->slots[v->param_offset];
+            if (cd_coalesce && capture.bucket.coalesceable()) {
+                put_cd_extract(v, offset, vt);
+            } else if (vt == VarType::Bool) {
+                jitc_vulkan_require_bool_storage();
+                jitc_vulkan_require_u32_const(offset);
+                fmt("$v_bp = OpConvertUToPtr %ptr_psb_u8 %data_r0\n"
+                    "$v_ptr = OpPtrAccessChain %ptr_psb_u8 $v_bp %c_u32_$u\n"
+                    "$v_raw = OpLoad %u8 $v_ptr Aligned 1\n"
+                    "$v = OpINotEqual %bool $v_raw %c_u8_0\n",
+                    v,
+                    v, v, offset,
+                    v, v,
+                    v, v);
+            } else {
+                uint32_t tsz = type_size[(int) vt];
+                uint32_t elem_idx = offset / tsz;
+                const char *ptr_type = jitc_vulkan_require_psb_ptr(vt);
+                jitc_vulkan_require_type(vt);
+                jitc_vulkan_require_u32_const(elem_idx);
+                fmt("$v_bp = OpConvertUToPtr $s %data_r0\n"
+                    "$v_ptr = OpPtrAccessChain $s $v_bp %c_u32_$u\n"
+                    "$v = OpLoad $t $v_ptr Aligned $a\n",
+                    v, ptr_type,
+                    v, ptr_type, v, elem_idx,
+                    v, v, v, v);
+            }
+        } else {
+            jitc_vulkan_render(v);
+        }
+    }
+}
+
+void jitc_vulkan_assemble_func(const CallData *call, uint32_t inst) {
+    bool has_out = jitc_vulkan_emit_ret_type(call);
+    jitc_vulkan_emit_fn_type(call);
+
+    fmt("%func$s_^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ = OpFunction ",
+        call->n_inst == 1 ? "_unique" : "");
+    jitc_vulkan_put_ret_type(call);
+    put(" None ");
+    jitc_vulkan_put_fn_type(call);
+    put("\n");
+
+    if (call->use_index)
+        put("%idx_r0 = OpFunctionParameter %u32\n");
+    if (call->use_self)
+        put("%self_r0 = OpFunctionParameter %u32\n");
+    if (!call->slots.empty())
+        put("%data_r0 = OpFunctionParameter %u64\n");
+    if (call->use_nested)
+        put("%base_r0 = OpFunctionParameter %u64\n");
+    for (uint32_t i = 0; i < call->n_in; ++i) {
+        if (!call->in_active[i])
+            continue;
+        Variable *vo = jitc_var(call->outer_in[i]);
+        fmt("%in_r0_$u = OpFunctionParameter $t\n", i, vo);
+    }
+
+    put("%entry_r0 = OpLabel\n");
+
+    size_t body_offset = buffer.size();
+    size_t locals_start = spv_func_locals.size();
+    uint32_t saved_aux_id = spv_aux_id;
+    spv_aux_id = 0;
+
+    char saved_label[64];
+    memcpy(saved_label, current_block_label, sizeof(saved_label));
+    jitc_vulkan_set_label("entry", 0);
+
+    jitc_vulkan_render_func_body(call, inst);
+
+    if (has_out) {
+        put("%ret_r0 = OpCompositeConstruct ");
+        jitc_vulkan_put_ret_type(call);
+        for (uint32_t i = 0; i < call->n_out; ++i) {
+            if (call->out_offset[i] == (uint32_t) -1)
+                continue;
+            Variable *v_out = jitc_var(call->inner_out[inst * call->n_out + i]);
+            fmt(" $v", v_out);
+        }
+        put("\nOpReturnValue %ret_r0\n");
+    } else {
+        put("OpReturn\n");
+    }
+    put("OpFunctionEnd\n");
+
+    if (spv_func_locals.size() > locals_start) {
+        size_t suffix_start = buffer.size();
+        put(spv_func_locals.get() + locals_start,
+            spv_func_locals.size() - locals_start);
+        buffer.move_suffix(suffix_start, body_offset);
+        spv_func_locals.rewind_to(locals_start);
+    }
+
+    spv_aux_id = saved_aux_id;
+    memcpy(current_block_label, saved_label, sizeof(saved_label));
+}
+
+void jitc_var_call_getter_assemble_vulkan(Variable *v, const Variable *index,
+                                          const Variable *mask) {
+    GetterData *gd = (GetterData *) v->data;
+    uint32_t header_offset = gd->header_offset;
+    VarType vt = (VarType) v->type;
+    uint32_t tsize = type_size[(int) vt];
+    uint32_t base_elem = header_offset / tsize;
+
+    const char *base_name = (callable_depth == 0) ? "%call_base" : "%base_r0";
+
+    jitc_vulkan_require_u32_const(base_elem);
+    jitc_vulkan_require_type(vt);
+
+    bool is_unmasked = mask->is_literal() && mask->literal == 1;
+    if (is_unmasked) {
+        if (vt == VarType::Bool) {
+            jitc_vulkan_require_bool_storage();
+            fmt("$v_base = OpConvertUToPtr %ptr_psb_u8 $s\n"
+                "$v_idx = OpIAdd %u32 %c_u32_$u $v\n"
+                "$v_ptr = OpPtrAccessChain %ptr_psb_u8 $v_base $v_idx\n"
+                "$v_raw = OpLoad %u8 $v_ptr Aligned 1\n"
+                "$v = OpINotEqual %bool $v_raw %c_u8_0\n",
+                v, base_name,
+                v, base_elem, index,
+                v, v, v,
+                v, v,
+                v, v);
+        } else {
+            const char *ptr_type = jitc_vulkan_require_psb_ptr(vt);
+            fmt("$v_base = OpConvertUToPtr $s $s\n"
+                "$v_idx = OpIAdd %u32 %c_u32_$u $v\n"
+                "$v_ptr = OpPtrAccessChain $s $v_base $v_idx\n"
+                "$v = OpLoad $t $v_ptr Aligned $a\n",
+                v, ptr_type, base_name,
+                v, base_elem, index,
+                v, ptr_type, v, v,
+                v, v, v, v);
+        }
+    } else {
+        jitc_vulkan_require_type(VarType::Bool);
+        const char *zero_c = jitc_vulkan_require_zero(vt);
+        fmt("OpSelectionMerge %getter_done_r$u None\n"
+            "OpBranchConditional $v %getter_then_r$u %getter_done_r$u\n"
+            "%getter_then_r$u = OpLabel\n",
+            v->reg_index,
+            mask, v->reg_index, v->reg_index,
+            v->reg_index);
+        if (vt == VarType::Bool) {
+            jitc_vulkan_require_bool_storage();
+            fmt("$v_base = OpConvertUToPtr %ptr_psb_u8 $s\n"
+                "$v_idx = OpIAdd %u32 %c_u32_$u $v\n"
+                "$v_ptr = OpPtrAccessChain %ptr_psb_u8 $v_base $v_idx\n"
+                "$v_raw = OpLoad %u8 $v_ptr Aligned 1\n"
+                "$v_val = OpINotEqual %bool $v_raw %c_u8_0\n",
+                v, base_name,
+                v, base_elem, index,
+                v, v, v,
+                v, v,
+                v, v);
+        } else {
+            const char *ptr_type = jitc_vulkan_require_psb_ptr(vt);
+            fmt("$v_base = OpConvertUToPtr $s $s\n"
+                "$v_idx = OpIAdd %u32 %c_u32_$u $v\n"
+                "$v_ptr = OpPtrAccessChain $s $v_base $v_idx\n"
+                "$v_val = OpLoad $t $v_ptr Aligned $a\n",
+                v, ptr_type, base_name,
+                v, base_elem, index,
+                v, ptr_type, v, v,
+                v, v, v, v);
+        }
+        fmt("OpBranch %getter_done_r$u\n"
+            "%getter_done_r$u = OpLabel\n"
+            "$v = OpPhi $t $v_val %getter_then_r$u $s $s\n",
+            v->reg_index,
+            v->reg_index,
+            v, v, v, v->reg_index, zero_c, current_block_label);
+        jitc_vulkan_set_label("getter_done", v->reg_index);
+    }
+}
+
+void jitc_var_call_assemble_vulkan(CallData *call, uint32_t call_reg,
+                                   uint32_t self_reg, uint32_t mask_reg) {
+    bool has_out = jitc_vulkan_emit_ret_type(call);
+
+    std::vector<std::pair<Variable *, uint32_t>> out_regs;
+    out_regs.reserve(call->n_out);
+    for (uint32_t i = 0, k = 0; i < call->n_out; ++i) {
+        if (call->out_offset[i] == (uint32_t) -1)
+            continue;
+        Variable *v = jitc_var(call->outer_out[i]);
+        if (v && v->reg_index && v->param_type != ParamType::Input) {
+            jitc_vulkan_require_type((VarType) v->type);
+            out_regs.emplace_back(v, k);
+        }
+        k++;
+    }
+
+    Variable *mask = jitc_var(jitc_var(call->id)->dep[1]);
+    bool is_masked = !mask->is_literal() || mask->literal != 1;
+
+    char before_call_label[64];
+    memcpy(before_call_label, current_block_label, sizeof(before_call_label));
+
+    if (is_masked) {
+        jitc_vulkan_require_type(VarType::Bool);
+        fmt("OpSelectionMerge %call_done_r$u None\n"
+            "OpBranchConditional %r$u %call_then_r$u %call_done_r$u\n"
+            "%call_then_r$u = OpLabel\n",
+            call_reg,
+            mask_reg, call_reg, call_reg,
+            call_reg);
+        jitc_vulkan_set_label("call_then", call_reg);
+    }
+
+    const char *base_name = (callable_depth == 0) ? "%call_base" : "%base_r0";
+    const char *idx_name  = (callable_depth == 0) ? "%idx" : "%idx_r0";
+
+    bool has_slots = !call->slots.empty();
+    if (has_slots) {
+        uint32_t table_base_idx =
+            call->offset_base / (uint32_t) sizeof(uint64_t);
+        const char *u64_ptr = jitc_vulkan_require_psb_ptr(VarType::UInt64);
+        jitc_vulkan_require_u32_const(table_base_idx);
+        jitc_vulkan_require_u32_const(32);
+        fmt("%call_tbp_r$u = OpConvertUToPtr $s $s\n"
+            "%call_tidx_r$u = OpIAdd %u32 %c_u32_$u %r$u\n"
+            "%call_tep_r$u = OpPtrAccessChain $s %call_tbp_r$u %call_tidx_r$u\n"
+            "%call_oe_r$u = OpLoad %u64 %call_tep_r$u Aligned 8\n"
+            "%call_doff_r$u = OpShiftRightLogical %u64 %call_oe_r$u %c_u32_32\n"
+            "%call_dptr_r$u = OpIAdd %u64 $s %call_doff_r$u\n",
+            call_reg, u64_ptr, base_name,
+            call_reg, table_base_idx, self_reg,
+            call_reg, u64_ptr, call_reg, call_reg,
+            call_reg, call_reg,
+            call_reg, call_reg,
+            call_reg, base_name, call_reg);
+    }
+
+    auto emit_call_args = [&]() {
+        if (call->use_index)
+            fmt(" $s", idx_name);
+        if (call->use_self)
+            fmt(" %r$u", self_reg);
+        if (has_slots)
+            fmt(" %call_dptr_r$u", call_reg);
+        if (call->use_nested)
+            fmt(" $s", base_name);
+        for (uint32_t i = 0; i < call->n_in; ++i) {
+            if (call->in_active[i])
+                fmt(" $v", jitc_var(call->outer_in[i]));
+        }
+        put("\n");
+    };
+
+    if (call->n_inst == 1) {
+        XXH128_hash_t h = call->inst_hash[0];
+        fmt("%call_ret_r$u = OpFunctionCall ", call_reg);
+        jitc_vulkan_put_ret_type(call);
+        fmt(" %func_unique_$Q$Q", h.high64, h.low64);
+        emit_call_args();
+    } else {
+        std::vector<XXH128_hash_t> unique_hashes;
+        unique_hashes.reserve(call->n_inst);
+        for (uint32_t i = 0; i < call->n_inst; ++i) {
+            XXH128_hash_t h = call->inst_hash[i];
+            bool seen = false;
+            for (const XXH128_hash_t &uh : unique_hashes) {
+                if (XXH128Eq()(uh, h)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen)
+                unique_hashes.push_back(h);
+        }
+
+        fmt("OpSelectionMerge %call_sw_merge_r$u None\n"
+            "OpSwitch %r$u %call_def_r$u",
+            call_reg, self_reg, call_reg);
+        for (uint32_t i = 0; i < call->n_inst; ++i) {
+            XXH128_hash_t h = call->inst_hash[i];
+            uint32_t k = 0;
+            while (!XXH128Eq()(unique_hashes[k], h))
+                k++;
+            fmt(" $u %call_case_$u_r$u", call->inst_id[i], k, call_reg);
+        }
+        put("\n");
+
+        for (uint32_t k = 0; k < (uint32_t) unique_hashes.size(); ++k) {
+            XXH128_hash_t h = unique_hashes[k];
+            fmt("%call_case_$u_r$u = OpLabel\n"
+                "%call_cret_$u_r$u = OpFunctionCall ",
+                k, call_reg,
+                k, call_reg);
+            jitc_vulkan_put_ret_type(call);
+            fmt(" %func_$Q$Q", h.high64, h.low64);
+            emit_call_args();
+            fmt("OpBranch %call_sw_merge_r$u\n", call_reg);
+        }
+
+        fmt("%call_def_r$u = OpLabel\n"
+            "OpBranch %call_sw_merge_r$u\n"
+            "%call_sw_merge_r$u = OpLabel\n",
+            call_reg,
+            call_reg,
+            call_reg);
+
+        if (has_out) {
+            fmt("%call_ret_r$u = OpPhi ", call_reg);
+            jitc_vulkan_put_ret_type(call);
+            put(" ");
+            jitc_vulkan_put_zero_tuple(call);
+            fmt(" %call_def_r$u", call_reg);
+            for (uint32_t k = 0; k < (uint32_t) unique_hashes.size(); ++k)
+                fmt(" %call_cret_$u_r$u %call_case_$u_r$u",
+                    k, call_reg, k, call_reg);
+            put("\n");
+        }
+        jitc_vulkan_set_label("call_sw_merge", call_reg);
+    }
+
+    if (is_masked) {
+        char after_call_label[64];
+        memcpy(after_call_label, current_block_label, sizeof(after_call_label));
+        for (auto [v_out, field] : out_regs) {
+            fmt("$v_act = OpCompositeExtract $t %call_ret_r$u $u\n",
+                v_out, v_out, call_reg, field);
+        }
+        fmt("OpBranch %call_done_r$u\n"
+            "%call_done_r$u = OpLabel\n",
+            call_reg, call_reg);
+        for (auto [v_out, field] : out_regs) {
+            const char *zero_c = jitc_vulkan_require_zero((VarType) v_out->type);
+            fmt("$v = OpPhi $t $v_act $s $s $s\n",
+                v_out, v_out, v_out, after_call_label,
+                zero_c, before_call_label);
+        }
+        jitc_vulkan_set_label("call_done", call_reg);
+    } else {
+        for (auto [v_out, field] : out_regs) {
+            fmt("$v = OpCompositeExtract $t %call_ret_r$u $u\n",
+                v_out, v_out, call_reg, field);
+        }
     }
 }
 

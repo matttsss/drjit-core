@@ -110,6 +110,10 @@ static uint32_t call_data_align(const ThreadState *ts, bool uses_optix_) {
         case JitBackend::Metal:
             return 16u;
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+        case JitBackend::Vulkan:
+            return 16u;
+#endif
         case JitBackend::LLVM: // packet cap x widest field (8B)
             return llvm_call_data_packet_cap() * 8u;
 
@@ -770,6 +774,10 @@ void jitc_var_call_getter_assemble(Variable *v, const Variable *index,
     else if (jitc_is_cuda(backend))
         jitc_var_call_getter_assemble_cuda(v, index, mask);
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    else if (jitc_is_vulkan(backend))
+        jitc_var_call_getter_assemble_vulkan(v, index, mask);
+#endif
     else
         jitc_fail("jitc_var_call_getter_assemble(): unsupported backend!");
 }
@@ -927,6 +935,11 @@ void jitc_var_call_assemble(CallData *call, uint32_t call_reg,
         jitc_var_call_assemble_cuda(call, call_reg, self_reg, mask_reg,
                                     in_size, in_align,
                                     out_size, out_align);
+#endif
+
+#if defined(DRJIT_ENABLE_VULKAN)
+    else if (jitc_is_vulkan(call->backend))
+        jitc_var_call_assemble_vulkan(call, call_reg, self_reg, mask_reg);
 #endif
 
     else

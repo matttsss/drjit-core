@@ -478,8 +478,144 @@ void VulkanThreadState::poke(void *dst, const void *src, uint32_t size) {
     vulkan_fill(vulkan_device(this), dst, size, size, src, "jit_poke");
 }
 
-void VulkanThreadState::aggregate(void *, AggregationEntry *, uint32_t) {
-    vulkan_unsupported("jit_aggregate");
+void VulkanThreadState::aggregate(void *dst, AggregationEntry *agg,
+                                  uint32_t size) {
+    if (size == 0)
+        return;
+
+    VulkanDevice &dev = vulkan_device(this);
+
+    jitc_log(InfoSym,
+             "jit_aggregate(" DRJIT_PTR " -> " DRJIT_PTR ", size=%u)",
+             (uintptr_t) agg, (uintptr_t) dst, size);
+
+    size_t max_end = 0;
+    size_t lit_bytes = 0;
+    for (uint32_t i = 0; i < size; ++i) {
+        const AggregationEntry &e = agg[i];
+        uint32_t esize = (uint32_t) std::abs((int) e.size);
+        size_t end = (size_t) e.offset + esize;
+        if (end > max_end)
+            max_end = end;
+        if (e.size > 0)
+            lit_bytes += esize;
+    }
+
+    size_t dst_offset = 0;
+    if (!vulkan_lookup(dst, max_end, &dst_offset, "jit_aggregate"))
+        jitc_raise("jit_aggregate(): " DRJIT_PTR " is not a Vulkan allocation!",
+                   (uintptr_t) dst);
+
+    uint8_t *staging = nullptr;
+    void *staging_alloc = nullptr;
+    if (lit_bytes > 0) {
+        if (lit_bytes <= VulkanMaxStageSize) {
+            staging = jitc_vulkan_stage(dev, lit_bytes);
+        } else {
+            staging_alloc = jitc_malloc(JitBackend::Vulkan, lit_bytes, true);
+            staging = (uint8_t *) staging_alloc;
+        }
+
+        size_t pos = 0;
+        for (uint32_t i = 0; i < size; ++i) {
+            const AggregationEntry &e = agg[i];
+            if (e.size <= 0)
+                continue;
+            uintptr_t val = (uintptr_t) e.src;
+            if (e.size == 8 &&
+                (ResourceKind) e.resource_kind == ResourceKind::Buffer && val) {
+                size_t off = 0;
+                if (VulkanBuffer *b = jitc_vulkan_find_buffer(e.src, &off))
+                    val = (uintptr_t) (b->address + off);
+            }
+            switch (e.size) {
+                case 1: {
+                    uint8_t v = (uint8_t) val;
+                    std::memcpy(staging + pos, &v, 1);
+                    pos += 1;
+                    break;
+                }
+                case 2: {
+                    uint16_t v = (uint16_t) val;
+                    std::memcpy(staging + pos, &v, 2);
+                    pos += 2;
+                    break;
+                }
+                case 4: {
+                    uint32_t v = (uint32_t) val;
+                    std::memcpy(staging + pos, &v, 4);
+                    pos += 4;
+                    break;
+                }
+                case 8: {
+                    uint64_t v = (uint64_t) val;
+                    std::memcpy(staging + pos, &v, 8);
+                    pos += 8;
+                    break;
+                }
+                default:
+                    jitc_fail("jit_aggregate(): invalid literal entry size %d!",
+                              (int) e.size);
+            }
+        }
+    }
+
+    // Look up buffers after allocating staging memory, which may release the lock
+    VulkanBuffer *dst_buf = jitc_vulkan_find_buffer(dst, &dst_offset),
+                 *staging_buf = nullptr;
+    size_t staging_offset = 0;
+    if (staging)
+        staging_buf = jitc_vulkan_find_buffer(staging, &staging_offset);
+
+    VkCommandBuffer cmd = jitc_vulkan_cmd(dev);
+    jitc_vulkan_access(dev, true);
+
+    if (staging) {
+        std::vector<VkBufferCopy> regions;
+        size_t pos = 0;
+        for (uint32_t i = 0; i < size; ++i) {
+            const AggregationEntry &e = agg[i];
+            if (e.size <= 0)
+                continue;
+            uint32_t esize = (uint32_t) e.size;
+            VkDeviceSize src_off = staging_offset + pos;
+            VkDeviceSize dst_off = dst_offset + e.offset;
+            if (!regions.empty() &&
+                regions.back().srcOffset + regions.back().size == src_off &&
+                regions.back().dstOffset + regions.back().size == dst_off) {
+                regions.back().size += esize;
+            } else {
+                regions.push_back({ src_off, dst_off, esize });
+            }
+            pos += esize;
+        }
+        if (!regions.empty())
+            vkCmdCopyBuffer(cmd, staging_buf->buffer, dst_buf->buffer,
+                            (uint32_t) regions.size(), regions.data());
+    }
+
+    for (uint32_t i = 0; i < size; ++i) {
+        const AggregationEntry &e = agg[i];
+        if (e.size >= 0)
+            continue;
+        uint32_t esize = (uint32_t) (-e.size);
+        size_t src_offset = 0;
+        VulkanBuffer *src_buf =
+            vulkan_lookup(e.src, esize, &src_offset, "jit_aggregate");
+        if (!src_buf)
+            jitc_raise("jit_aggregate(): source pointer " DRJIT_PTR
+                       " is not a Vulkan allocation!",
+                       (uintptr_t) e.src);
+        VkBufferCopy region { src_offset, dst_offset + e.offset, esize };
+        vkCmdCopyBuffer(cmd, src_buf->buffer, dst_buf->buffer, 1, &region);
+    }
+
+    if (staging_alloc) {
+        jitc_free(staging_alloc);
+        dev.stream->cmd_staging += lit_bytes;
+    }
+
+    jitc_vulkan_maybe_submit(dev);
 }
 
 void VulkanThreadState::enqueue_host_func(void (*callback)(void *),

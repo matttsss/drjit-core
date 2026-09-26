@@ -173,6 +173,9 @@ struct Kernel;
 extern void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
                                  uint32_t n_regs, uint32_t n_params);
 
+/// Used by jitc_call() to generate SPIR-V source code for callables
+extern void jitc_vulkan_assemble_func(const CallData *call, uint32_t inst);
+
 /// Reset per-kernel Vulkan assembly state at the start of jitc_assemble()
 extern void jitc_vulkan_assemble_reset();
 

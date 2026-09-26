@@ -989,7 +989,12 @@ using PFN_SpvDiagnosticDestroy = void (*)(SpvDiagnostic *);
 
 static std::string g_captured_spirv;
 
-static void capture_spirv_cb(LogLevel, const char *msg) {
+static void capture_spirv_cb(LogLevel level, const char *msg) {
+    if (level == LogLevel::Error) {
+        if (msg)
+            fprintf(stderr, "%s\n", msg);
+        return;
+    }
     if (msg && strstr(msg, "OpCapability Shader"))
         g_captured_spirv = msg;
 }
@@ -3167,12 +3172,106 @@ struct ScopedRecord {
         jit_record_end(backend, checkpoint, cleanup);
     }
 
+    uint32_t checkpoint_and_rewind() {
+        jit_set_scope(backend, scope);
+        return jit_record_checkpoint(backend);
+    }
+
     void disarm() { cleanup = false; }
 
     JitBackend backend;
     uint32_t checkpoint = 0, scope = 0;
     bool cleanup = true;
 };
+
+struct ScopedSetMask {
+    ScopedSetMask(JitBackend backend, uint32_t index) : backend(backend) {
+        jit_var_mask_push(backend, index);
+        jit_var_dec_ref(index);
+    }
+    ~ScopedSetMask() { jit_var_mask_pop(backend); }
+    JitBackend backend;
+};
+
+struct ScopedSetSelf {
+    ScopedSetSelf(JitBackend backend, uint32_t value, uint32_t self_index = 0)
+        : m_backend(backend) {
+        uint32_t tmp;
+        jit_var_self(backend, &m_self_value, &tmp);
+        m_self_index = jit_var_inc_ref(tmp);
+        jit_var_set_self(m_backend, value, self_index);
+    }
+    ~ScopedSetSelf() {
+        jit_var_set_self(m_backend, m_self_value, m_self_index);
+        jit_var_dec_ref(m_self_index);
+    }
+private:
+    JitBackend m_backend;
+    uint32_t m_self_value;
+    uint32_t m_self_index;
+};
+
+template <size_t n_callables, size_t n_inputs, size_t n_outputs>
+void symbolic_call_vk(
+        JitBackend backend,
+        const char *domain,
+        bool symbolic,
+        uint32_t self,
+        uint32_t mask,
+        void (*call)(void *, uint32_t *, uint32_t *),
+        uint32_t *inputs,
+        uint32_t *outputs) {
+    uint32_t checkpoints[n_callables + 1] = { 0 };
+    uint32_t inst_id[n_callables] = { 0 };
+
+    uint32_t call_inputs[n_inputs == 0 ? 1 : n_inputs] = { 0 };
+    uint32_t rv_values[n_outputs == 0 ? 1 : n_callables * n_outputs] = { 0 };
+
+    jit_new_scope(backend);
+    {
+        ScopedRecord rec(backend, domain, true);
+
+        for (size_t i = 0; i < n_inputs; ++i)
+            call_inputs[i] = jit_var_call_input(inputs[i]);
+
+        {
+            ScopedSetMask mask_guard(backend, jit_var_call_mask(backend));
+            for (size_t i = 0; i < n_callables; ++i) {
+                checkpoints[i] = rec.checkpoint_and_rewind();
+                uint32_t call_index = (uint32_t) i + 1;
+                void *ptr = jit_registry_ptr("Vulkan", domain, call_index);
+                ScopedSetSelf set_self(backend, call_index);
+                call(ptr, call_inputs, &rv_values[i * n_outputs]);
+                inst_id[i] = call_index;
+            }
+            checkpoints[n_callables] = rec.checkpoint_and_rewind();
+        }
+
+        jit_new_scope(backend);
+
+        jit_var_call(
+            domain, symbolic,
+            self, mask,
+            (uint32_t) n_callables,
+            (uint32_t) n_callables,
+            inst_id,
+            (uint32_t) n_inputs,
+            call_inputs,
+            (uint32_t) (n_callables * n_outputs),
+            rv_values,
+            checkpoints,
+            outputs
+        );
+
+        for (size_t i = 0; i < n_inputs; ++i)
+            jit_var_dec_ref(call_inputs[i]);
+
+        for (size_t i = 0; i < n_callables * n_outputs; ++i)
+            jit_var_dec_ref(rv_values[i]);
+
+        rec.disarm();
+    }
+}
 
 struct VarRef {
     VarRef() : index(0) { }
@@ -4060,4 +4159,893 @@ TEST_VULKAN(26_local_arrays) {
         jit_assert(strcmp(y.str(), "[0, 0, 0, 1, 1, 1, 2, 2, 2]") == 0);
     }
 }
+
+TEST_VULKAN(27_polymorphic_calls) {
+    using Double = Array<double>;
+    using UInt8  = Array<uint8_t>;
+    using Int16  = Array<int16_t>;
+    using UInt64 = Array<uint64_t>;
+
+    // 1. Direct test of jit_aggregate (immediate literals + device copies + buffer address resolution)
+    {
+        Alloc src_dev(Kind::Device, 16), src_sh(Kind::Shared, 16);
+        uint32_t src_vals[4] = { 0x11223344u, 0x55667788u, 0x99aabbcdu, 0xdeadbeefu };
+        upload(src_dev.ptr, src_vals, sizeof(src_vals));
+
+        Alloc dst_dev(Kind::Device, 64);
+        uint8_t zero = 0;
+        jit_memset_async(Backend, dst_dev.ptr, 64, 1, &zero);
+
+        uint8_t  imm_u8  = 0x7fu;
+        uint16_t imm_u16 = 0x1234u;
+        uint32_t imm_u32 = 0xcafebabeu;
+        uint64_t imm_u64 = 0x0102030405060708ull;
+
+        AggregationEntry entries[7] = { };
+        memcpy(&entries[0].src, &imm_u8, 1);
+        entries[0].offset = 0;
+        entries[0].size   = 1;
+
+        memcpy(&entries[1].src, &imm_u16, 2);
+        entries[1].offset = 2;
+        entries[1].size   = 2;
+
+        memcpy(&entries[2].src, &imm_u32, 4);
+        entries[2].offset = 4;
+        entries[2].size   = 4;
+
+        memcpy(&entries[3].src, &imm_u64, 8);
+        entries[3].offset = 8;
+        entries[3].size   = 8;
+
+        // Device-to-device copy (size < 0)
+        entries[4].src    = src_dev.ptr;
+        entries[4].offset = 16;
+        entries[4].size   = -16;
+
+        // Device & shared buffer pointers resolved to VkDeviceAddress (size == 8)
+        entries[5].src    = src_dev.ptr;
+        entries[5].offset = 32;
+        entries[5].size   = 8;
+
+        entries[6].src    = src_sh.ptr;
+        entries[6].offset = 40;
+        entries[6].size   = 8;
+
+        jit_aggregate(Backend, dst_dev.ptr, entries, 7);
+
+        std::vector<uint8_t> out = download(dst_dev.ptr, 64);
+        jit_assert(out[0] == 0x7fu);
+        uint16_t got_u16 = 0;
+        uint32_t got_u32 = 0;
+        uint64_t got_u64 = 0;
+        uint32_t got_dev[4] = { };
+        uint64_t got_bda_dev = 0, got_bda_sh = 0;
+        memcpy(&got_u16,     out.data() + 2, 2);
+        memcpy(&got_u32,     out.data() + 4, 4);
+        memcpy(&got_u64,     out.data() + 8, 8);
+        memcpy(got_dev,      out.data() + 16, 16);
+        memcpy(&got_bda_dev, out.data() + 32, 8);
+        memcpy(&got_bda_sh,  out.data() + 40, 8);
+        jit_assert(got_u16 == imm_u16);
+        jit_assert(got_u32 == imm_u32);
+        jit_assert(got_u64 == imm_u64);
+        for (int i = 0; i < 4; ++i)
+            jit_assert(got_dev[i] == src_vals[i]);
+        jit_assert(got_bda_dev == (uint64_t) (uintptr_t) src_dev.ptr);
+        jit_assert(got_bda_sh != 0 && got_bda_sh != (uint64_t) (uintptr_t) src_sh.ptr);
+    }
+
+    // 2. Direct symbolic call (n_inst == 1) with SPIR-V validation
+    {
+        struct SingleBase {
+            virtual ~SingleBase() = default;
+            virtual Float f(Float x) = 0;
+        };
+        struct S1 : SingleBase {
+            Float offset = opaque<Float>(7.f);
+            Float f(Float x) override { return x * 3.f + offset; }
+        };
+
+        S1 s1;
+        uint32_t id1 = jit_registry_put("Vulkan", "SingleBase", &s1);
+        jit_assert(id1 == 1);
+
+        UInt32 self = arange<UInt32>(6) % 2; // 0, 1, 0, 1, 0, 1
+        Float x = arange<Float>(6);
+
+        auto f_call = [](void *p, uint32_t *in, uint32_t *out) {
+            Float rv = ((SingleBase *) p)->f(Float::borrow(in[0]));
+            out[0] = rv.release();
+        };
+
+        for (int opt = 0; opt < 2; ++opt) {
+            jit_set_flag(JitFlag::OptimizeCalls, opt);
+            uint32_t inputs[1] = { x.index() };
+            uint32_t outputs[1] = { 0 };
+            Mask mask = Mask::steal(jit_var_bool(Backend, true));
+            symbolic_call_vk<1, 1, 1>(Backend, "SingleBase", false,
+                                      self.index(), mask.index(),
+                                      f_call, inputs, outputs);
+            Float y = Float::steal(outputs[0]);
+            std::string spv = assemble_and_validate_spirv(y.index());
+            jit_assert(spv.find("OpFunctionCall %Tuple_") != std::string::npos);
+            jit_assert(strcmp(y.str(), "[0, 10, 0, 16, 0, 22]") == 0);
+        }
+        jit_registry_remove(&s1);
+    }
+
+    // 3. Polymorphic virtual function call (01_recorded_vcall, n_inst == 2) with SPIR-V validation
+    {
+        struct Base {
+            virtual ~Base() = default;
+            virtual Float f(Float x) = 0;
+        };
+        struct A1 : Base {
+            Float f(Float x) override { return (x + 10) * 2; }
+        };
+        struct A2 : Base {
+            Float f(Float x) override { return (x + 100) * 2; }
+        };
+
+        A1 a1; A2 a2;
+        uint32_t i1 = jit_registry_put("Vulkan", "Base", &a1);
+        uint32_t i2 = jit_registry_put("Vulkan", "Base", &a2);
+        jit_assert(i1 == 1 && i2 == 2);
+
+        Float x = arange<Float>(10);
+        UInt32 self = arange<UInt32>(10) % 3;
+
+        auto f_call = [](void *p, uint32_t *in, uint32_t *out) {
+            Float rv = ((Base *) p)->f(Float::borrow(in[0]));
+            out[0] = rv.release();
+        };
+
+        for (int opt = 0; opt < 2; ++opt) {
+            jit_set_flag(JitFlag::OptimizeCalls, opt);
+            uint32_t inputs[1] = { x.index() };
+            uint32_t outputs[1] = { 0 };
+            Mask mask = Mask::steal(jit_var_bool(Backend, true));
+            symbolic_call_vk<2, 1, 1>(Backend, "Base", false,
+                                      self.index(), mask.index(),
+                                      f_call, inputs, outputs);
+            Float y = Float::steal(outputs[0]);
+            std::string spv = assemble_and_validate_spirv(y.index());
+            jit_assert(spv.find("OpSwitch ") != std::string::npos);
+            jit_assert(strcmp(y.str(), "[0, 22, 204, 0, 28, 210, 0, 34, 216, 0]") == 0);
+        }
+
+        jit_registry_remove(&a1);
+        jit_registry_remove(&a2);
+    }
+
+    // 4. Calling conventions & mixed types (02_calling_conventions)
+    {
+        struct Base {
+            virtual ~Base() = default;
+            virtual tuple<Mask, Float, Double, Float, Mask>
+            f(Mask p0, Float p1, Double p2, Float p3, Mask p4) = 0;
+        };
+        struct B1 : Base {
+            tuple<Mask, Float, Double, Float, Mask>
+            f(Mask p0, Float p1, Double p2, Float p3, Mask p4) override {
+                return { p0, p1, p2, p3, p4 };
+            }
+        };
+        struct B2 : Base {
+            tuple<Mask, Float, Double, Float, Mask>
+            f(Mask p0, Float p1, Double p2, Float p3, Mask) override {
+                return { !p0, p1 + 1, p2 + 2, p3 + 3, false };
+            }
+        };
+        struct B3 : Base {
+            tuple<Mask, Float, Double, Float, Mask>
+            f(Mask, Float, Double, Float, Mask) override {
+                return { 0, 0, 0, 0, 0 };
+            }
+        };
+
+        B1 b1; B2 b2; B3 b3;
+        jit_registry_put("Vulkan", "BaseCC", &b1);
+        jit_registry_put("Vulkan", "BaseCC", &b2);
+        jit_registry_put("Vulkan", "BaseCC", &b3);
+
+        auto f_call = [](void *p, uint32_t *in, uint32_t *out) {
+            Base *base = (Base *) p;
+            auto [rv0, rv1, rv2, rv3, rv4] = base->f(
+                Mask::borrow(in[0]), Float::borrow(in[1]), Double::borrow(in[2]),
+                Float::borrow(in[3]), Mask::borrow(in[4]));
+            out[0] = rv0.release();
+            out[1] = rv1.release();
+            out[2] = rv2.release();
+            out[3] = rv3.release();
+            out[4] = rv4.release();
+        };
+
+        for (uint32_t opt = 0; opt < 2; ++opt) {
+            jit_set_flag(JitFlag::OptimizeCalls, opt);
+            UInt32 self = arange<UInt32>(10) % 3;
+            Mask   p0(false);
+            Float  p1(12);
+            Double p2(34);
+            Float  p3(56);
+            Mask   p4(true);
+            Mask   mask = Mask::steal(jit_var_bool(Backend, true));
+
+            uint32_t inputs[5] = {
+                p0.index(), p1.index(), p2.index(), p3.index(), p4.index()
+            };
+            uint32_t outputs[5] = { 0 };
+
+            symbolic_call_vk<3, 5, 5>(Backend, "BaseCC", false,
+                                      self.index(), mask.index(),
+                                      f_call, inputs, outputs);
+
+            for (int k = 0; k < 5; ++k)
+                jit_var_schedule(outputs[k]);
+            assemble_and_validate_spirv();
+
+            Mask   rv0 = Mask::steal(outputs[0]);
+            Float  rv1 = Float::steal(outputs[1]);
+            Double rv2 = Double::steal(outputs[2]);
+            Float  rv3 = Float::steal(outputs[3]);
+            Mask   rv4 = Mask::steal(outputs[4]);
+
+            jit_assert(strcmp(rv0.str(), "[0, 0, 1, 0, 0, 1, 0, 0, 1, 0]") == 0);
+            jit_assert(strcmp(rv1.str(), "[0, 12, 13, 0, 12, 13, 0, 12, 13, 0]") == 0);
+            jit_assert(strcmp(rv2.str(), "[0, 34, 36, 0, 34, 36, 0, 34, 36, 0]") == 0);
+            jit_assert(strcmp(rv3.str(), "[0, 56, 59, 0, 56, 59, 0, 56, 59, 0]") == 0);
+            jit_assert(strcmp(rv4.str(), "[0, 1, 0, 0, 1, 0, 0, 1, 0, 0]") == 0);
+        }
+
+        jit_registry_remove(&b1);
+        jit_registry_remove(&b2);
+        jit_registry_remove(&b3);
+    }
+
+    // 5. Devirtualization of identical outputs across callables (03_devirtualize)
+    {
+        struct Base {
+            virtual ~Base() = default;
+            virtual tuple<Float, Float, Float> f(Float p1, Float p2) = 0;
+        };
+        struct D1 : Base {
+            tuple<Float, Float, Float> f(Float p1, Float p2) override {
+                return { p2 + 2, p1 + 1, 0 };
+            }
+        };
+        struct D2 : Base {
+            tuple<Float, Float, Float> f(Float p1, Float p2) override {
+                return { p2 + 2, p1 + 2, 0 };
+            }
+        };
+
+        D1 d1; D2 d2;
+        jit_registry_put("Vulkan", "BaseDevirt", &d1);
+        jit_registry_put("Vulkan", "BaseDevirt", &d2);
+        UInt32 self = arange<UInt32>(10) % 3;
+
+        auto f_call = [](void *p, uint32_t *in, uint32_t *out) {
+            auto [rv0, rv1, rv2] = ((Base *) p)->f(
+                Float::borrow(in[0]), Float::borrow(in[1]));
+            out[0] = rv0.release();
+            out[1] = rv1.release();
+            out[2] = rv2.release();
+        };
+
+        for (uint32_t k = 0; k < 2; ++k) {
+            for (uint32_t opt = 0; opt < 2; ++opt) {
+                Float p1 = (k == 0) ? Float(12) : opaque<Float>(12);
+                Float p2 = (k == 0) ? Float(34) : opaque<Float>(34);
+                jit_set_flag(JitFlag::OptimizeCalls, opt);
+
+                Mask call_mask = Mask::steal(jit_var_bool(Backend, true));
+                uint32_t inputs[2] = { p1.index(), p2.index() };
+                uint32_t outputs[3] = { 0 };
+
+                symbolic_call_vk<2, 2, 3>(Backend, "BaseDevirt", false,
+                                          self.index(), call_mask.index(),
+                                          f_call, inputs, outputs);
+
+                Float rv0 = Float::steal(outputs[0]);
+                Float rv1 = Float::steal(outputs[1]);
+                Float rv2 = Float::steal(outputs[2]);
+
+                auto is_call_output = [](uint32_t index) {
+                    return strcmp(jit_var_kind_name(index), "call_output") == 0;
+                };
+
+                bool literal_input   = (k == 0);
+                bool optimize_output = (opt == 1);
+
+                jit_assert(is_call_output(rv0.index()) != (optimize_output && literal_input));
+                jit_assert(is_call_output(rv1.index()) == true);
+                jit_assert(is_call_output(rv2.index()) != optimize_output);
+
+                jit_var_schedule(rv0.index());
+                jit_var_schedule(rv1.index());
+                jit_assert(strcmp(rv0.str(), "[0, 36, 36, 0, 36, 36, 0, 36, 36, 0]") == 0);
+                jit_assert(strcmp(rv1.str(), "[0, 13, 14, 0, 13, 14, 0, 13, 14, 0]") == 0);
+            }
+        }
+        jit_registry_remove(&d1);
+        jit_registry_remove(&d2);
+    }
+
+    // 6. Captured extra data (04_extra_data, 13_load_bool_data, coalesced & uncoalesced 1/2/4/8-byte types + pointers)
+    {
+        struct Base {
+            virtual ~Base() = default;
+            virtual Float f(Float x) = 0;
+        };
+        struct E1 : Base {
+            Double local_1 = 4;
+            Float  local_2 = 5;
+            Mask   cond    = opaque<Mask>(true);
+            UInt8  u8      = opaque<UInt8>(2);
+            Int16  i16     = opaque<Int16>(3);
+            UInt32 c0      = opaque<UInt32>(10);
+            UInt32 c1      = opaque<UInt32>(20);
+            UInt32 c2      = opaque<UInt32>(30);
+            UInt32 c3      = opaque<UInt32>(40);
+            UInt64 u64     = opaque<UInt64>(5);
+            Float  arr     = Float(100.f, 200.f);
+
+            Float f(Float x) override {
+                Float base_v = Float(Double(x) * local_1) + local_2;
+                Float coal_v = Float(c0 + c1 + c2 + c3); // 100 (coalesced v4u32 load)
+                Float misc_v = select(cond, Float(UInt32(u8) + UInt32(i16) + UInt32(u64)), Float(0)); // 10
+                Float g_v    = gather<Float>(arr, UInt32(0)); // 100 (captured buffer pointer)
+                return base_v + (coal_v - 100.f) + (misc_v - 10.f) + (g_v - 100.f);
+            }
+        };
+        struct E2 : Base {
+            Float  local_1 = 3;
+            Double local_2 = 5;
+            Mask   cond    = opaque<Mask>(false);
+            UInt8  u8      = opaque<UInt8>(7);
+            Int16  i16     = opaque<Int16>(8);
+            UInt64 u64_a   = opaque<UInt64>(11);
+            UInt64 u64_b   = opaque<UInt64>(22);
+            Float  arr     = Float(300.f, 400.f);
+
+            Float f(Float x) override {
+                Float base_v = local_1 + Float(Double(x) * local_2);
+                Float coal_v = Float(UInt32(u64_a + u64_b)); // 33 (coalesced v4u32 load for 2x u64)
+                Float misc_v = select(cond, Float(999.f), Float(UInt32(u8) + UInt32(i16))); // 15
+                Float g_v    = gather<Float>(arr, UInt32(1)); // 400
+                return base_v + (coal_v - 33.f) + (misc_v - 15.f) + (g_v - 400.f);
+            }
+        };
+
+        E1 e1; E2 e2;
+        jit_registry_put("Vulkan", "BaseExtra", &e1);
+        jit_registry_put("Vulkan", "BaseExtra", &e2);
+
+        UInt32 self = arange<UInt32>(10) % 3;
+        Float x = arange<Float>(10);
+
+        auto f_call = [](void *p, uint32_t *in, uint32_t *out) {
+            Float rv = ((Base *) p)->f(Float::borrow(in[0]));
+            out[0] = rv.release();
+        };
+
+        for (uint32_t k = 0; k < 2; ++k) {
+            if (k == 1) {
+                e1.local_1.eval();
+                e1.local_2.eval();
+                e2.local_1.eval();
+                e2.local_2.eval();
+            }
+            for (uint32_t opt = 0; opt < 2; ++opt) {
+                jit_set_flag(JitFlag::OptimizeCalls, opt);
+                Mask mask = Mask::steal(jit_var_bool(Backend, true));
+                uint32_t inputs[1] = { x.index() };
+                uint32_t outputs[1] = { 0 };
+
+                symbolic_call_vk<2, 1, 1>(Backend, "BaseExtra", false,
+                                          self.index(), mask.index(),
+                                          f_call, inputs, outputs);
+
+                Float result = Float::steal(outputs[0]);
+                std::string spv = assemble_and_validate_spirv(result.index());
+                if (opt == 0)
+                    jit_assert(spv.find("OpTypeVector %u32 4") != std::string::npos);
+                jit_assert(strcmp(result.str(), "[0, 9, 13, 0, 21, 28, 0, 33, 43, 0]") == 0);
+            }
+        }
+
+        jit_registry_remove(&e1);
+        jit_registry_remove(&e2);
+    }
+
+    // 7. Side effects inside callables & subgroup local scatter-reduce inside callable (05_side_effects, 06_side_effects_only_once)
+    {
+        struct Base {
+            virtual ~Base() = default;
+            virtual void go() = 0;
+        };
+        struct F1 : Base {
+            Float buffer = zeros<Float>(5);
+            void go() override {
+                scatter_reduce(ReduceOp::Add, buffer, Float(1), UInt32(1));
+                scatter_reduce(ReduceOp::Add, buffer, Float(2), UInt32(3));
+            }
+        };
+        struct F2 : Base {
+            Float buffer = arange<Float>(4);
+            void go() override {
+                scatter_reduce(ReduceOp::Add, buffer, Float(1), UInt32(2));
+            }
+        };
+
+        UInt32 self = arange<UInt32>(11) % 3;
+        auto f_call = [](void *p, uint32_t *, uint32_t *) {
+            ((Base *) p)->go();
+        };
+
+        for (uint32_t opt = 0; opt < 2; ++opt) {
+            jit_set_flag(JitFlag::OptimizeCalls, opt);
+            F1 f1; F2 f2;
+            jit_registry_put("Vulkan", "BaseSE", &f1);
+            jit_registry_put("Vulkan", "BaseSE", &f2);
+            Mask mask = Mask::steal(jit_var_bool(Backend, true));
+
+            symbolic_call_vk<2, 0, 0>(Backend, "BaseSE", false,
+                                      self.index(), mask.index(),
+                                      f_call, nullptr, nullptr);
+
+            jit_assert(strcmp(f1.buffer.str(), "[0, 4, 0, 8, 0]") == 0);
+            jit_assert(strcmp(f2.buffer.str(), "[0, 1, 5, 3]") == 0);
+
+            jit_registry_remove(&f1);
+            jit_registry_remove(&f2);
+        }
+
+        // 06_side_effects_only_once + ReduceMode::Local inside callable
+        struct BaseOnce {
+            virtual ~BaseOnce() = default;
+            virtual tuple<Float, Float> f() = 0;
+        };
+        struct G1 : BaseOnce {
+            UInt32 buffer = zeros<UInt32>(5);
+            tuple<Float, Float> f() override {
+                scatter_reduce(ReduceOp::Add, buffer, UInt32(1), UInt32(1));
+                return { 1, 2 };
+            }
+        };
+        struct G2 : BaseOnce {
+            UInt32 buffer = zeros<UInt32>(5);
+            tuple<Float, Float> f() override {
+                scatter_reduce(ReduceOp::Add, buffer, UInt32(1), UInt32(2));
+                return { 2, 1 };
+            }
+        };
+
+        auto g_call = [](void *p, uint32_t *, uint32_t *out) {
+            auto [rv0, rv1] = ((BaseOnce *) p)->f();
+            out[0] = rv0.release();
+            out[1] = rv1.release();
+        };
+
+        for (uint32_t opt = 0; opt < 2; ++opt) {
+            jit_set_flag(JitFlag::OptimizeCalls, opt);
+            G1 g1; G2 g2;
+            jit_registry_put("Vulkan", "BaseOnce", &g1);
+            jit_registry_put("Vulkan", "BaseOnce", &g2);
+            uint32_t outputs[2] = { 0 };
+            Mask mask = Mask::steal(jit_var_bool(Backend, true));
+
+            symbolic_call_vk<2, 0, 2>(Backend, "BaseOnce", false,
+                                      self.index(), mask.index(),
+                                      g_call, nullptr, outputs);
+
+            Float r1 = Float::steal(outputs[0]);
+            Float r2 = Float::steal(outputs[1]);
+
+            jit_assert(strcmp(r1.str(), "[0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1]") == 0);
+            jit_assert(strcmp(g1.buffer.str(), "[0, 4, 0, 0, 0]") == 0);
+            jit_assert(strcmp(g2.buffer.str(), "[0, 0, 3, 0, 0]") == 0);
+            jit_assert(strcmp(r2.str(), "[0, 2, 1, 0, 2, 1, 0, 2, 1, 0, 2]") == 0);
+            jit_assert(strcmp(g1.buffer.str(), "[0, 4, 0, 0, 0]") == 0);
+            jit_assert(strcmp(g2.buffer.str(), "[0, 0, 3, 0, 0]") == 0);
+
+            jit_registry_remove(&g1);
+            jit_registry_remove(&g2);
+        }
+    }
+
+    // 8. Multiple calls, many-instance callable deduplication, & jit_var_call_getter (07_multiple_calls, 08_big)
+    {
+        struct Base {
+            virtual ~Base() = default;
+            virtual Float f(Float x) = 0;
+        };
+        struct H1 : Base { Float f(Float x) override { return x + Float(1); } };
+        struct H2 : Base { Float f(Float x) override { return x + Float(2); } };
+
+        H1 h1; H2 h2;
+        jit_registry_put("Vulkan", "BaseMult", &h1);
+        jit_registry_put("Vulkan", "BaseMult", &h2);
+        UInt32 self = arange<UInt32>(10) % 3;
+        Float x = opaque<Float>(10, 1);
+
+        auto f_call = [](void *p, uint32_t *in, uint32_t *out) {
+            Float rv = ((Base *) p)->f(Float::borrow(in[0]));
+            out[0] = rv.release();
+        };
+
+        for (uint32_t opt = 0; opt < 2; ++opt) {
+            jit_set_flag(JitFlag::OptimizeCalls, opt);
+            Mask mask = Mask::steal(jit_var_bool(Backend, true));
+            uint32_t inputs[1] = { x.index() };
+            uint32_t outputs[1] = { 0 };
+
+            symbolic_call_vk<2, 1, 1>(Backend, "BaseMult", false,
+                                      self.index(), mask.index(),
+                                      f_call, inputs, outputs);
+            Float y = Float::steal(outputs[0]);
+            inputs[0] = y.index();
+
+            symbolic_call_vk<2, 1, 1>(Backend, "BaseMult", false,
+                                      self.index(), mask.index(),
+                                      f_call, inputs, outputs);
+            Float z = Float::steal(outputs[0]);
+            assemble_and_validate_spirv(z.index());
+            jit_assert(strcmp(z.str(), "[0, 12, 14, 0, 12, 14, 0, 12, 14, 0]") == 0);
+        }
+        jit_registry_remove(&h1);
+        jit_registry_remove(&h2);
+
+        // 08_big: 25 and 35 instances with identical callable bodies (deduplicated)
+        struct BigBase1 { virtual ~BigBase1() = default; virtual Float f() = 0; };
+        struct BigBase2 { virtual ~BigBase2() = default; virtual Float f() = 0; };
+        struct I1 : BigBase1 { Float v; Float f() override { return v; } };
+        struct I2 : BigBase2 { Float v; Float f() override { return v; } };
+
+        constexpr int n1 = 25, n2 = 35, n = 40;
+        I1 v1[n1];
+        I2 v2[n2];
+        for (int i = 0; i < n1; ++i) {
+            v1[i].v = Float((float) i);
+            jit_registry_put("Vulkan", "BigBase1", &v1[i]);
+        }
+        for (int i = 0; i < n2; ++i) {
+            v2[i].v = Float(100.f + (float) i);
+            jit_registry_put("Vulkan", "BigBase2", &v2[i]);
+        }
+
+        UInt32 self1 = arange<UInt32>(n + 1);
+        UInt32 self2 = arange<UInt32>(n + 1);
+        self1 = select(self1 <= n1, self1, 0);
+        self2 = select(self2 <= n2, self2, 0);
+
+        auto f_call1 = [](void *p, uint32_t *, uint32_t *out) {
+            out[0] = ((BigBase1 *) p)->f().release();
+        };
+        auto f_call2 = [](void *p, uint32_t *, uint32_t *out) {
+            out[0] = ((BigBase2 *) p)->f().release();
+        };
+
+        for (uint32_t opt = 0; opt < 2; ++opt) {
+            jit_set_flag(JitFlag::OptimizeCalls, opt);
+            Mask mask1 = Mask::steal(jit_var_bool(Backend, true));
+            Mask mask2 = Mask::steal(jit_var_bool(Backend, true));
+            uint32_t out1[1] = { 0 }, out2[1] = { 0 };
+
+            symbolic_call_vk<n1, 0, 1>(Backend, "BigBase1", false,
+                                       self1.index(), mask1.index(),
+                                       f_call1, nullptr, out1);
+            symbolic_call_vk<n2, 0, 1>(Backend, "BigBase2", false,
+                                       self2.index(), mask2.index(),
+                                       f_call2, nullptr, out2);
+
+            Float rx = Float::steal(out1[0]);
+            Float ry = Float::steal(out2[0]);
+            rx.schedule();
+            ry.schedule();
+            assemble_and_validate_spirv();
+
+            jit_assert((uint32_t) rx.read(0) == 0);
+            jit_assert((uint32_t) ry.read(0) == 0);
+            for (uint32_t j = 1; j <= n1; ++j)
+                jit_assert((uint32_t) rx.read(j) == j - 1);
+            for (uint32_t j = 1; j <= n2; ++j)
+                jit_assert((uint32_t) ry.read(j) == 100 + j - 1);
+            for (uint32_t j = n1 + 1; j < n; ++j)
+                jit_assert((uint32_t) rx.read(j + 1) == 0);
+            for (uint32_t j = n2 + 1; j < n; ++j)
+                jit_assert((uint32_t) ry.read(j + 1) == 0);
+        }
+
+        for (int i = 0; i < n1; ++i)
+            jit_registry_remove(&v1[i]);
+        for (int i = 0; i < n2; ++i)
+            jit_registry_remove(&v2[i]);
+
+        // Direct test of jit_var_call_getter (unmasked + masked, literal + opaque + absent, Float/UInt64/Bool)
+        {
+            Float  f_lit(12.5f), f_opq = opaque<Float>(37.5f);
+            UInt64 u_lit(1000ull), u_opq = opaque<UInt64>(2000ull);
+            Mask   b_lit(true), b_opq = opaque<Mask>(false);
+
+            uint32_t f_vals[3] = { f_lit.index(), f_opq.index(), 0 };
+            uint32_t u_vals[3] = { u_lit.index(), 0, u_opq.index() };
+            uint32_t b_vals[3] = { b_lit.index(), b_opq.index(), b_lit.index() };
+
+            UInt32 g_idx = arange<UInt32>(6) % 4; // [0, 1, 2, 3, 0, 1]
+            Mask   g_unmasked = Mask::steal(jit_var_bool(Backend, true));
+            Mask   g_masked   = neq(g_idx, 0u);
+
+            Float  gf_unm = Float::steal(jit_var_call_getter(
+                VarType::Float32, 3, f_vals, g_idx.index(), g_unmasked.index()));
+            Float  gf_msk = Float::steal(jit_var_call_getter(
+                VarType::Float32, 3, f_vals, g_idx.index(), g_masked.index()));
+            UInt64 gu_msk = UInt64::steal(jit_var_call_getter(
+                VarType::UInt64, 3, u_vals, g_idx.index(), g_masked.index()));
+            Mask   gb_unm = Mask::steal(jit_var_call_getter(
+                VarType::Bool, 3, b_vals, g_idx.index(), g_unmasked.index()));
+            Mask   gb_msk = Mask::steal(jit_var_call_getter(
+                VarType::Bool, 3, b_vals, g_idx.index(), g_masked.index()));
+
+            gf_unm.schedule();
+            gf_msk.schedule();
+            gu_msk.schedule();
+            gb_unm.schedule();
+            gb_msk.schedule();
+            assemble_and_validate_spirv();
+
+            jit_assert(strcmp(gf_unm.str(), "[0, 12.5, 37.5, 0, 0, 12.5]") == 0);
+            jit_assert(strcmp(gf_msk.str(), "[0, 12.5, 37.5, 0, 0, 12.5]") == 0);
+            jit_assert(strcmp(gu_msk.str(), "[0, 1000, 0, 2000, 0, 1000]") == 0);
+            jit_assert(strcmp(gb_unm.str(), "[0, 1, 0, 1, 0, 1]") == 0);
+            jit_assert(strcmp(gb_msk.str(), "[0, 1, 0, 1, 0, 1]") == 0);
+        }
+    }
+
+    // 9. CallSelf (09_self)
+    {
+        struct Base {
+            virtual ~Base() = default;
+            virtual Array<Base *> f() = 0;
+        };
+        struct I : Base {
+            Array<Base *> f() override {
+                Array<Base *> result = this;
+                return result;
+            }
+        };
+
+        I i1, i2;
+        uint32_t i1_id = jit_registry_put("Vulkan", "BaseSelf", &i1);
+        uint32_t i2_id = jit_registry_put("Vulkan", "BaseSelf", &i2);
+        UInt32 self(i1_id, i2_id);
+
+        auto f_call = [](void *p, uint32_t *, uint32_t *out) {
+            UInt32 rv = ((Base *) p)->f();
+            out[0] = rv.release();
+        };
+
+        for (uint32_t opt = 0; opt < 2; ++opt) {
+            jit_set_flag(JitFlag::OptimizeCalls, opt);
+            uint32_t outputs[1] = { 0 };
+            Mask mask = Mask::steal(jit_var_mask_default(Backend, self.size()));
+            symbolic_call_vk<2, 0, 1>(Backend, "BaseSelf", false,
+                                      self.index(), mask.index(),
+                                      f_call, nullptr, outputs);
+            UInt32 y = UInt32::steal(outputs[0]);
+            assemble_and_validate_spirv(y.index());
+            jit_assert(strcmp(y.str(), "[1, 2]") == 0);
+        }
+
+        jit_registry_remove(&i1);
+        jit_registry_remove(&i2);
+    }
+
+    // 10. Nested symbolic calls with local data & side effects (10_recursion, 11_recursion_with_local, 12_nested_with_side_effects)
+    {
+        struct Base1 {
+            virtual ~Base1() = default;
+            virtual Float f(const Float &x) = 0;
+        };
+        struct Base2 {
+            virtual ~Base2() = default;
+            virtual Float g(const UInt32 &ptr, const Float &x) = 0;
+        };
+        struct I1 : Base1 {
+            Float c;
+            Float buffer = zeros<Float>(4);
+            Float f(const Float &x) override {
+                scatter_reduce(ReduceOp::Add, buffer, Float(1), UInt32(1));
+                return x * c;
+            }
+        };
+        struct I2 : Base2 {
+            Float g(const UInt32 &ptr, const Float &x) override {
+                auto inner_call = [](void *p, uint32_t *in, uint32_t *out) {
+                    Float rv = ((Base1 *) p)->f(Float::borrow(in[0]));
+                    out[0] = rv.release();
+                };
+                uint32_t in[1]  = { x.index() };
+                uint32_t out[1] = { 0 };
+                Mask mask = Mask::steal(jit_var_bool(Backend, true));
+                symbolic_call_vk<2, 1, 1>(Backend, "NestBase1", true,
+                                          ptr.index(), mask.index(),
+                                          inner_call, in, out);
+                return Float::steal(out[0]) + 1.f;
+            }
+        };
+
+        for (uint32_t use_opaque = 0; use_opaque < 2; ++use_opaque) {
+            for (uint32_t opt = 0; opt < 2; ++opt) {
+                jit_set_flag(JitFlag::OptimizeCalls, opt);
+                I1 i11, i12;
+                i11.c = use_opaque ? opaque<Float>(2) : Float(2);
+                i12.c = use_opaque ? opaque<Float>(3) : Float(3);
+                I2 i21, i22;
+
+                uint32_t i11_id = jit_registry_put("Vulkan", "NestBase1", &i11);
+                uint32_t i12_id = jit_registry_put("Vulkan", "NestBase1", &i12);
+                uint32_t i21_id = jit_registry_put("Vulkan", "NestBase2", &i21);
+                uint32_t i22_id = jit_registry_put("Vulkan", "NestBase2", &i22);
+
+                auto outer_call = [](void *p, uint32_t *in, uint32_t *out) {
+                    Float rv = ((Base2 *) p)->g(UInt32::borrow(in[0]), Float::borrow(in[1]));
+                    out[0] = rv.release();
+                };
+
+                UInt32 self1(i11_id, i12_id);
+                UInt32 self2(i21_id, i22_id);
+                Float x(3.f, 5.f);
+
+                uint32_t inputs[2]  = { self1.index(), x.index() };
+                uint32_t outputs[1] = { 0 };
+                Mask mask = Mask::steal(jit_var_bool(Backend, true));
+
+                symbolic_call_vk<2, 2, 1>(Backend, "NestBase2", false,
+                                          self2.index(), mask.index(),
+                                          outer_call, inputs, outputs);
+
+                Float y = Float::steal(outputs[0]);
+                y.schedule();
+                i11.buffer.schedule();
+                i12.buffer.schedule();
+                assemble_and_validate_spirv();
+
+                jit_assert(strcmp(y.str(), "[7, 16]") == 0);
+                jit_assert(strcmp(i11.buffer.str(), "[0, 1, 0, 0]") == 0);
+                jit_assert(strcmp(i12.buffer.str(), "[0, 1, 0, 0]") == 0);
+
+                jit_registry_remove(&i11);
+                jit_registry_remove(&i12);
+                jit_registry_remove(&i21);
+                jit_registry_remove(&i22);
+            }
+        }
+    }
+
+    // 11. Symbolic conditionals, loops, and local arrays inside callables
+    {
+        struct ComplexBase {
+            virtual ~ComplexBase() = default;
+            virtual UInt32 compute(UInt32 n) = 0;
+        };
+
+        // Callable 1: Uses a LocalArr + symbolic loop inside the callable
+        struct LoopArrCallable : ComplexBase {
+            UInt32 scale = opaque<UInt32>(2);
+            UInt32 compute(UInt32 n) override {
+                LocalArr<UInt32> arr(4, 0u);
+                for (uint32_t k = 0; k < 4; ++k)
+                    arr.write(k, (n + k) * scale);
+
+                UInt32 i = 0u, acc = 0u;
+                {
+                    uint32_t vars[2] = { i.index(), acc.index() };
+                    ScopedRecord rec(Backend);
+                    VarRef loop = VarRef::steal(
+                        jit_var_loop_start("CallInnerLoop", true, 2, vars));
+                    do {
+                        UInt32 il   = UInt32::steal(vars[0]);
+                        UInt32 accl = UInt32::steal(vars[1]);
+                        Mask active_i = il < 4u;
+                        Mask active = Mask::steal(jit_var_mask_apply(
+                            active_i.index(), (uint32_t) jit_var_size(active_i.index())));
+                        VarRef cond = VarRef::steal(
+                            jit_var_loop_cond(loop, active.index()));
+                        accl += arr.read(il, active);
+                        il += 1u;
+                        vars[0] = il.index();
+                        vars[1] = accl.index();
+                        if (jit_var_loop_end(loop, cond, vars, rec.checkpoint)) {
+                            i   = UInt32::steal(vars[0]);
+                            acc = UInt32::steal(vars[1]);
+                            rec.disarm();
+                            break;
+                        }
+                    } while (true);
+                }
+                return acc;
+            }
+        };
+
+        // Callable 2: Uses a symbolic conditional inside the callable
+        struct CondCallable : ComplexBase {
+            UInt32 bias = opaque<UInt32>(100);
+            UInt32 compute(UInt32 n) override {
+                Mask is_even = eq(n & 1u, 0u);
+                Mask cond_t = Mask::steal(jit_var_mask_apply(
+                    is_even.index(), (uint32_t) jit_var_size(is_even.index())));
+                Mask cond_f = Mask::steal(jit_var_mask_apply(
+                    (!is_even).index(), (uint32_t) jit_var_size(is_even.index())));
+
+                UInt32 res;
+                {
+                    ScopedRecord rec(Backend, "CallInnerCond");
+                    VarRef cond = VarRef::steal(
+                        jit_var_cond_start("CallInnerCond", true, cond_t.index(), cond_f.index()));
+
+                    jit_var_mask_push(Backend, cond_t.index());
+                    UInt32 vt = n * 10u + bias;
+                    jit_var_mask_pop(Backend);
+                    uint32_t rvt[1] = { vt.index() };
+                    VarRef lt = VarRef::steal(jit_var_cond_append(cond, rvt, 1));
+
+                    jit_var_mask_push(Backend, cond_f.index());
+                    UInt32 vf = n * 100u + bias;
+                    jit_var_mask_pop(Backend);
+                    uint32_t rvf[1] = { vf.index() };
+                    VarRef lf = VarRef::steal(jit_var_cond_append(cond, rvf, 1));
+
+                    uint32_t rv_out[1] = { 0 };
+                    jit_var_cond_end(cond, rv_out);
+                    res = UInt32::steal(rv_out[0]);
+                    rec.disarm();
+                }
+                return res;
+            }
+        };
+
+        LoopArrCallable c1;
+        CondCallable    c2;
+        jit_registry_put("Vulkan", "ComplexBase", &c1);
+        jit_registry_put("Vulkan", "ComplexBase", &c2);
+
+        UInt32 self = (arange<UInt32>(6) % 2) + 1u; // [1, 2, 1, 2, 1, 2]
+        UInt32 n    = arange<UInt32>(6) + 1u;       // [1, 2, 3, 4, 5, 6]
+
+        auto f_call = [](void *p, uint32_t *in, uint32_t *out) {
+            UInt32 rv = ((ComplexBase *) p)->compute(UInt32::borrow(in[0]));
+            out[0] = rv.release();
+        };
+
+        for (uint32_t opt = 0; opt < 2; ++opt) {
+            jit_set_flag(JitFlag::OptimizeCalls, opt);
+            uint32_t inputs[1]  = { n.index() };
+            uint32_t outputs[1] = { 0 };
+            Mask mask = Mask::steal(jit_var_bool(Backend, true));
+
+            symbolic_call_vk<2, 1, 1>(Backend, "ComplexBase", false,
+                                      self.index(), mask.index(),
+                                      f_call, inputs, outputs);
+
+            UInt32 y = UInt32::steal(outputs[0]);
+            assemble_and_validate_spirv(y.index());
+
+            // Lane 0: c1(1) = ((1+0)+(1+1)+(1+2)+(1+3))*2 = 10*2 = 20
+            // Lane 1: c2(2) = even -> 2*10 + 100 = 120
+            // Lane 2: c1(3) = (3+4+5+6)*2 = 36
+            // Lane 3: c2(4) = even -> 4*10 + 100 = 140
+            // Lane 4: c1(5) = (5+6+7+8)*2 = 52
+            // Lane 5: c2(6) = even -> 6*10 + 100 = 160
+            jit_assert(strcmp(y.str(), "[20, 120, 36, 140, 52, 160]") == 0);
+        }
+
+        jit_registry_remove(&c1);
+        jit_registry_remove(&c2);
+    }
+
+    jit_set_flag(JitFlag::OptimizeCalls, true);
+}
+
 
