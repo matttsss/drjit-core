@@ -73,5 +73,10 @@ extern void jitc_vulkan_require_u32_const(uint32_t value);
 /// ``%c_u8_1`` are declared for loading/storing 8-bit boolean buffers.
 extern void jitc_vulkan_require_bool_storage();
 
+/// Ensure that ``%c_zero_<type> = OpConstantNull %<type>`` is declared in
+/// ``spv_types_consts`` and return its SPIR-V constant identifier.
+extern const char *jitc_vulkan_require_zero(VarType vt);
+
 /// Request the ``GLSL.std.450`` extended instruction set in ``spv_header``.
 extern void jitc_vulkan_require_glsl450();
+

@@ -46,9 +46,15 @@ static void jitc_vulkan_render(Variable *v);
 
 static const VulkanDevice *active_vulkan_dev = nullptr;
 
-static bool emitted_types   [(size_t) VarType::Count];
-static bool emitted_psb_ptrs[(size_t) VarType::Count];
-static bool emitted_fn_ptrs [(size_t) VarType::Count];
+static bool emitted_types      [(size_t) VarType::Count];
+static bool emitted_psb_ptrs   [(size_t) VarType::Count];
+static bool emitted_fn_ptrs    [(size_t) VarType::Count];
+static bool emitted_zero_consts[(size_t) VarType::Count];
+static bool emitted_one_consts [(size_t) VarType::Count];
+static bool emitted_ones_consts[(size_t) VarType::Count];
+static bool emitted_nan_consts [(size_t) VarType::Count];
+static bool emitted_sign_consts[(size_t) VarType::Count];
+static bool emitted_mul_structs[(size_t) VarType::Count];
 
 static tsl::robin_set<uint32_t> emitted_u32_consts;
 
@@ -76,6 +82,34 @@ static const char *fn_ptr_names[(size_t) VarType::Count] = {
     "???",          "%ptr_fn_f16",  "%ptr_fn_f32",  "%ptr_fn_f64"
 };
 
+static const char *zero_const_names[(size_t) VarType::Count] = {
+    "???",          "%c_zero_bool", "???",          "%c_zero_i8",
+    "%c_zero_u8",   "%c_zero_i16",  "%c_zero_u16",  "%c_zero_i32",
+    "%c_zero_u32",  "%c_zero_i64",  "%c_zero_u64",  "%c_zero_u64",
+    "???",          "%c_zero_f16",  "%c_zero_f32",  "%c_zero_f64"
+};
+
+static const char *one_const_names[(size_t) VarType::Count] = {
+    "???",          "%c_one_bool",  "???",          "%c_one_i8",
+    "%c_one_u8",    "%c_one_i16",   "%c_one_u16",   "%c_one_i32",
+    "%c_one_u32",   "%c_one_i64",   "%c_one_u64",   "%c_one_u64",
+    "???",          "%c_one_f16",   "%c_one_f32",   "%c_one_f64"
+};
+
+static const char *ones_const_names[(size_t) VarType::Count] = {
+    "???",          "%c_one_bool",  "???",          "%c_ones_i8",
+    "%c_ones_u8",   "%c_ones_i16",  "%c_ones_u16",  "%c_ones_i32",
+    "%c_ones_u32",  "%c_ones_i64",  "%c_ones_u64",  "%c_ones_u64",
+    "???",          "???",          "???",          "???"
+};
+
+static const char *mul_struct_names[(size_t) VarType::Count] = {
+    "???",              "???",              "???",              "%struct_mul_i8",
+    "%struct_mul_u8",   "%struct_mul_i16",  "%struct_mul_u16",  "%struct_mul_i32",
+    "%struct_mul_u32",  "%struct_mul_i64",  "%struct_mul_u64",  "%struct_mul_u64",
+    "???",              "???",              "???",              "???"
+};
+
 void jitc_vulkan_assemble_reset() {
     spv_header.clear();
     spv_annotations.clear();
@@ -86,6 +120,12 @@ void jitc_vulkan_assemble_reset() {
     memset(emitted_types, 0, sizeof(emitted_types));
     memset(emitted_psb_ptrs, 0, sizeof(emitted_psb_ptrs));
     memset(emitted_fn_ptrs, 0, sizeof(emitted_fn_ptrs));
+    memset(emitted_zero_consts, 0, sizeof(emitted_zero_consts));
+    memset(emitted_one_consts, 0, sizeof(emitted_one_consts));
+    memset(emitted_ones_consts, 0, sizeof(emitted_ones_consts));
+    memset(emitted_nan_consts, 0, sizeof(emitted_nan_consts));
+    memset(emitted_sign_consts, 0, sizeof(emitted_sign_consts));
+    memset(emitted_mul_structs, 0, sizeof(emitted_mul_structs));
     emitted_u32_consts.clear();
 
     has_bool_storage_consts = false;
@@ -266,6 +306,186 @@ void jitc_vulkan_require_bool_storage() {
                "%c_u8_1 = OpConstant %u8 1\n");
         has_bool_storage_consts = true;
     }
+}
+
+static VarType jitc_vulkan_uint_type(VarType vt) {
+    switch (type_size[(uint32_t) vt]) {
+        case 1: return VarType::UInt8;
+        case 2: return VarType::UInt16;
+        case 4: return VarType::UInt32;
+        case 8: return VarType::UInt64;
+        default:
+            jitc_fail("jitc_vulkan_uint_type(): unsupported type %u!",
+                      (uint32_t) vt);
+    }
+}
+
+static VarType jitc_vulkan_sint_type(VarType vt) {
+    switch (type_size[(uint32_t) vt]) {
+        case 1: return VarType::Int8;
+        case 2: return VarType::Int16;
+        case 4: return VarType::Int32;
+        case 8: return VarType::Int64;
+        default:
+            jitc_fail("jitc_vulkan_sint_type(): unsupported type %u!",
+                      (uint32_t) vt);
+    }
+}
+
+const char *jitc_vulkan_require_zero(VarType vt) {
+    if (vt == VarType::Pointer)
+        vt = VarType::UInt64;
+
+    uint32_t idx = (uint32_t) vt;
+    const char *name = zero_const_names[idx];
+    if (emitted_zero_consts[idx])
+        return name;
+
+    jitc_vulkan_require_type(vt);
+    fmt_tc("$s = OpConstantNull $s\n", name, type_name_vulkan[idx]);
+
+    emitted_zero_consts[idx] = true;
+    return name;
+}
+
+static const char *jitc_vulkan_require_one(VarType vt) {
+    if (vt == VarType::Pointer)
+        vt = VarType::UInt64;
+
+    uint32_t idx = (uint32_t) vt;
+    const char *name = one_const_names[idx];
+    if (emitted_one_consts[idx])
+        return name;
+
+    jitc_vulkan_require_type(vt);
+    switch (vt) {
+        case VarType::Bool:
+            fmt_tc("$s = OpConstantTrue %bool\n", name);
+            break;
+        case VarType::Float16:
+            fmt_tc("$s = OpConstant %f16 !0x3c00\n", name);
+            break;
+        case VarType::Float32:
+            fmt_tc("$s = OpConstant %f32 !0x3f800000\n", name);
+            break;
+        case VarType::Float64:
+            fmt_tc("$s = OpConstant %f64 !0x0 !0x3ff00000\n", name);
+            break;
+        default:
+            fmt_tc("$s = OpConstant $s 1\n", name, type_name_vulkan[idx]);
+            break;
+    }
+
+    emitted_one_consts[idx] = true;
+    return name;
+}
+
+static const char *jitc_vulkan_require_ones(VarType vt) {
+    if (vt == VarType::Pointer)
+        vt = VarType::UInt64;
+    if (vt == VarType::Bool)
+        return jitc_vulkan_require_one(VarType::Bool);
+
+    uint32_t idx = (uint32_t) vt;
+    const char *name = ones_const_names[idx];
+    if (emitted_ones_consts[idx])
+        return name;
+
+    jitc_vulkan_require_type(vt);
+    const char *val_str = nullptr;
+    switch (type_size[idx]) {
+        case 1: val_str = "0xff";               break;
+        case 2: val_str = "0xffff";             break;
+        case 4: val_str = "0xffffffff";         break;
+        case 8: val_str = "0xffffffffffffffff"; break;
+        default:
+            jitc_fail("jitc_vulkan_require_ones(): unsupported type %u!", idx);
+    }
+
+    fmt_tc("$s = OpConstant $s $s\n", name, type_name_vulkan[idx], val_str);
+
+    emitted_ones_consts[idx] = true;
+    return name;
+}
+
+static const char *jitc_vulkan_require_nan(VarType vt) {
+    uint32_t idx = (uint32_t) vt;
+    const char *name = nullptr;
+    const char *val_str = nullptr;
+    switch (vt) {
+        case VarType::Float16:
+            name = "%c_nan_f16";
+            val_str = "!0x7e00";
+            break;
+        case VarType::Float32:
+            name = "%c_nan_f32";
+            val_str = "!0x7fc00000";
+            break;
+        case VarType::Float64:
+            name = "%c_nan_f64";
+            val_str = "!0x0 !0x7ff80000";
+            break;
+        default:
+            jitc_fail("jitc_vulkan_require_nan(): unsupported type %u!", idx);
+    }
+
+    if (emitted_nan_consts[idx])
+        return name;
+
+    jitc_vulkan_require_type(vt);
+    fmt_tc("$s = OpConstant $s $s\n", name, type_name_vulkan[idx], val_str);
+
+    emitted_nan_consts[idx] = true;
+    return name;
+}
+
+static const char *jitc_vulkan_require_sign_mask(VarType vt) {
+    VarType ut = jitc_vulkan_uint_type(vt);
+    uint32_t idx = (uint32_t) ut;
+    const char *name = nullptr;
+    const char *val_str = nullptr;
+    switch (ut) {
+        case VarType::UInt16:
+            name = "%c_sign_u16";
+            val_str = "0x8000";
+            break;
+        case VarType::UInt32:
+            name = "%c_sign_u32";
+            val_str = "0x80000000";
+            break;
+        case VarType::UInt64:
+            name = "%c_sign_u64";
+            val_str = "0x8000000000000000";
+            break;
+        default:
+            jitc_fail("jitc_vulkan_require_sign_mask(): unsupported type %u!", idx);
+    }
+
+    if (emitted_sign_consts[idx])
+        return name;
+
+    jitc_vulkan_require_type(ut);
+    fmt_tc("$s = OpConstant $s $s\n", name, type_name_vulkan[idx], val_str);
+
+    emitted_sign_consts[idx] = true;
+    return name;
+}
+
+static const char *jitc_vulkan_require_mul_struct(VarType vt) {
+    if (vt == VarType::Pointer)
+        vt = VarType::UInt64;
+
+    uint32_t idx = (uint32_t) vt;
+    const char *name = mul_struct_names[idx];
+    if (emitted_mul_structs[idx])
+        return name;
+
+    jitc_vulkan_require_type(vt);
+    const char *tname = type_name_vulkan[idx];
+    fmt_tc("$s = OpTypeStruct $s $s\n", name, tname, tname);
+
+    emitted_mul_structs[idx] = true;
+    return name;
 }
 
 // ----------------------------------------------------------------------------
@@ -539,12 +759,50 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
         "OpFunctionEnd\n");
 }
 
+static void jitc_vulkan_render_round(Variable *v, Variable *a0, const char *op) {
+    jitc_vulkan_require_type((VarType) a0->type);
+    if (jitc_is_float(v)) {
+        jitc_vulkan_require_glsl450();
+        fmt("$v = OpExtInst $t %glsl450 $s $v\n", v, v, op, a0);
+    } else if ((VarKind) v->kind == VarKind::Trunc) {
+        fmt("$v = $s $t $v\n", v,
+            jitc_is_uint(v) ? "OpConvertFToU" : "OpConvertFToS", v, a0);
+    } else {
+        jitc_vulkan_require_glsl450();
+        fmt("$v_0 = OpExtInst $t %glsl450 $s $v\n"
+            "$v = $s $t $v_0\n",
+            v, a0, op, a0,
+            v, jitc_is_uint(v) ? "OpConvertFToU" : "OpConvertFToS", v, v);
+    }
+}
+
+static void jitc_vulkan_render_trig_exp(Variable *v, Variable *a0,
+                                        const char *op) {
+    jitc_vulkan_require_glsl450();
+    if (jitc_is_double(v)) {
+        // GLSL.std.450 transcendental instructions only accept 16/32-bit floats
+        jitc_vulkan_require_type(VarType::Float32);
+        fmt("$v_0 = OpFConvert %f32 $v\n"
+            "$v_1 = OpExtInst %f32 %glsl450 $s $v_0\n"
+            "$v = OpFConvert $t $v_1\n",
+            v, a0, v, op, v, v, v, v);
+    } else {
+        fmt("$v = OpExtInst $t %glsl450 $s $v\n", v, v, op, a0);
+    }
+}
+
 static void jitc_vulkan_render(Variable *v) {
+    Variable *a0 = v->dep[0] ? jitc_var(v->dep[0]) : nullptr,
+             *a1 = v->dep[1] ? jitc_var(v->dep[1]) : nullptr,
+             *a2 = v->dep[2] ? jitc_var(v->dep[2]) : nullptr;
+
     VarType vt = (VarType) v->type;
+    VarKind kind = (VarKind) v->kind;
+
     if (vt != VarType::Void)
         jitc_vulkan_require_type(vt);
 
-    switch ((VarKind) v->kind) {
+    switch (kind) {
         case VarKind::Nop:
             break;
 
@@ -567,8 +825,650 @@ static void jitc_vulkan_render(Variable *v) {
             fmt("$v = OpCopyObject $t %idx\n", v, v);
             break;
 
-        case VarKind::Bitcast: {
-            Variable *a0 = jitc_var(v->dep[0]);
+        case VarKind::Neg:
+            fmt(jitc_is_float(v) ? "$v = OpFNegate $t $v\n"
+                                 : "$v = OpSNegate $t $v\n",
+                v, v, a0);
+            break;
+
+        case VarKind::Not:
+            if (jitc_is_bool(v)) {
+                fmt("$v = OpLogicalNot $t $v\n", v, v, a0);
+            } else if (jitc_is_float(v)) {
+                jitc_vulkan_require_type(jitc_vulkan_uint_type(vt));
+                fmt("$v_0 = OpBitcast $b $v\n"
+                    "$v_1 = OpNot $b $v_0\n"
+                    "$v = OpBitcast $t $v_1\n",
+                    v, v, a0, v, v, v, v, v, v);
+            } else {
+                fmt("$v = OpNot $t $v\n", v, v, a0);
+            }
+            break;
+
+        case VarKind::Sqrt:
+        case VarKind::SqrtApprox:
+            jitc_vulkan_require_glsl450();
+            fmt("$v = OpExtInst $t %glsl450 Sqrt $v\n", v, v, a0);
+            break;
+
+        case VarKind::Abs:
+            if (jitc_is_float(v)) {
+                jitc_vulkan_require_glsl450();
+                fmt("$v = OpExtInst $t %glsl450 FAbs $v\n", v, v, a0);
+            } else if (jitc_is_sint(v)) {
+                jitc_vulkan_require_glsl450();
+                fmt("$v = OpExtInst $t %glsl450 SAbs $v\n", v, v, a0);
+            } else {
+                fmt("$v = OpCopyObject $t $v\n", v, v, a0);
+            }
+            break;
+
+        case VarKind::Add:
+            fmt(jitc_is_float(v) ? "$v = OpFAdd $t $v $v\n"
+                                 : "$v = OpIAdd $t $v $v\n",
+                v, v, a0, a1);
+            break;
+
+        case VarKind::Sub:
+            fmt(jitc_is_float(v) ? "$v = OpFSub $t $v $v\n"
+                                 : "$v = OpISub $t $v $v\n",
+                v, v, a0, a1);
+            break;
+
+        case VarKind::Mul:
+            fmt(jitc_is_float(v) ? "$v = OpFMul $t $v $v\n"
+                                 : "$v = OpIMul $t $v $v\n",
+                v, v, a0, a1);
+            break;
+
+        case VarKind::Div:
+        case VarKind::DivApprox:
+            if (jitc_is_float(v))
+                fmt("$v = OpFDiv $t $v $v\n", v, v, a0, a1);
+            else if (jitc_is_uint(v))
+                fmt("$v = OpUDiv $t $v $v\n", v, v, a0, a1);
+            else
+                fmt("$v = OpSDiv $t $v $v\n", v, v, a0, a1);
+            break;
+
+        case VarKind::Mod:
+            fmt(jitc_is_uint(v) ? "$v = OpUMod $t $v $v\n"
+                                : "$v = OpSRem $t $v $v\n",
+                v, v, a0, a1);
+            break;
+
+        case VarKind::MulHi: {
+            const char *st_name = jitc_vulkan_require_mul_struct(vt);
+            const char *op = jitc_is_uint(v) ? "OpUMulExtended"
+                                             : "OpSMulExtended";
+            fmt("$v_0 = $s $s $v $v\n"
+                "$v = OpCompositeExtract $t $v_0 1\n",
+                v, op, st_name, a0, a1,
+                v, v, v);
+            break;
+        }
+
+        case VarKind::MulWide: {
+            jitc_vulkan_require_type((VarType) a0->type);
+            const char *op = jitc_is_uint(v) ? "OpUConvert" : "OpSConvert";
+            fmt("$v_0 = $s $t $v\n"
+                "$v_1 = $s $t $v\n"
+                "$v = OpIMul $t $v_0 $v_1\n",
+                v, op, v, a0,
+                v, op, v, a1,
+                v, v, v, v);
+            break;
+        }
+
+        case VarKind::Fma:
+            if (jitc_is_float(v)) {
+                jitc_vulkan_require_glsl450();
+                fmt("$v = OpExtInst $t %glsl450 Fma $v $v $v\n",
+                    v, v, a0, a1, a2);
+            } else {
+                fmt("$v_0 = OpIMul $t $v $v\n"
+                    "$v = OpIAdd $t $v_0 $v\n",
+                    v, v, a0, a1,
+                    v, v, v, a2);
+            }
+            break;
+
+        case VarKind::Min:
+        case VarKind::Max: {
+            bool is_min = kind == VarKind::Min;
+            jitc_vulkan_require_glsl450();
+            if (jitc_is_float(v)) {
+                const char *fn = is_min ? "FMin" : "FMax";
+                const char *nan_c = jitc_vulkan_require_nan(vt);
+                jitc_vulkan_require_type(VarType::Bool);
+                fmt("$v_0 = OpExtInst $t %glsl450 $s $v $v\n"
+                    "$v_1 = OpIsNan %bool $v\n"
+                    "$v_2 = OpIsNan %bool $v\n"
+                    "$v_3 = OpLogicalOr %bool $v_1 $v_2\n"
+                    "$v = OpSelect $t $v_3 $s $v_0\n",
+                    v, v, fn, a0, a1,
+                    v, a0,
+                    v, a1,
+                    v, v, v,
+                    v, v, v, nan_c, v);
+            } else {
+                const char *fn = jitc_is_uint(v) ? (is_min ? "UMin" : "UMax")
+                                                 : (is_min ? "SMin" : "SMax");
+                fmt("$v = OpExtInst $t %glsl450 $s $v $v\n",
+                    v, v, fn, a0, a1);
+            }
+            break;
+        }
+
+        case VarKind::FMin:
+        case VarKind::FMax: {
+            jitc_vulkan_require_glsl450();
+            const char *fn = kind == VarKind::FMin ? "NMin" : "NMax";
+            fmt("$v = OpExtInst $t %glsl450 $s $v $v\n", v, v, fn, a0, a1);
+            break;
+        }
+
+        case VarKind::Copysign: {
+            const char *sign_mask = jitc_vulkan_require_sign_mask(vt);
+            fmt("$v_0 = OpBitcast $b $v\n"
+                "$v_1 = OpBitcast $b $v\n"
+                "$v_2 = OpBitwiseXor $b $v_0 $v_1\n"
+                "$v_3 = OpBitwiseAnd $b $v_2 $s\n"
+                "$v_4 = OpBitwiseXor $b $v_0 $v_3\n"
+                "$v = OpBitcast $t $v_4\n",
+                v, v, a0,
+                v, v, a1,
+                v, v, v, v,
+                v, v, v, sign_mask,
+                v, v, v, v,
+                v, v, v);
+            break;
+        }
+
+        case VarKind::Ceil:
+            jitc_vulkan_render_round(v, a0, "Ceil");
+            break;
+
+        case VarKind::Floor:
+            jitc_vulkan_render_round(v, a0, "Floor");
+            break;
+
+        case VarKind::Round:
+            jitc_vulkan_render_round(v, a0, "RoundEven");
+            break;
+
+        case VarKind::Trunc:
+            jitc_vulkan_render_round(v, a0, "Trunc");
+            break;
+
+        case VarKind::Eq:
+            jitc_vulkan_require_type((VarType) a0->type);
+            if (jitc_is_float(a0))
+                fmt("$v = OpFOrdEqual $t $v $v\n", v, v, a0, a1);
+            else if (jitc_is_bool(a0))
+                fmt("$v = OpLogicalEqual $t $v $v\n", v, v, a0, a1);
+            else
+                fmt("$v = OpIEqual $t $v $v\n", v, v, a0, a1);
+            break;
+
+        case VarKind::Neq:
+            jitc_vulkan_require_type((VarType) a0->type);
+            if (jitc_is_float(a0))
+                fmt("$v = OpFOrdNotEqual $t $v $v\n", v, v, a0, a1);
+            else if (jitc_is_bool(a0))
+                fmt("$v = OpLogicalNotEqual $t $v $v\n", v, v, a0, a1);
+            else
+                fmt("$v = OpINotEqual $t $v $v\n", v, v, a0, a1);
+            break;
+
+        case VarKind::Lt:
+            jitc_vulkan_require_type((VarType) a0->type);
+            if (jitc_is_float(a0))
+                fmt("$v = OpFOrdLessThan $t $v $v\n", v, v, a0, a1);
+            else if (jitc_is_uint(a0))
+                fmt("$v = OpULessThan $t $v $v\n", v, v, a0, a1);
+            else if (jitc_is_sint(a0))
+                fmt("$v = OpSLessThan $t $v $v\n", v, v, a0, a1);
+            else
+                fmt("$v_0 = OpLogicalNot $t $v\n"
+                    "$v = OpLogicalAnd $t $v_0 $v\n",
+                    v, v, a0, v, v, v, a1);
+            break;
+
+        case VarKind::Le:
+            jitc_vulkan_require_type((VarType) a0->type);
+            if (jitc_is_float(a0))
+                fmt("$v = OpFOrdLessThanEqual $t $v $v\n", v, v, a0, a1);
+            else if (jitc_is_uint(a0))
+                fmt("$v = OpULessThanEqual $t $v $v\n", v, v, a0, a1);
+            else if (jitc_is_sint(a0))
+                fmt("$v = OpSLessThanEqual $t $v $v\n", v, v, a0, a1);
+            else
+                fmt("$v_0 = OpLogicalNot $t $v\n"
+                    "$v = OpLogicalOr $t $v_0 $v\n",
+                    v, v, a0, v, v, v, a1);
+            break;
+
+        case VarKind::Gt:
+            jitc_vulkan_require_type((VarType) a0->type);
+            if (jitc_is_float(a0))
+                fmt("$v = OpFOrdGreaterThan $t $v $v\n", v, v, a0, a1);
+            else if (jitc_is_uint(a0))
+                fmt("$v = OpUGreaterThan $t $v $v\n", v, v, a0, a1);
+            else if (jitc_is_sint(a0))
+                fmt("$v = OpSGreaterThan $t $v $v\n", v, v, a0, a1);
+            else
+                fmt("$v_0 = OpLogicalNot $t $v\n"
+                    "$v = OpLogicalAnd $t $v $v_0\n",
+                    v, v, a1, v, v, a0, v);
+            break;
+
+        case VarKind::Ge:
+            jitc_vulkan_require_type((VarType) a0->type);
+            if (jitc_is_float(a0))
+                fmt("$v = OpFOrdGreaterThanEqual $t $v $v\n", v, v, a0, a1);
+            else if (jitc_is_uint(a0))
+                fmt("$v = OpUGreaterThanEqual $t $v $v\n", v, v, a0, a1);
+            else if (jitc_is_sint(a0))
+                fmt("$v = OpSGreaterThanEqual $t $v $v\n", v, v, a0, a1);
+            else
+                fmt("$v_0 = OpLogicalNot $t $v\n"
+                    "$v = OpLogicalOr $t $v $v_0\n",
+                    v, v, a1, v, v, a0, v);
+            break;
+
+        case VarKind::Select:
+            jitc_vulkan_require_type(VarType::Bool);
+            fmt("$v = OpSelect $t $v $v $v\n", v, v, a0, a1, a2);
+            break;
+
+        case VarKind::Popc: {
+            jitc_vulkan_require_type(VarType::UInt32);
+            uint32_t sz = type_size[v->type];
+            if (sz <= 2) {
+                if (jitc_is_uint(v)) {
+                    fmt("$v_0 = OpUConvert %u32 $v\n", v, a0);
+                } else {
+                    jitc_vulkan_require_type(jitc_vulkan_uint_type(vt));
+                    fmt("$v_u = OpBitcast $b $v\n"
+                        "$v_0 = OpUConvert %u32 $v_u\n",
+                        v, v, a0, v, v);
+                }
+                fmt("$v_1 = OpBitCount %u32 $v_0\n"
+                    "$v = $s $t $v_1\n",
+                    v, v,
+                    v, jitc_is_uint(v) ? "OpUConvert" : "OpSConvert", v, v);
+            } else if (sz == 4) {
+                fmt("$v = OpBitCount $t $v\n", v, v, a0);
+            } else {
+                jitc_vulkan_require_type(VarType::UInt64);
+                jitc_vulkan_require_u32_const(32);
+                if (jitc_is_uint(v))
+                    fmt("$v_u = OpCopyObject %u64 $v\n", v, a0);
+                else
+                    fmt("$v_u = OpBitcast %u64 $v\n", v, a0);
+                fmt("$v_lo = OpUConvert %u32 $v_u\n"
+                    "$v_hi64 = OpShiftRightLogical %u64 $v_u %c_u32_32\n"
+                    "$v_hi = OpUConvert %u32 $v_hi64\n"
+                    "$v_clo = OpBitCount %u32 $v_lo\n"
+                    "$v_chi = OpBitCount %u32 $v_hi\n"
+                    "$v_c32 = OpIAdd %u32 $v_clo $v_chi\n",
+                    v, v, v, v, v, v, v, v, v, v, v, v, v);
+                if (jitc_is_uint(v))
+                    fmt("$v = OpUConvert %u64 $v_c32\n", v, v);
+                else
+                    fmt("$v_c64 = OpUConvert %u64 $v_c32\n"
+                        "$v = OpBitcast %i64 $v_c64\n",
+                        v, v, v, v);
+            }
+            break;
+        }
+
+        case VarKind::Brev: {
+            jitc_vulkan_require_type(VarType::UInt32);
+            uint32_t sz = type_size[v->type];
+            if (sz <= 2) {
+                uint32_t shift = 32 - sz * 8;
+                jitc_vulkan_require_u32_const(shift);
+                if (jitc_is_uint(v)) {
+                    fmt("$v_0 = OpUConvert %u32 $v\n", v, a0);
+                } else {
+                    jitc_vulkan_require_type(jitc_vulkan_uint_type(vt));
+                    fmt("$v_u = OpBitcast $b $v\n"
+                        "$v_0 = OpUConvert %u32 $v_u\n",
+                        v, v, a0, v, v);
+                }
+                fmt("$v_1 = OpBitReverse %u32 $v_0\n"
+                    "$v_2 = OpShiftRightLogical %u32 $v_1 %c_u32_$u\n"
+                    "$v = $s $t $v_2\n",
+                    v, v, v, v, shift,
+                    v, jitc_is_uint(v) ? "OpUConvert" : "OpSConvert", v, v);
+            } else if (sz == 4) {
+                fmt("$v = OpBitReverse $t $v\n", v, v, a0);
+            } else {
+                jitc_vulkan_require_type(VarType::UInt64);
+                jitc_vulkan_require_u32_const(32);
+                if (jitc_is_uint(v))
+                    fmt("$v_u = OpCopyObject %u64 $v\n", v, a0);
+                else
+                    fmt("$v_u = OpBitcast %u64 $v\n", v, a0);
+                fmt("$v_lo = OpUConvert %u32 $v_u\n"
+                    "$v_hi64 = OpShiftRightLogical %u64 $v_u %c_u32_32\n"
+                    "$v_hi = OpUConvert %u32 $v_hi64\n"
+                    "$v_rlo = OpBitReverse %u32 $v_lo\n"
+                    "$v_rhi = OpBitReverse %u32 $v_hi\n"
+                    "$v_rlo64 = OpUConvert %u64 $v_rlo\n"
+                    "$v_rhi64 = OpUConvert %u64 $v_rhi\n"
+                    "$v_rhi_s = OpShiftLeftLogical %u64 $v_rlo64 %c_u32_32\n",
+                    v, v, v, v, v, v, v, v, v, v, v, v, v, v, v, v);
+                if (jitc_is_uint(v))
+                    fmt("$v = OpBitwiseOr %u64 $v_rhi_s $v_rhi64\n", v, v, v);
+                else
+                    fmt("$v_res = OpBitwiseOr %u64 $v_rhi_s $v_rhi64\n"
+                        "$v = OpBitcast %i64 $v_res\n",
+                        v, v, v, v, v);
+            }
+            break;
+        }
+
+        case VarKind::Clz: {
+            jitc_vulkan_require_glsl450();
+            jitc_vulkan_require_type(VarType::UInt32);
+            uint32_t sz = type_size[v->type];
+            if (sz <= 2) {
+                uint32_t max_bit = sz * 8 - 1;
+                jitc_vulkan_require_u32_const(max_bit);
+                if (jitc_is_uint(v)) {
+                    fmt("$v_0 = OpUConvert %u32 $v\n", v, a0);
+                } else {
+                    jitc_vulkan_require_type(jitc_vulkan_uint_type(vt));
+                    fmt("$v_u = OpBitcast $b $v\n"
+                        "$v_0 = OpUConvert %u32 $v_u\n",
+                        v, v, a0, v, v);
+                }
+                fmt("$v_1 = OpExtInst %u32 %glsl450 FindUMsb $v_0\n"
+                    "$v_2 = OpISub %u32 %c_u32_$u $v_1\n"
+                    "$v = $s $t $v_2\n",
+                    v, v, v, max_bit, v,
+                    v, jitc_is_uint(v) ? "OpUConvert" : "OpSConvert", v, v);
+            } else if (sz == 4) {
+                jitc_vulkan_require_u32_const(31);
+                if (jitc_is_uint(v)) {
+                    fmt("$v_0 = OpExtInst %u32 %glsl450 FindUMsb $v\n"
+                        "$v = OpISub %u32 %c_u32_31 $v_0\n",
+                        v, a0, v, v);
+                } else {
+                    fmt("$v_0 = OpBitcast %u32 $v\n"
+                        "$v_1 = OpExtInst %u32 %glsl450 FindUMsb $v_0\n"
+                        "$v_2 = OpISub %u32 %c_u32_31 $v_1\n"
+                        "$v = OpBitcast %i32 $v_2\n",
+                        v, a0, v, v, v, v, v, v);
+                }
+            } else {
+                jitc_vulkan_require_type(VarType::Bool);
+                jitc_vulkan_require_type(VarType::UInt64);
+                jitc_vulkan_require_u32_const(0);
+                jitc_vulkan_require_u32_const(31);
+                jitc_vulkan_require_u32_const(32);
+                jitc_vulkan_require_u32_const(63);
+                if (jitc_is_uint(v))
+                    fmt("$v_u = OpCopyObject %u64 $v\n", v, a0);
+                else
+                    fmt("$v_u = OpBitcast %u64 $v\n", v, a0);
+                fmt("$v_lo = OpUConvert %u32 $v_u\n"
+                    "$v_hi64 = OpShiftRightLogical %u64 $v_u %c_u32_32\n"
+                    "$v_hi = OpUConvert %u32 $v_hi64\n"
+                    "$v_mhi = OpExtInst %u32 %glsl450 FindUMsb $v_hi\n"
+                    "$v_mlo = OpExtInst %u32 %glsl450 FindUMsb $v_lo\n"
+                    "$v_chi = OpISub %u32 %c_u32_31 $v_mhi\n"
+                    "$v_clo = OpISub %u32 %c_u32_63 $v_mlo\n"
+                    "$v_hnz = OpINotEqual %bool $v_hi %c_u32_0\n"
+                    "$v_c32 = OpSelect %u32 $v_hnz $v_chi $v_clo\n",
+                    v, v, v, v, v, v, v, v, v, v, v, v, v, v, v, v, v, v, v, v);
+                if (jitc_is_uint(v))
+                    fmt("$v = OpUConvert %u64 $v_c32\n", v, v);
+                else
+                    fmt("$v_c64 = OpUConvert %u64 $v_c32\n"
+                        "$v = OpBitcast %i64 $v_c64\n",
+                        v, v, v, v);
+            }
+            break;
+        }
+
+        case VarKind::Ctz: {
+            jitc_vulkan_require_glsl450();
+            jitc_vulkan_require_type(VarType::UInt32);
+            uint32_t sz = type_size[v->type];
+            if (sz <= 2) {
+                uint32_t sentinel = 1u << (sz * 8);
+                jitc_vulkan_require_u32_const(sentinel);
+                if (jitc_is_uint(v)) {
+                    fmt("$v_0 = OpUConvert %u32 $v\n", v, a0);
+                } else {
+                    jitc_vulkan_require_type(jitc_vulkan_uint_type(vt));
+                    fmt("$v_u = OpBitcast $b $v\n"
+                        "$v_0 = OpUConvert %u32 $v_u\n",
+                        v, v, a0, v, v);
+                }
+                fmt("$v_1 = OpBitwiseOr %u32 $v_0 %c_u32_$u\n"
+                    "$v_2 = OpExtInst %u32 %glsl450 FindILsb $v_1\n"
+                    "$v = $s $t $v_2\n",
+                    v, v, sentinel, v, v,
+                    v, jitc_is_uint(v) ? "OpUConvert" : "OpSConvert", v, v);
+            } else if (sz == 4) {
+                jitc_vulkan_require_type(VarType::Bool);
+                jitc_vulkan_require_u32_const(0);
+                jitc_vulkan_require_u32_const(32);
+                if (jitc_is_uint(v)) {
+                    fmt("$v_0 = OpExtInst %u32 %glsl450 FindILsb $v\n"
+                        "$v_1 = OpIEqual %bool $v %c_u32_0\n"
+                        "$v = OpSelect %u32 $v_1 %c_u32_32 $v_0\n",
+                        v, a0, v, a0, v, v, v);
+                } else {
+                    fmt("$v_0 = OpBitcast %u32 $v\n"
+                        "$v_1 = OpExtInst %u32 %glsl450 FindILsb $v_0\n"
+                        "$v_2 = OpIEqual %bool $v_0 %c_u32_0\n"
+                        "$v_3 = OpSelect %u32 $v_2 %c_u32_32 $v_1\n"
+                        "$v = OpBitcast %i32 $v_3\n",
+                        v, a0, v, v, v, v, v, v, v, v, v);
+                }
+            } else {
+                jitc_vulkan_require_type(VarType::Bool);
+                jitc_vulkan_require_type(VarType::UInt64);
+                jitc_vulkan_require_u32_const(0);
+                jitc_vulkan_require_u32_const(32);
+                jitc_vulkan_require_u32_const(64);
+                if (jitc_is_uint(v))
+                    fmt("$v_u = OpCopyObject %u64 $v\n", v, a0);
+                else
+                    fmt("$v_u = OpBitcast %u64 $v\n", v, a0);
+                fmt("$v_lo = OpUConvert %u32 $v_u\n"
+                    "$v_hi64 = OpShiftRightLogical %u64 $v_u %c_u32_32\n"
+                    "$v_hi = OpUConvert %u32 $v_hi64\n"
+                    "$v_llo = OpExtInst %u32 %glsl450 FindILsb $v_lo\n"
+                    "$v_lhi = OpExtInst %u32 %glsl450 FindILsb $v_hi\n"
+                    "$v_chi0 = OpIAdd %u32 $v_lhi %c_u32_32\n"
+                    "$v_hz = OpIEqual %bool $v_hi %c_u32_0\n"
+                    "$v_chi = OpSelect %u32 $v_hz %c_u32_64 $v_chi0\n"
+                    "$v_lnz = OpINotEqual %bool $v_lo %c_u32_0\n"
+                    "$v_c32 = OpSelect %u32 $v_lnz $v_llo $v_chi\n",
+                    v, v, v, v, v, v, v, v, v, v,
+                    v, v, v, v, v, v, v, v, v, v,
+                    v, v, v);
+                if (jitc_is_uint(v))
+                    fmt("$v = OpUConvert %u64 $v_c32\n", v, v);
+                else
+                    fmt("$v_c64 = OpUConvert %u64 $v_c32\n"
+                        "$v = OpBitcast %i64 $v_c64\n",
+                        v, v, v, v);
+            }
+            break;
+        }
+
+        case VarKind::And:
+            if (a0->type != a1->type) {
+                jitc_vulkan_require_type(VarType::Bool);
+                const char *zero_c = jitc_vulkan_require_zero(vt);
+                fmt("$v = OpSelect $t $v $v $s\n", v, v, a1, a0, zero_c);
+            } else if (jitc_is_bool(v)) {
+                fmt("$v = OpLogicalAnd $t $v $v\n", v, v, a0, a1);
+            } else if (jitc_is_float(v)) {
+                jitc_vulkan_require_type(jitc_vulkan_uint_type(vt));
+                fmt("$v_0 = OpBitcast $b $v\n"
+                    "$v_1 = OpBitcast $b $v\n"
+                    "$v_2 = OpBitwiseAnd $b $v_0 $v_1\n"
+                    "$v = OpBitcast $t $v_2\n",
+                    v, v, a0, v, v, a1, v, v, v, v, v, v, v);
+            } else {
+                fmt("$v = OpBitwiseAnd $t $v $v\n", v, v, a0, a1);
+            }
+            break;
+
+        case VarKind::Or:
+            if (a0->type != a1->type) {
+                jitc_vulkan_require_type(VarType::Bool);
+                if (jitc_is_float(v)) {
+                    VarType ut = jitc_vulkan_uint_type(vt);
+                    const char *ones_c = jitc_vulkan_require_ones(ut);
+                    fmt("$v_0 = OpBitcast $b $v\n"
+                        "$v_1 = OpSelect $b $v $s $v_0\n"
+                        "$v = OpBitcast $t $v_1\n",
+                        v, v, a0, v, v, a1, ones_c, v, v, v, v);
+                } else {
+                    const char *ones_c = jitc_vulkan_require_ones(vt);
+                    fmt("$v = OpSelect $t $v $s $v\n", v, v, a1, ones_c, a0);
+                }
+            } else if (jitc_is_bool(v)) {
+                fmt("$v = OpLogicalOr $t $v $v\n", v, v, a0, a1);
+            } else if (jitc_is_float(v)) {
+                jitc_vulkan_require_type(jitc_vulkan_uint_type(vt));
+                fmt("$v_0 = OpBitcast $b $v\n"
+                    "$v_1 = OpBitcast $b $v\n"
+                    "$v_2 = OpBitwiseOr $b $v_0 $v_1\n"
+                    "$v = OpBitcast $t $v_2\n",
+                    v, v, a0, v, v, a1, v, v, v, v, v, v, v);
+            } else {
+                fmt("$v = OpBitwiseOr $t $v $v\n", v, v, a0, a1);
+            }
+            break;
+
+        case VarKind::Xor:
+            if (jitc_is_bool(v)) {
+                fmt("$v = OpLogicalNotEqual $t $v $v\n", v, v, a0, a1);
+            } else if (jitc_is_float(v)) {
+                jitc_vulkan_require_type(jitc_vulkan_uint_type(vt));
+                fmt("$v_0 = OpBitcast $b $v\n"
+                    "$v_1 = OpBitcast $b $v\n"
+                    "$v_2 = OpBitwiseXor $b $v_0 $v_1\n"
+                    "$v = OpBitcast $t $v_2\n",
+                    v, v, a0, v, v, a1, v, v, v, v, v, v, v);
+            } else {
+                fmt("$v = OpBitwiseXor $t $v $v\n", v, v, a0, a1);
+            }
+            break;
+
+        case VarKind::Shl:
+            fmt("$v = OpShiftLeftLogical $t $v $v\n", v, v, a0, a1);
+            break;
+
+        case VarKind::Shr:
+            fmt(jitc_is_uint(v) ? "$v = OpShiftRightLogical $t $v $v\n"
+                                : "$v = OpShiftRightArithmetic $t $v $v\n",
+                v, v, a0, a1);
+            break;
+
+        case VarKind::Rcp:
+        case VarKind::RcpApprox: {
+            const char *one_c = jitc_vulkan_require_one(vt);
+            fmt("$v = OpFDiv $t $s $v\n", v, v, one_c, a0);
+            break;
+        }
+
+        case VarKind::RSqrtApprox:
+            jitc_vulkan_require_glsl450();
+            fmt("$v = OpExtInst $t %glsl450 InverseSqrt $v\n", v, v, a0);
+            break;
+
+        case VarKind::Sin:
+            jitc_vulkan_render_trig_exp(v, a0, "Sin");
+            break;
+
+        case VarKind::Cos:
+            jitc_vulkan_render_trig_exp(v, a0, "Cos");
+            break;
+
+        case VarKind::Exp2:
+            jitc_vulkan_render_trig_exp(v, a0, "Exp2");
+            break;
+
+        case VarKind::Log2:
+            jitc_vulkan_render_trig_exp(v, a0, "Log2");
+            break;
+
+        case VarKind::Tanh:
+            jitc_vulkan_render_trig_exp(v, a0, "Tanh");
+            break;
+
+        case VarKind::Cast: {
+            VarType src_vt = (VarType) a0->type;
+            jitc_vulkan_require_type(src_vt);
+
+            if (jitc_is_bool(v)) {
+                const char *zero_c = jitc_vulkan_require_zero(src_vt);
+                fmt(jitc_is_float(a0) ? "$v = OpFOrdNotEqual %bool $v $s\n"
+                                      : "$v = OpINotEqual %bool $v $s\n",
+                    v, a0, zero_c);
+            } else if (jitc_is_bool(a0)) {
+                const char *one_c  = jitc_vulkan_require_one(vt);
+                const char *zero_c = jitc_vulkan_require_zero(vt);
+                fmt("$v = OpSelect $t $v $s $s\n", v, v, a0, one_c, zero_c);
+            } else if (jitc_is_float(v) && jitc_is_float(a0)) {
+                fmt("$v = OpFConvert $t $v\n", v, v, a0);
+            } else if (jitc_is_float(v) && !jitc_is_float(a0)) {
+                fmt(jitc_is_uint(a0) ? "$v = OpConvertUToF $t $v\n"
+                                     : "$v = OpConvertSToF $t $v\n",
+                    v, v, a0);
+            } else if (!jitc_is_float(v) && jitc_is_float(a0)) {
+                fmt(jitc_is_uint(v) ? "$v = OpConvertFToU $t $v\n"
+                                    : "$v = OpConvertFToS $t $v\n",
+                    v, v, a0);
+            } else if (type_size[v->type] < type_size[a0->type]) {
+                fmt(jitc_is_uint(v) ? "$v = OpUConvert $t $v\n"
+                                    : "$v = OpSConvert $t $v\n",
+                    v, v, a0);
+            } else if (type_size[v->type] > type_size[a0->type]) {
+                if (jitc_is_uint(a0)) {
+                    if (jitc_is_uint(v)) {
+                        fmt("$v = OpUConvert $t $v\n", v, v, a0);
+                    } else {
+                        VarType ut = jitc_vulkan_uint_type(vt);
+                        jitc_vulkan_require_type(ut);
+                        fmt("$v_0 = OpUConvert $b $v\n"
+                            "$v = OpBitcast $t $v_0\n",
+                            v, v, a0, v, v, v);
+                    }
+                } else {
+                    if (jitc_is_sint(v)) {
+                        fmt("$v = OpSConvert $t $v\n", v, v, a0);
+                    } else {
+                        VarType st = jitc_vulkan_sint_type(vt);
+                        jitc_vulkan_require_type(st);
+                        fmt("$v_0 = OpSConvert $s $v\n"
+                            "$v = OpBitcast $t $v_0\n",
+                            v, type_name_vulkan[(uint32_t) st], a0, v, v, v);
+                    }
+                }
+            } else {
+                if (strcmp(type_name_vulkan[v->type],
+                           type_name_vulkan[a0->type]) == 0)
+                    fmt("$v = OpCopyObject $t $v\n", v, v, a0);
+                else
+                    fmt("$v = OpBitcast $t $v\n", v, v, a0);
+            }
+            break;
+        }
+
+        case VarKind::Bitcast:
             jitc_vulkan_require_type((VarType) a0->type);
             if (strcmp(type_name_vulkan[v->type],
                        type_name_vulkan[a0->type]) == 0)
@@ -576,15 +1476,6 @@ static void jitc_vulkan_render(Variable *v) {
             else
                 fmt("$v = OpBitcast $t $v\n", v, v, a0);
             break;
-        }
-
-        case VarKind::Select: {
-            Variable *a0 = jitc_var(v->dep[0]),
-                     *a1 = jitc_var(v->dep[1]),
-                     *a2 = jitc_var(v->dep[2]);
-            fmt("$v = OpSelect $t $v $v $v\n", v, v, a0, a1, a2);
-            break;
-        }
 
         default:
             jitc_raise("jitc_vulkan_render(): unhandled variable kind \"%s\" "

@@ -1260,3 +1260,317 @@ TEST_VULKAN(18_spirv_assemble) {
     jit_var_dec_ref(mask_vec);
 }
 
+TEST_VULKAN(19_spirv_ops) {
+    const uint32_t n = 16;
+    int prev_cp = jit_flag(JitFlag::ConstantPropagation);
+    int prev_fm = jit_flag(JitFlag::FastMath);
+    jit_set_flag(JitFlag::ConstantPropagation, 0);
+
+    uint8_t m0_data[n], m1_data[n];
+    for (uint32_t i = 0; i < n; ++i) {
+        m0_data[i] = (uint8_t) (i & 1);
+        m1_data[i] = (uint8_t) ((i >> 1) & 1);
+    }
+    uint32_t m0 = jit_var_mem_copy(Backend, VarType::Bool, m0_data, n, 0),
+             m1 = jit_var_mem_copy(Backend, VarType::Bool, m1_data, n, 0);
+
+    auto make_input = [&](VarType vt, uint8_t seed) -> uint32_t {
+        size_t esize = 1;
+        switch (vt) {
+            case VarType::Bool:
+            case VarType::Int8:
+            case VarType::UInt8:   esize = 1; break;
+            case VarType::Int16:
+            case VarType::UInt16:
+            case VarType::Float16: esize = 2; break;
+            case VarType::Int32:
+            case VarType::UInt32:
+            case VarType::Float32: esize = 4; break;
+            case VarType::Int64:
+            case VarType::UInt64:
+            case VarType::Float64: esize = 8; break;
+            default: break;
+        }
+        std::vector<uint8_t> bytes(n * esize, seed);
+        return jit_var_mem_copy(Backend, vt, bytes.data(), n, 0);
+    };
+
+    // 1. Boolean logical and comparison operations
+    {
+        uint32_t r_not = jit_var_not(m0),
+                 r_and = jit_var_and(m0, m1),
+                 r_or  = jit_var_or(m0, m1),
+                 r_xor = jit_var_xor(m0, m1),
+                 r_eq  = jit_var_eq(m0, m1),
+                 r_neq = jit_var_neq(m0, m1),
+                 r_lt  = jit_var_lt(m0, m1),
+                 r_le  = jit_var_le(m0, m1),
+                 r_gt  = jit_var_gt(m0, m1),
+                 r_ge  = jit_var_ge(m0, m1);
+
+        uint32_t acc = jit_var_xor(r_not, r_and);
+        for (uint32_t v : { r_or, r_xor, r_eq, r_neq, r_lt, r_le, r_gt, r_ge }) {
+            uint32_t next = jit_var_xor(acc, v);
+            jit_var_dec_ref(acc);
+            acc = next;
+        }
+
+        std::string spv = assemble_and_validate_spirv(acc);
+        jit_assert(spv.find("OpLogicalNot %bool") != std::string::npos);
+        jit_assert(spv.find("OpLogicalAnd %bool") != std::string::npos);
+        jit_assert(spv.find("OpLogicalOr %bool") != std::string::npos);
+        jit_assert(spv.find("OpLogicalEqual %bool") != std::string::npos);
+        jit_assert(spv.find("OpLogicalNotEqual %bool") != std::string::npos);
+
+        jit_var_dec_ref(acc);
+        for (uint32_t v : { r_not, r_and, r_or, r_xor, r_eq, r_neq, r_lt, r_le, r_gt, r_ge })
+            jit_var_dec_ref(v);
+    }
+
+    // 2. Integer arithmetic, bitwise, bit-manipulation, and comparisons across all 8 integer types
+    const VarType int_types[] = {
+        VarType::Int8,  VarType::UInt8,  VarType::Int16, VarType::UInt16,
+        VarType::Int32, VarType::UInt32, VarType::Int64, VarType::UInt64
+    };
+
+    for (VarType vt : int_types) {
+        uint32_t a = make_input(vt, 1),
+                 b = make_input(vt, 2),
+                 c = make_input(vt, 3);
+
+        uint32_t r_neg  = jit_var_neg(a),
+                 r_abs  = jit_var_abs(a),
+                 r_not  = jit_var_not(a),
+                 r_add  = jit_var_add(a, b),
+                 r_sub  = jit_var_sub(a, b),
+                 r_mul  = jit_var_mul(a, b),
+                 r_div  = jit_var_div(a, b),
+                 r_mod  = jit_var_mod(a, b),
+                 r_mhi  = jit_var_mul_hi(a, b),
+                 r_fma  = jit_var_fma(a, b, c),
+                 r_min  = jit_var_min(a, b),
+                 r_max  = jit_var_max(a, b),
+                 r_and  = jit_var_and(a, b),
+                 r_or   = jit_var_or(a, b),
+                 r_xor  = jit_var_xor(a, b),
+                 r_andm = jit_var_and(a, m0),
+                 r_orm  = jit_var_or(a, m0),
+                 r_shl  = jit_var_shl(a, b),
+                 r_shr  = jit_var_shr(a, b),
+                 r_popc = jit_var_popc(a),
+                 r_brev = jit_var_brev(a),
+                 r_clz  = jit_var_clz(a),
+                 r_ctz  = jit_var_ctz(a);
+
+        uint32_t r_eq  = jit_var_eq(a, b),
+                 r_neq = jit_var_neq(a, b),
+                 r_lt  = jit_var_lt(a, b),
+                 r_le  = jit_var_le(a, b),
+                 r_gt  = jit_var_gt(a, b),
+                 r_ge  = jit_var_ge(a, b);
+
+        uint32_t cmp_m = jit_var_xor(r_eq, r_neq);
+        for (uint32_t m : { r_lt, r_le, r_gt, r_ge }) {
+            uint32_t next = jit_var_xor(cmp_m, m);
+            jit_var_dec_ref(cmp_m);
+            cmp_m = next;
+        }
+
+        uint32_t acc = jit_var_select(cmp_m, r_neg, r_abs);
+        for (uint32_t v : { r_not, r_add, r_sub, r_mul, r_div, r_mod, r_mhi,
+                            r_fma, r_min, r_max, r_and, r_or, r_xor, r_andm,
+                            r_orm, r_shl, r_shr, r_popc, r_brev, r_clz, r_ctz }) {
+            uint32_t next = jit_var_add(acc, v);
+            jit_var_dec_ref(acc);
+            acc = next;
+        }
+
+        std::string spv = assemble_and_validate_spirv(acc);
+        jit_assert(spv.find("OpSNegate ") != std::string::npos);
+        jit_assert(spv.find("OpIAdd ") != std::string::npos);
+        jit_assert(spv.find("OpISub ") != std::string::npos);
+        jit_assert(spv.find("OpIMul ") != std::string::npos);
+        jit_assert(spv.find("OpBitCount ") != std::string::npos);
+        jit_assert(spv.find("OpBitReverse ") != std::string::npos);
+        jit_assert(spv.find("FindUMsb ") != std::string::npos);
+        jit_assert(spv.find("FindILsb ") != std::string::npos);
+
+        if (vt == VarType::Int32 || vt == VarType::UInt32) {
+            uint32_t wide = jit_var_mul_wide(a, b);
+            std::string spv_w = assemble_and_validate_spirv(wide);
+            jit_assert(spv_w.find(vt == VarType::UInt32 ? "OpUConvert %u64"
+                                                        : "OpSConvert %i64") !=
+                       std::string::npos);
+            jit_var_dec_ref(wide);
+        }
+
+        jit_var_dec_ref(acc);
+        jit_var_dec_ref(cmp_m);
+        for (uint32_t v : { r_eq, r_neq, r_lt, r_le, r_gt, r_ge, r_neg, r_abs,
+                            r_not, r_add, r_sub, r_mul, r_div, r_mod, r_mhi,
+                            r_fma, r_min, r_max, r_and, r_or, r_xor, r_andm,
+                            r_orm, r_shl, r_shr, r_popc, r_brev, r_clz, r_ctz,
+                            c, b, a })
+            jit_var_dec_ref(v);
+    }
+
+    // 3. Floating-point arithmetic, math, bitwise, and comparisons across Float16, Float32, Float64
+    const VarType float_types[] = {
+        VarType::Float16, VarType::Float32, VarType::Float64
+    };
+
+    for (int fm = 0; fm <= 1; ++fm) {
+        jit_set_flag(JitFlag::FastMath, fm);
+        for (VarType vt : float_types) {
+            uint32_t a = make_input(vt, 0x3c),
+                     b = make_input(vt, 0x40),
+                     c = make_input(vt, 0x42);
+
+            uint32_t r_neg   = jit_var_neg(a),
+                     r_abs   = jit_var_abs(a),
+                     r_not   = jit_var_not(a),
+                     r_sqrt  = jit_var_sqrt(a),
+                     r_rcp   = jit_var_rcp(a),
+                     r_rsqrt = jit_var_rsqrt(a),
+                     r_ceil  = jit_var_ceil(a),
+                     r_floor = jit_var_floor(a),
+                     r_round = jit_var_round(a),
+                     r_trunc = jit_var_trunc(a),
+                     r_sin   = jit_var_sin_intrinsic(a),
+                     r_cos   = jit_var_cos_intrinsic(a),
+                     r_exp2  = jit_var_exp2_intrinsic(a),
+                     r_log2  = jit_var_log2_intrinsic(a),
+                     r_tanh  = jit_var_tanh_intrinsic(a),
+                     r_add   = jit_var_add(a, b),
+                     r_sub   = jit_var_sub(a, b),
+                     r_mul   = jit_var_mul(a, b),
+                     r_div   = jit_var_div(a, b),
+                     r_fma   = jit_var_fma(a, b, c),
+                     r_min   = jit_var_min(a, b),
+                     r_max   = jit_var_max(a, b),
+                     r_fmin  = jit_var_fmin(a, b),
+                     r_fmax  = jit_var_fmax(a, b),
+                     r_csgn  = jit_var_copysign(a, b),
+                     r_and   = jit_var_and(a, b),
+                     r_or    = jit_var_or(a, b),
+                     r_xor   = jit_var_xor(a, b),
+                     r_andm  = jit_var_and(a, m0),
+                     r_orm   = jit_var_or(a, m0);
+
+            uint32_t r_eq  = jit_var_eq(a, b),
+                     r_neq = jit_var_neq(a, b),
+                     r_lt  = jit_var_lt(a, b),
+                     r_le  = jit_var_le(a, b),
+                     r_gt  = jit_var_gt(a, b),
+                     r_ge  = jit_var_ge(a, b);
+
+            uint32_t cmp_m = jit_var_xor(r_eq, r_neq);
+            for (uint32_t m : { r_lt, r_le, r_gt, r_ge }) {
+                uint32_t next = jit_var_xor(cmp_m, m);
+                jit_var_dec_ref(cmp_m);
+                cmp_m = next;
+            }
+
+            uint32_t acc = jit_var_select(cmp_m, r_neg, r_abs);
+            for (uint32_t v : { r_not, r_sqrt, r_rcp, r_rsqrt, r_ceil, r_floor,
+                                r_round, r_trunc, r_sin, r_cos, r_exp2, r_log2,
+                                r_tanh, r_add, r_sub, r_mul, r_div, r_fma,
+                                r_min, r_max, r_fmin, r_fmax, r_csgn, r_and,
+                                r_or, r_xor, r_andm, r_orm }) {
+                uint32_t next = jit_var_add(acc, v);
+                jit_var_dec_ref(acc);
+                acc = next;
+            }
+
+            std::string spv = assemble_and_validate_spirv(acc);
+            jit_assert(spv.find("OpFNegate ") != std::string::npos);
+            jit_assert(spv.find("OpFAdd ") != std::string::npos);
+            jit_assert(spv.find("OpFSub ") != std::string::npos);
+            jit_assert(spv.find("OpFMul ") != std::string::npos);
+            jit_assert(spv.find("OpFDiv ") != std::string::npos);
+            jit_assert(spv.find("OpIsNan %bool") != std::string::npos);
+            jit_assert(spv.find("RoundEven ") != std::string::npos);
+            if (vt == VarType::Float32 && fm == 1)
+                jit_assert(spv.find("InverseSqrt ") != std::string::npos);
+
+            jit_var_dec_ref(acc);
+            jit_var_dec_ref(cmp_m);
+            for (uint32_t v : { r_eq, r_neq, r_lt, r_le, r_gt, r_ge, r_neg,
+                                r_abs, r_not, r_sqrt, r_rcp, r_rsqrt, r_ceil,
+                                r_floor, r_round, r_trunc, r_sin, r_cos, r_exp2,
+                                r_log2, r_tanh, r_add, r_sub, r_mul, r_div,
+                                r_fma, r_min, r_max, r_fmin, r_fmax, r_csgn,
+                                r_and, r_or, r_xor, r_andm, r_orm, c, b, a })
+                jit_var_dec_ref(v);
+        }
+    }
+
+    // 4. Fused float-to-int rounding (ceil2int, floor2int, round2int, trunc2int)
+    jit_set_flag(JitFlag::ConstantPropagation, 1);
+    for (VarType fvt : { VarType::Float32, VarType::Float64 }) {
+        uint32_t fa = make_input(fvt, 0x40);
+        for (VarType ivt : int_types) {
+            uint32_t c_rnd = jit_var_ceil(fa),
+                     f_rnd = jit_var_floor(fa),
+                     r_rnd = jit_var_round(fa),
+                     t_rnd = jit_var_trunc(fa);
+            uint32_t ci = jit_var_cast(c_rnd, ivt, 0),
+                     fi = jit_var_cast(f_rnd, ivt, 0),
+                     ri = jit_var_cast(r_rnd, ivt, 0),
+                     ti = jit_var_cast(t_rnd, ivt, 0);
+            uint32_t s0 = jit_var_add(ci, fi),
+                     s1 = jit_var_add(ri, ti),
+                     tot = jit_var_add(s0, s1);
+
+            std::string spv = assemble_and_validate_spirv(tot);
+            jit_assert(spv.find("Ceil ") != std::string::npos);
+            jit_assert(spv.find("Floor ") != std::string::npos);
+            jit_assert(spv.find("RoundEven ") != std::string::npos);
+
+            for (uint32_t v : { tot, s1, s0, ti, ri, fi, ci, t_rnd, r_rnd, f_rnd, c_rnd })
+                jit_var_dec_ref(v);
+        }
+        jit_var_dec_ref(fa);
+    }
+    jit_set_flag(JitFlag::ConstantPropagation, 0);
+
+    // 5. All pairwise value casts across all 12 scalar types
+    const VarType all_types[] = {
+        VarType::Bool,    VarType::Int8,    VarType::UInt8,   VarType::Int16,
+        VarType::UInt16,  VarType::Int32,   VarType::UInt32,  VarType::Int64,
+        VarType::UInt64,  VarType::Float16, VarType::Float32, VarType::Float64
+    };
+
+    std::vector<uint32_t> src_vars;
+    for (VarType svt : all_types)
+        src_vars.push_back(make_input(svt, 1));
+
+    for (VarType dvt : all_types) {
+        uint32_t acc = 0;
+        for (size_t i = 0; i < 12; ++i) {
+            uint32_t casted = jit_var_cast(src_vars[i], dvt, 0);
+            if (acc == 0) {
+                acc = casted;
+            } else {
+                uint32_t next = (dvt == VarType::Bool)
+                                    ? jit_var_xor(acc, casted)
+                                    : jit_var_add(acc, casted);
+                jit_var_dec_ref(acc);
+                jit_var_dec_ref(casted);
+                acc = next;
+            }
+        }
+        assemble_and_validate_spirv(acc);
+        jit_var_dec_ref(acc);
+    }
+
+    for (uint32_t sv : src_vars)
+        jit_var_dec_ref(sv);
+
+    jit_set_flag(JitFlag::FastMath, prev_fm);
+    jit_set_flag(JitFlag::ConstantPropagation, prev_cp);
+    jit_var_dec_ref(m1);
+    jit_var_dec_ref(m0);
+}
+
+
