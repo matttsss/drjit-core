@@ -94,6 +94,18 @@ const NameTable<(size_t) VarType::Count> type_name_metal_bin({
     "uint",  "ulong", "ulong", "ulong", "???",   "ushort", "uint",   "uint"
 });
 
+/// Vulkan SPIR-V type names
+const NameTable<(size_t) VarType::Count> type_name_vulkan({
+    "%void", "%bool", "???",  "%i8",  "%u8",  "%i16", "%u16", "%i32",
+    "%u32",  "%i64",  "%u64", "%u64", "???",  "%f16", "%f32", "%f64"
+});
+
+/// Vulkan SPIR-V binary view (unsigned integer type of matching bit width)
+const NameTable<(size_t) VarType::Count> type_name_vulkan_bin({
+    "???",  "%u8",  "???",  "%u8",  "%u8",  "%u16", "%u16", "%u32",
+    "%u32", "%u64", "%u64", "%u64", "???",  "%u16", "%u32", "%u64"
+});
+
 /// Double size integer arrays for mul_hi()
 const NameTable<(size_t) VarType::Count> type_name_llvm_big({
     "???", "???",  "???", "i16",  "i16", "i32", "i32", "i64",

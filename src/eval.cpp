@@ -337,11 +337,6 @@ static void jitc_var_traverse(uint32_t size, uint32_t index, uint32_t depth = 0)
 void jitc_assemble(ThreadState *ts, ScheduledGroup group) {
     JitBackend backend = ts->backend;
 
-    if (jitc_is_vulkan(backend))
-        jitc_raise("jit_eval(): the Vulkan backend cannot compile kernels "
-                   "yet. It currently only supports memory operations (e.g., "
-                   "allocations, copies, and evaluating literals).");
-
     kernel_params.clear();
     kernel_param_ids.clear();
     kernel_param_info.clear();
@@ -352,6 +347,9 @@ void jitc_assemble(ThreadState *ts, ScheduledGroup group) {
     uses_metal4 = false;
 #if defined(DRJIT_ENABLE_METAL)
     jitc_metal_assemble_reset();
+#endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    jitc_vulkan_assemble_reset();
 #endif
     kernel_history_entry = { };
 
@@ -378,9 +376,8 @@ void jitc_assemble(ThreadState *ts, ScheduledGroup group) {
         add_param((void *) (uintptr_t) group.size);
 
         // CUDA reserves r0..r3 for the thread-index computation (ctaid/ntid/tid)
-        // and compound-op temporaries. Metal receives the thread index directly
-        // via [[thread_position_in_grid]] (r0), so locals can start at r1.
-        n_regs = jitc_is_metal(backend) ? 1 : 4;
+        // and compound-op temporaries. Metal and Vulkan start locals at r1.
+        n_regs = (jitc_is_metal(backend) || jitc_is_vulkan(backend)) ? 1 : 4;
     } else {
         // First 4 parameters reserved for: kernel ptr, size, ITT identifier,
         // callable table. All are bound in LLVMThreadState::launch().
@@ -614,6 +611,11 @@ void jitc_assemble(ThreadState *ts, ScheduledGroup group) {
         jitc_metal_assemble(ts, group, n_regs, (uint32_t) kernel_params.size());
     else
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (jitc_is_vulkan(backend))
+        jitc_vulkan_assemble(ts, group, n_regs, (uint32_t) kernel_params.size());
+    else
+#endif
         jitc_llvm_assemble(ts, group);
 
     // Assign callable indices (determines the dispatch table/VFT/SBT layout)
@@ -712,6 +714,11 @@ static void jitc_kernel_attach_source(Kernel &kernel) {
 }
 
 Task *jitc_run(ThreadState *ts, ScheduledGroup group) {
+    if (jitc_is_vulkan(ts->backend))
+        jitc_raise("jit_eval(): the Vulkan backend cannot compile kernels "
+                   "yet. It currently only supports memory operations (e.g., "
+                   "allocations, copies, and evaluating literals).");
+
     uint64_t flags = 0;
 
 #if defined(DRJIT_ENABLE_OPTIX)

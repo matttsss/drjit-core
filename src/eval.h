@@ -166,6 +166,15 @@ extern int metal_vft_arg_index;
 extern void jitc_metal_render_prologue();
 #endif
 
+#if defined(DRJIT_ENABLE_VULKAN)
+/// Used by jitc_eval() to generate Vulkan SPIR-V source code
+extern void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
+                                 uint32_t n_regs, uint32_t n_params);
+
+/// Reset per-kernel Vulkan assembly state at the start of jitc_assemble()
+extern void jitc_vulkan_assemble_reset();
+#endif
+
 #if defined(DRJIT_ENABLE_CUDA)
 /// Emit the shared PTX unit prologue (.version/.target) into 'buffer'
 extern void jitc_cuda_render_prologue(ThreadState *ts);

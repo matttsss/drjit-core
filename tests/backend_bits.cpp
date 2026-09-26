@@ -152,7 +152,7 @@ static void test_public_api() {
             jit_var_dec_ref(index);
         }
 
-        jit_shutdown(i); // light shutdown, then full shutdown
+        jit_shutdown(1 - i); // light shutdown, then full shutdown
     }
 }
 

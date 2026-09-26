@@ -218,6 +218,8 @@ if (DRJIT_ENABLE_VULKAN)
     src/vulkan_api.cpp
     src/vulkan.h
     src/vulkan_core.cpp
+    src/vulkan_eval.h
+    src/vulkan_eval.cpp
     src/vulkan_ts.h
     src/vulkan_ts.cpp)
 endif()

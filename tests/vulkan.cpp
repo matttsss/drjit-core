@@ -948,3 +948,315 @@ TEST_VULKAN(17_device_selection) {
     jit_assert(jit_has_backend(Backend));
     jit_assert(jit_vulkan_device_index() == default_index);
 }
+
+// ====================================================================
+//                   SPIR-V 1.6 Assembly & Validation
+// ====================================================================
+
+struct SpvBinary {
+    uint32_t *code;
+    size_t wordCount;
+};
+
+struct SpvPosition {
+    size_t line, column, index;
+};
+
+struct SpvDiagnostic {
+    SpvPosition position;
+    char *error;
+    bool isTextSource;
+};
+
+using PFN_SpvContextCreate     = void *(*)(int);
+using PFN_SpvContextDestroy    = void (*)(void *);
+using PFN_SpvTextToBinary      = int (*)(const void *, const char *, size_t,
+                                         SpvBinary **, SpvDiagnostic **);
+using PFN_SpvBinaryDestroy     = void (*)(SpvBinary *);
+using PFN_SpvValidateBinary    = int (*)(const void *, const uint32_t *, size_t,
+                                         SpvDiagnostic **);
+using PFN_SpvDiagnosticDestroy = void (*)(SpvDiagnostic *);
+
+static std::string g_captured_spirv;
+
+static void capture_spirv_cb(LogLevel, const char *msg) {
+    if (msg && strstr(msg, "OpCapability Shader"))
+        g_captured_spirv = msg;
+}
+
+/// Schedule 'var_idx', run jit_eval() with PrintIR enabled to capture the
+/// assembled SPIR-V module, and validate it using SPIRV-Tools (Vulkan 1.3 /
+/// SPIR-V 1.6).
+static std::string assemble_and_validate_spirv(uint32_t var_idx) {
+    g_captured_spirv.clear();
+
+    LogLevel prev_stderr   = jit_log_level_stderr(),
+             prev_callback = jit_log_level_callback();
+    int prev_print_ir      = jit_flag(JitFlag::PrintIR);
+
+    jit_set_log_level_stderr(LogLevel::Error);
+    jit_set_log_level_callback(LogLevel::Warn, capture_spirv_cb);
+    jit_set_flag(JitFlag::PrintIR, 1);
+
+    jit_var_schedule(var_idx);
+    bool threw = raises([] { jit_eval(); }, "cannot compile kernels");
+
+    jit_set_flag(JitFlag::PrintIR, prev_print_ir);
+    jit_set_log_level_callback(prev_callback, nullptr);
+    jit_set_log_level_stderr(prev_stderr);
+
+    jit_assert(threw);
+    jit_assert(!g_captured_spirv.empty());
+
+    // Check module structure and patched 32-hex entry point name
+    jit_assert(g_captured_spirv.find("OpCapability Shader\n") != std::string::npos);
+    jit_assert(g_captured_spirv.find("OpCapability Int64\n") != std::string::npos);
+    jit_assert(g_captured_spirv.find("OpCapability PhysicalStorageBufferAddresses\n") != std::string::npos);
+    jit_assert(g_captured_spirv.find("OpMemoryModel PhysicalStorageBuffer64 GLSL450\n") != std::string::npos);
+    jit_assert(g_captured_spirv.find('^') == std::string::npos);
+
+    size_t ep_pos = g_captured_spirv.find("OpEntryPoint GLCompute %main \"drjit_");
+    jit_assert(ep_pos != std::string::npos);
+    const char *hash_str = g_captured_spirv.c_str() + ep_pos + 36;
+    for (int i = 0; i < 32; ++i) {
+        char c = hash_str[i];
+        jit_assert((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
+    }
+    jit_assert(hash_str[32] == '"');
+
+    // Assemble and validate with SPIRV-Tools targeting SPV_ENV_VULKAN_1_3 (25)
+    auto ContextCreate = (PFN_SpvContextCreate) jit_vulkan_lookup("spvContextCreate");
+    auto ContextDestroy = (PFN_SpvContextDestroy) jit_vulkan_lookup("spvContextDestroy");
+    auto TextToBinary = (PFN_SpvTextToBinary) jit_vulkan_lookup("spvTextToBinary");
+    auto BinaryDestroy = (PFN_SpvBinaryDestroy) jit_vulkan_lookup("spvBinaryDestroy");
+    auto ValidateBinary = (PFN_SpvValidateBinary) jit_vulkan_lookup("spvValidateBinary");
+    auto DiagnosticDestroy = (PFN_SpvDiagnosticDestroy) jit_vulkan_lookup("spvDiagnosticDestroy");
+
+    void *ctx = ContextCreate(25 /* SPV_ENV_VULKAN_1_3 */);
+    jit_assert(ctx != nullptr);
+
+    SpvBinary *binary = nullptr;
+    SpvDiagnostic *diag = nullptr;
+    int rv = TextToBinary(ctx, g_captured_spirv.c_str(),
+                          g_captured_spirv.size(), &binary, &diag);
+    if (rv != 0 || !binary) {
+        fprintf(stderr, "spvTextToBinary failed (rv=%d): %s\n--- SPIR-V ---\n%s\n",
+                rv, diag && diag->error ? diag->error : "?",
+                g_captured_spirv.c_str());
+        if (diag)
+            DiagnosticDestroy(diag);
+        ContextDestroy(ctx);
+        jit_assert(false);
+    }
+
+    jit_assert(binary->wordCount > 5);
+    jit_assert(binary->code[0] == 0x07230203u); // SPIR-V magic
+    jit_assert(binary->code[1] == 0x00010600u); // SPIR-V 1.6
+
+    rv = ValidateBinary(ctx, binary->code, binary->wordCount, &diag);
+    if (rv != 0) {
+        fprintf(stderr, "spvValidateBinary failed (rv=%d): %s\n--- SPIR-V ---\n%s\n",
+                rv, diag && diag->error ? diag->error : "?",
+                g_captured_spirv.c_str());
+        if (diag)
+            DiagnosticDestroy(diag);
+        BinaryDestroy(binary);
+        ContextDestroy(ctx);
+        jit_assert(false);
+    }
+
+    BinaryDestroy(binary);
+    ContextDestroy(ctx);
+    return g_captured_spirv;
+}
+
+TEST_VULKAN(18_spirv_assemble) {
+    const uint32_t n = 16;
+
+    // 1. Counter kernel (UInt32 output only, no optional capabilities)
+    {
+        uint32_t c = jit_var_counter(Backend, n);
+        std::string spv = assemble_and_validate_spirv(c);
+        jit_assert(spv.find("OpCapability Int8\n") == std::string::npos);
+        jit_assert(spv.find("OpCapability StorageBuffer8BitAccess\n") == std::string::npos);
+        jit_assert(spv.find("OpCapability Int16\n") == std::string::npos);
+        jit_assert(spv.find("OpCapability StorageBuffer16BitAccess\n") == std::string::npos);
+        jit_assert(spv.find("OpCapability Float16\n") == std::string::npos);
+        jit_assert(spv.find("OpCapability Float64\n") == std::string::npos);
+        jit_assert(spv.find("OpCopyObject %u32 %idx\n") != std::string::npos);
+        jit_assert(spv.find("%params = OpVariable %ptr_pc_Params PushConstant\n") != std::string::npos);
+        jit_var_dec_ref(c);
+    }
+
+    // 2. Test all 12 scalar types: scalar input (size == 1), vector input
+    //    (size == n), literal, undefined, bitcast/resize, select, and output
+    int prev_cp = jit_flag(JitFlag::ConstantPropagation);
+    jit_set_flag(JitFlag::ConstantPropagation, 0);
+
+    const VarType types[] = {
+        VarType::Bool,    VarType::Int8,    VarType::UInt8,   VarType::Int16,
+        VarType::UInt16,  VarType::Int32,   VarType::UInt32,  VarType::Int64,
+        VarType::UInt64,  VarType::Float16, VarType::Float32, VarType::Float64
+    };
+
+    uint8_t mask_data[n];
+    for (uint32_t i = 0; i < n; ++i)
+        mask_data[i] = (uint8_t) (i & 1);
+    uint32_t mask_vec = jit_var_mem_copy(Backend, VarType::Bool,
+                                         mask_data, n, 0);
+    uint8_t mask_scalar_val = 1;
+    uint32_t mask_scalar = jit_var_mem_copy(Backend, VarType::Bool,
+                                            &mask_scalar_val, 1, 0);
+
+    for (VarType vt : types) {
+        size_t esize = 1;
+        switch (vt) {
+            case VarType::Bool:
+            case VarType::Int8:
+            case VarType::UInt8:   esize = 1; break;
+            case VarType::Int16:
+            case VarType::UInt16:
+            case VarType::Float16: esize = 2; break;
+            case VarType::Int32:
+            case VarType::UInt32:
+            case VarType::Float32: esize = 4; break;
+            case VarType::Int64:
+            case VarType::UInt64:
+            case VarType::Float64: esize = 8; break;
+            default: break;
+        }
+
+        std::vector<uint8_t> vec_bytes(n * esize, 1),
+                             scalar_bytes(esize, 1);
+        uint32_t in_vec = jit_var_mem_copy(Backend, vt,
+                                           vec_bytes.data(), n, 0);
+        uint32_t in_sca = jit_var_mem_copy(Backend, vt,
+                                           scalar_bytes.data(), 1, 0);
+
+        uint64_t lit_bits = 1;
+        if (vt == VarType::Float16)
+            lit_bits = 0x3c00u; // 1.0h
+        else if (vt == VarType::Float32)
+            lit_bits = 0x3f800000u; // 1.0f
+        else if (vt == VarType::Float64)
+            lit_bits = 0x3ff0000000000000ull; // 1.0
+        uint32_t lit = jit_var_literal(Backend, vt, &lit_bits, n, 0);
+        uint32_t undef = jit_var_undefined(Backend, vt, n);
+        uint32_t resized = jit_var_resize(in_sca, n);
+
+        uint32_t sel1 = jit_var_select(mask_vec, in_vec, lit);
+        uint32_t sel2 = jit_var_select(mask_scalar, undef, resized);
+        uint32_t out  = jit_var_select(mask_vec, sel1, sel2);
+
+        std::string spv = assemble_and_validate_spirv(out);
+
+        if (vt == VarType::Bool) {
+            jit_assert(spv.find("OpINotEqual %bool") != std::string::npos);
+            jit_assert(spv.find("OpSelect %u8") != std::string::npos);
+            jit_assert(spv.find("OpConstantTrue %bool") != std::string::npos);
+            jit_assert(spv.find("OpConstantNull %bool") != std::string::npos);
+        } else if (vt == VarType::Int8 || vt == VarType::UInt8) {
+            jit_assert(spv.find("OpCapability Int8\n") != std::string::npos);
+            jit_assert(spv.find("OpCapability StorageBuffer8BitAccess\n") != std::string::npos);
+        } else if (vt == VarType::Int16 || vt == VarType::UInt16) {
+            jit_assert(spv.find("OpCapability Int16\n") != std::string::npos);
+            jit_assert(spv.find("OpCapability StorageBuffer16BitAccess\n") != std::string::npos);
+        } else if (vt == VarType::Float16) {
+            jit_assert(spv.find("OpCapability Float16\n") != std::string::npos);
+            jit_assert(spv.find("OpCapability StorageBuffer16BitAccess\n") != std::string::npos);
+            jit_assert(spv.find("!0x3c00\n") != std::string::npos);
+        } else if (vt == VarType::Float32) {
+            jit_assert(spv.find("!0x3f800000\n") != std::string::npos);
+        } else if (vt == VarType::Float64) {
+            jit_assert(spv.find("OpCapability Float64\n") != std::string::npos);
+            jit_assert(spv.find("!0x0 !0x3ff00000\n") != std::string::npos);
+        }
+
+        jit_var_dec_ref(out);
+        jit_var_dec_ref(sel2);
+        jit_var_dec_ref(sel1);
+        jit_var_dec_ref(resized);
+        jit_var_dec_ref(undef);
+        jit_var_dec_ref(lit);
+        jit_var_dec_ref(in_sca);
+        jit_var_dec_ref(in_vec);
+    }
+
+    // 3. Reinterpret-cast (OpBitcast) across same-width types & special float literals
+    {
+        uint32_t f32_nan_bits = 0x7fc00001u,
+                 f32_inf_bits = 0xff800000u; // -Inf
+        uint64_t f64_neg0_bits = 0x8000000000000000ull;
+
+        uint32_t f32_nan  = jit_var_literal(Backend, VarType::Float32, &f32_nan_bits, n, 0),
+                 f32_inf  = jit_var_literal(Backend, VarType::Float32, &f32_inf_bits, n, 0),
+                 f64_neg0 = jit_var_literal(Backend, VarType::Float64, &f64_neg0_bits, n, 0);
+
+        uint32_t u32_nan  = jit_var_cast(f32_nan, VarType::UInt32, 1),
+                 i32_inf  = jit_var_cast(f32_inf, VarType::Int32, 1),
+                 u32_inf  = jit_var_cast(i32_inf, VarType::UInt32, 1),
+                 u64_neg0 = jit_var_cast(f64_neg0, VarType::UInt64, 1);
+
+        uint32_t sel_u32 = jit_var_select(mask_vec, u32_nan, u32_inf);
+        std::string spv1 = assemble_and_validate_spirv(sel_u32);
+        jit_assert(spv1.find("OpBitcast %u32") != std::string::npos);
+        jit_assert(spv1.find("OpBitcast %i32") != std::string::npos);
+
+        std::string spv2 = assemble_and_validate_spirv(u64_neg0);
+        jit_assert(spv2.find("OpBitcast %u64") != std::string::npos);
+
+        jit_var_dec_ref(sel_u32);
+        jit_var_dec_ref(u64_neg0);
+        jit_var_dec_ref(u32_inf);
+        jit_var_dec_ref(i32_inf);
+        jit_var_dec_ref(u32_nan);
+        jit_var_dec_ref(f64_neg0);
+        jit_var_dec_ref(f32_inf);
+        jit_var_dec_ref(f32_nan);
+    }
+
+    // 4. Pointer literals (VarType::Pointer) loaded from %params
+    {
+        Alloc buf1(Kind::Device, 64), buf2(Kind::Device, 64);
+        uint32_t ptr1 = jit_var_pointer(Backend, buf1.ptr, mask_vec, 0),
+                 ptr2 = jit_var_pointer(Backend, buf2.ptr, mask_vec, 0),
+                 ptr_sel = jit_var_select(mask_vec, ptr1, ptr2);
+        std::string spv = assemble_and_validate_spirv(ptr_sel);
+        jit_assert(spv.find("OpSelect %u64") != std::string::npos);
+        jit_var_dec_ref(ptr_sel);
+        jit_var_dec_ref(ptr2);
+        jit_var_dec_ref(ptr1);
+    }
+
+    // 5. PhysicalStorageBuffer parameter fallback when n_params * 8 > maxPushConstantsSize
+    {
+        const uint32_t n_inputs = 40;
+        std::vector<uint32_t> inputs(n_inputs);
+        uint32_t val = 42;
+        for (uint32_t i = 0; i < n_inputs; ++i)
+            inputs[i] = jit_var_mem_copy(Backend,
+                                         VarType::UInt32, &val, 1, 0);
+
+        uint32_t acc = jit_var_resize(inputs[0], n);
+        for (uint32_t i = 1; i < n_inputs; ++i) {
+            uint32_t next = jit_var_select(mask_vec, acc, inputs[i]);
+            jit_var_dec_ref(acc);
+            acc = next;
+        }
+
+        std::string spv = assemble_and_validate_spirv(acc);
+        jit_assert(spv.find("%pc = OpVariable %ptr_pc_PushConstants PushConstant\n") !=
+                   std::string::npos);
+        jit_assert(spv.find("%params = OpLoad %ptr_psb_Params %params_ptr_ptr\n") !=
+                   std::string::npos);
+
+        jit_var_dec_ref(acc);
+        for (uint32_t in : inputs)
+            jit_var_dec_ref(in);
+    }
+
+    jit_set_flag(JitFlag::ConstantPropagation, prev_cp);
+    jit_var_dec_ref(mask_scalar);
+    jit_var_dec_ref(mask_vec);
+}
+
