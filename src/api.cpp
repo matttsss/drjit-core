@@ -21,6 +21,7 @@
 #endif
 #if defined(DRJIT_ENABLE_VULKAN)
 #  include "vulkan_api.h"
+#  include "vulkan.h"
 #endif
 #include "op.h"
 #include "call.h"
@@ -111,7 +112,8 @@ int jit_has_backend(JitBackend backend) {
 
         case JitBackend::Vulkan:
 #if defined(DRJIT_ENABLE_VULKAN)
-            result = state.backends & (1u << (uint32_t) JitBackend::Vulkan);
+            result = (state.backends & (1u << (uint32_t) JitBackend::Vulkan))
+                && !state.vulkan_devices.empty();
 #else
             result = false;
 #endif
@@ -589,6 +591,104 @@ void *jit_vulkan_lookup(const char *name) {
     jit_raise("jit_vulkan_lookup(): the Vulkan backend is not enabled in "
               "this build of Dr.Jit.");
     return nullptr;
+#endif
+}
+
+#if defined(DRJIT_ENABLE_VULKAN)
+/// Return the device used by the Vulkan backend (or \c nullptr)
+static const VulkanDevice *jitc_vulkan_active_device() {
+    return state.vulkan_devices.empty() ? nullptr : &state.vulkan_devices[0];
+}
+#endif
+
+void *jit_vulkan_device_handle() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_VULKAN)
+    const VulkanDevice *dev = jitc_vulkan_active_device();
+    return dev ? dev->device : nullptr;
+#else
+    return nullptr;
+#endif
+}
+
+void *jit_vulkan_physical_device() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_VULKAN)
+    const VulkanDevice *dev = jitc_vulkan_active_device();
+    return dev ? dev->physical_device : nullptr;
+#else
+    return nullptr;
+#endif
+}
+
+void *jit_vulkan_queue() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_VULKAN)
+    const VulkanDevice *dev = jitc_vulkan_active_device();
+    return dev ? dev->queue : nullptr;
+#else
+    return nullptr;
+#endif
+}
+
+int jit_vulkan_queue_family() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_VULKAN)
+    const VulkanDevice *dev = jitc_vulkan_active_device();
+    return dev ? (int) dev->queue_family : -1;
+#else
+    return -1;
+#endif
+}
+
+int jit_vulkan_device_index() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_VULKAN)
+    const VulkanDevice *dev = jitc_vulkan_active_device();
+    return dev ? dev->index : -1;
+#else
+    return -1;
+#endif
+}
+
+const char *jit_vulkan_device_name() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_VULKAN)
+    const VulkanDevice *dev = jitc_vulkan_active_device();
+    return dev ? dev->name : nullptr;
+#else
+    return nullptr;
+#endif
+}
+
+void *jit_vulkan_lookup_buffer(const void *ptr, size_t *offset) {
+    lock_guard guard(state.lock);
+    void *result = nullptr;
+    size_t result_offset = 0;
+#if defined(DRJIT_ENABLE_VULKAN)
+    size_t buffer_offset = 0;
+    VulkanBuffer *buffer = jitc_vulkan_find_buffer(ptr, &buffer_offset);
+    if (buffer) {
+        result = (void *) buffer->buffer;
+        result_offset = buffer_offset;
+    }
+#else
+    (void) ptr;
+#endif
+    if (offset)
+        *offset = result_offset;
+    return result;
+}
+
+uint64_t jit_vulkan_device_address(const void *ptr) {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_VULKAN)
+    size_t offset = 0;
+    VulkanBuffer *buffer = jitc_vulkan_find_buffer(ptr, &offset);
+    return buffer ? (uint64_t) buffer->address + offset : 0;
+#else
+    (void) ptr;
+    return 0;
 #endif
 }
 
@@ -1270,6 +1370,10 @@ void jit_eval() {
 #if defined(DRJIT_ENABLE_METAL)
     if (tl.ts_metal)
         jitc_eval(tl.ts_metal);
+#endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (tl.ts_vulkan)
+        jitc_eval(tl.ts_vulkan);
 #endif
 }
 
@@ -2410,6 +2514,12 @@ JitEvent jit_event_create(JitBackend backend, int enable_timing) {
 #if defined(DRJIT_ENABLE_METAL)
         case JitBackend::Metal:
             return jitc_metal_event_create(enable_timing);
+#endif
+
+#if defined(DRJIT_ENABLE_VULKAN)
+        case JitBackend::Vulkan:
+            jitc_raise("jit_event_create(): events are not supported by the "
+                       "Vulkan backend yet.");
 #endif
 
         case JitBackend::LLVM:

@@ -21,6 +21,10 @@
 #  include "metal.h"
 #endif
 
+#if defined(DRJIT_ENABLE_VULKAN)
+#  include "vulkan.h"
+#endif
+
 // Try to use huge pages for allocations > 2M (only on Linux)
 #if defined(__linux__)
 #  define DRJIT_HUGEPAGE 1
@@ -99,6 +103,61 @@ static void aligned_free(void *ptr, size_t size) {
 #endif
 }
 
+#if defined(DRJIT_ENABLE_VULKAN)
+/**
+ * \brief Handle a new allocation \c ptr (described by \c ai) whose address
+ * equals that of an existing entry \c it of \c state.alloc_used
+ *
+ * The Vulkan backend identifies device-local allocations by their device
+ * address, which could coincide with the address of a host allocation.
+ * Furthermore, a full shutdown of the Vulkan backend destroys all buffers,
+ * including leaked ones whose (now stale) records remain in \c alloc_used,
+ * and whose addresses may subsequently be reused.
+ */
+static void jitc_malloc_collision(AllocUsedMap::iterator it, void *ptr,
+                                  AllocInfo ai) {
+    auto [size, backend, shared, device] = alloc_info_decode(ai);
+    auto [prev_size, prev_backend, prev_shared, prev_device] =
+        alloc_info_decode(it->second);
+    (void) shared; (void) device; (void) prev_shared; (void) prev_device;
+
+    /* Live Vulkan allocations are registered, and a new Vulkan buffer cannot
+       be registered at the address of another one. A Vulkan record at the
+       address of a new Vulkan allocation must therefore be stale. */
+    bool prev_vulkan = jitc_is_vulkan(prev_backend),
+         prev_stale = prev_vulkan &&
+                      (jitc_is_vulkan(backend) || !jitc_vulkan_owns(ptr));
+
+    if (prev_stale) {
+        state.alloc_usage[(int) prev_backend] -= prev_size;
+        it.value() = ai;
+    } else if (jitc_is_vulkan(backend)) {
+        // Release the Vulkan buffer and report the collision
+        VulkanBuffer *buffer = jitc_vulkan_unregister_buffer(ptr);
+        state.alloc_allocated[(int) backend] -= size;
+        if (buffer) {
+            unlock_guard guard(state.lock);
+            vulkan_buffer_free(buffer);
+        }
+        jitc_raise("jit_malloc(): the address " DRJIT_PTR " of a new Vulkan "
+                   "allocation (%zu bytes) coincides with that of an existing "
+                   "%s allocation. This is an unlikely event caused by the "
+                   "Vulkan backend using device addresses as pointers.",
+                   (uintptr_t) ptr, size, jitc_backend_name(prev_backend));
+    } else if (prev_vulkan) {
+        jitc_fail("jit_malloc(): the address " DRJIT_PTR " of a new %s "
+                  "allocation (%zu bytes) coincides with the device address "
+                  "of an existing Vulkan allocation. This is an unlikely "
+                  "event caused by the Vulkan backend using device addresses "
+                  "as pointers.",
+                  (uintptr_t) ptr, jitc_backend_name(backend), size);
+    }
+
+    // Otherwise, keep the previous record (as when the Vulkan backend is
+    // disabled)
+}
+#endif
+
 void* jitc_malloc(JitBackend backend, size_t size, bool shared) {
     if (size == 0)
         return nullptr;
@@ -139,6 +198,24 @@ void* jitc_malloc(JitBackend backend, size_t size, bool shared) {
     }
 #endif
 
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (jitc_is_vulkan(backend)) {
+        ts = thread_state(backend);
+        device = ts->device;
+
+        /* Vulkan buffers are backed by dedicated memory allocations, whose
+           size is limited by the device */
+        uint64_t max_size =
+            state.vulkan_devices[device].max_memory_allocation_size;
+        if (size > max_size)
+            jitc_raise("jit_malloc(): the allocation size (%zu bytes, i.e., "
+                       "the requested size rounded up to a power of two) "
+                       "exceeds the maximum allocation size supported by the "
+                       "Vulkan device (%s).",
+                       size, jitc_mem_string(max_size).c_str());
+    }
+#endif
+
     AllocInfo ai = alloc_info_encode(size, backend, shared, device);
     const char *descr = nullptr;
     void *ptr = nullptr;
@@ -162,6 +239,12 @@ void* jitc_malloc(JitBackend backend, size_t size, bool shared) {
 #if defined(DRJIT_ENABLE_METAL)
         void *metal_buf = nullptr; // opaque MTLBuffer handle
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+        VulkanBuffer *vulkan_buf = nullptr;
+        // (the device list only changes during initialization and shutdown)
+        const VulkanDevice *vulkan_dev =
+            jitc_is_vulkan(backend) ? &state.vulkan_devices[device] : nullptr;
+#endif
         for (int i = 0; i < 2; ++i) {
             {
                 unlock_guard guard(state.lock);
@@ -172,6 +255,12 @@ void* jitc_malloc(JitBackend backend, size_t size, bool shared) {
                 } else if (jitc_is_metal(backend)) {
                     metal_buf =
                         metal_buffer_new(ts->metal_device, size, shared, &ptr);
+#endif
+
+#if defined(DRJIT_ENABLE_VULKAN)
+                } else if (jitc_is_vulkan(backend)) {
+                    vulkan_buf = vulkan_buffer_new(*vulkan_dev, size, shared);
+                    ptr = vulkan_buf ? (void *) vulkan_buf->base : nullptr;
 #endif
 
 #if defined(DRJIT_ENABLE_CUDA)
@@ -203,6 +292,25 @@ void* jitc_malloc(JitBackend backend, size_t size, bool shared) {
             jitc_metal_register_buffer(ptr, metal_buf, size);
 #endif
 
+#if defined(DRJIT_ENABLE_VULKAN)
+        // Register the Vulkan buffer now that we're holding the JIT lock again
+        if (vulkan_buf && !jitc_vulkan_register_buffer(vulkan_buf)) {
+            /* Device addresses and host addresses of shared allocations
+               share the same registry. This (unlikely) event occurs when
+               they overlap. */
+            {
+                unlock_guard guard(state.lock);
+                vulkan_buffer_free(vulkan_buf);
+            }
+            jitc_raise("jit_malloc(): the address range of a new Vulkan "
+                       "allocation (" DRJIT_PTR ", %zu bytes, shared=%i) "
+                       "overlaps with that of an existing Vulkan allocation. "
+                       "This is an unlikely event caused by the Vulkan backend "
+                       "using device addresses as pointers.",
+                       (uintptr_t) ptr, size, (int) shared);
+        }
+#endif
+
         descr = "new allocation";
 
         state.alloc_allocated[(int) backend] += size;
@@ -216,7 +324,13 @@ void* jitc_malloc(JitBackend backend, size_t size, bool shared) {
                    "(backend=%s, shared=%i).", size,
                    jitc_backend_name(backend), (int) shared);
 
+#if defined(DRJIT_ENABLE_VULKAN)
+    auto [it_used, inserted] = state.alloc_used.emplace((uintptr_t) ptr, ai);
+    if (unlikely(!inserted))
+        jitc_malloc_collision(it_used, ptr, ai);
+#else
     state.alloc_used.emplace((uintptr_t) ptr, ai);
+#endif
     state.alloc_usage[(int) backend] += size;
 
     (void) descr;
@@ -276,12 +390,38 @@ void jitc_free(void *ptr) {
 #if defined(DRJIT_ENABLE_METAL)
         case JitBackend::Metal: ts = tl.ts_metal; break;
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+        case JitBackend::Vulkan: ts = tl.ts_vulkan; break;
+#endif
         case JitBackend::LLVM: ts = tl.ts_llvm; break;
         default: break;
     }
 
     if (ts)
         ts->notify_free(ptr);
+
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (backend == JitBackend::Vulkan) {
+        /* All thread states record their work into the command stream of the
+           device, which orders it after previously recorded work. Device-local
+           memory can therefore be reused right away. Shared memory must wait
+           until the GPU no longer accesses it, since the host could otherwise
+           modify it prematurely. Allocations whose buffer was destroyed by a
+           full shutdown of the Vulkan backend are simply dropped. */
+        if (jitc_vulkan_owns(ptr)) {
+            if (shared)
+                jitc_vulkan_free_later(info, ptr);
+            else
+                jitc_malloc_release(info, ptr);
+        }
+
+        jitc_trace("jit_free(" DRJIT_PTR ", backend=%s, shared=%i, "
+                   "device=%i, size=%zu)",
+                   (uintptr_t) ptr, jitc_backend_name(backend), (int) shared,
+                   device, size);
+        return;
+    }
+#endif
 
     if (shared && !ts) // Leak shared allocation if Dr.Jit has already shut down
         return;
@@ -414,6 +554,11 @@ void* jitc_malloc_migrate(void *ptr, JitBackend dst_backend, int move) {
         }
     }
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    // Copies from host memory capture the source data before returning
+    if (jitc_is_vulkan(gpu_backend))
+        jitc_memcpy_async(JitBackend::Vulkan, ptr_new, ptr, size);
+#endif
 #if defined(DRJIT_ENABLE_CUDA)
     if (jitc_is_cuda(gpu_backend)) {
         scoped_set_context guard(ts->context);
@@ -523,6 +668,21 @@ void jitc_flush_malloc_cache(bool warn) {
                 for (void *buf : bufs)
                     if (buf)
                         metal_buffer_free(buf);
+                continue;
+            }
+#endif
+
+#if defined(DRJIT_ENABLE_VULKAN)
+            if (jitc_is_vulkan(backend) && !state.vulkan_devices.empty()) {
+                std::vector<VulkanBuffer *> bufs(entries.size());
+                {
+                    lock_guard guard_map(state.lock);
+                    for (size_t i = 0; i < entries.size(); ++i)
+                        bufs[i] = jitc_vulkan_unregister_buffer(entries[i]);
+                }
+                for (VulkanBuffer *buf : bufs)
+                    if (buf)
+                        vulkan_buffer_free(buf);
                 continue;
             }
 #endif

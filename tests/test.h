@@ -36,6 +36,11 @@ using Int32M  = MetalArray<int32_t>;
 using UInt32M = MetalArray<uint32_t>;
 using MaskM   = MetalArray<bool>;
 using HalfM   = MetalArray<drjit::half>;
+using FloatV  = VulkanArray<float>;
+using Int32V  = VulkanArray<int32_t>;
+using UInt32V = VulkanArray<uint32_t>;
+using MaskV   = VulkanArray<bool>;
+using HalfV   = VulkanArray<drjit::half>;
 
 #define TEST_REGISTER_CUDA(name, suffix, FloatType, ...)                       \
     int test##name##_##suffix =                                                \
@@ -65,6 +70,13 @@ using HalfM   = MetalArray<drjit::half>;
                                  MaskM, MetalArray>,                           \
                       ##__VA_ARGS__);
 
+#define TEST_REGISTER_VULKAN(name, suffix, FloatType, ...)                     \
+    int test##name##_##suffix =                                                \
+        test_register("test" #name#suffix,                                     \
+                      test##name<JitBackend::Vulkan, FloatType, Int32V,        \
+                                 UInt32V, MaskV, VulkanArray>,                 \
+                      ##__VA_ARGS__);
+
 #define TEST_CUDA(name, ...)                                                   \
     template <JitBackend Backend, typename Float, typename Int32,              \
               typename UInt32, typename Mask, template <class> class Array>    \
@@ -83,6 +95,15 @@ using HalfM   = MetalArray<drjit::half>;
     void test##name();                                                         \
     TEST_REGISTER_LLVM(name,    _llvm_fp32,     FloatL)                        \
     TEST_REGISTER_LLVM(name,    _llvm_fp16,     HalfL)                         \
+    template <JitBackend Backend, typename Float, typename Int32,              \
+              typename UInt32, typename Mask, template <class> class Array>    \
+    void test##name()
+
+#define TEST_VULKAN(name, ...)                                                 \
+    template <JitBackend Backend, typename Float, typename Int32,              \
+              typename UInt32, typename Mask, template <class> class Array>    \
+    void test##name();                                                         \
+    TEST_REGISTER_VULKAN(name,  _vulkan,        FloatV)                        \
     template <JitBackend Backend, typename Float, typename Int32,              \
               typename UInt32, typename Mask, template <class> class Array>    \
     void test##name()

@@ -39,6 +39,7 @@
 
 #if defined(DRJIT_ENABLE_VULKAN)
 #  include "vulkan_api.h"
+#  include "vulkan.h"
 #endif
 
 #if defined(_WIN32)
@@ -112,10 +113,11 @@ void jitc_init(uint32_t backends) {
 #endif
 
 #if defined(DRJIT_ENABLE_VULKAN)
-    // Load the Vulkan loader & SPIRV-Tools and create the Vulkan instance.
-    // The backend is only flagged as available once devices are supported.
-    if (backends & (1u << (uint32_t) JitBackend::Vulkan))
-        jitc_vulkan_api_init();
+    // Load the Vulkan loader & SPIRV-Tools, create the Vulkan instance, and
+    // initialize a compatible device
+    if ((backends & (1u << (uint32_t) JitBackend::Vulkan)) &&
+        jitc_vulkan_api_init() && jitc_vulkan_init())
+        state.backends |= 1u << (uint32_t) JitBackend::Vulkan;
 #endif
 
     state.variable_counter = 0;
@@ -163,6 +165,12 @@ void jitc_shutdown(int light) {
             jitc_log(Warn, "jit_shutdown(): leaked %zu active masks!",
                      ts->mask_stack.size());
     }
+
+#if defined(DRJIT_ENABLE_VULKAN)
+    // Wait until the Vulkan device is idle (this also runs pending host
+    // callbacks and releases staging memory)
+    jitc_vulkan_sync_all();
+#endif
 
     if (jitc_task) {
         Task *task = jitc_task;
@@ -351,6 +359,7 @@ void jitc_shutdown(int light) {
         jitc_metal_shutdown();
 #endif
 #if defined(DRJIT_ENABLE_VULKAN)
+        jitc_vulkan_shutdown();
         jitc_vulkan_api_shutdown();
 #endif
     }
@@ -406,8 +415,19 @@ ThreadState *jitc_init_thread_state(JitBackend backend) {
                 "first. The Vulkan backend requires a Vulkan 1.2 (or newer) "
                 "capable device and driver.");
 
-        jitc_raise("jit_init_thread_state(): the Vulkan backend does not "
-                   "support thread states yet.");
+        if (state.vulkan_devices.empty())
+            jitc_raise("jit_init_thread_state(): the Vulkan backend is "
+                       "inactive because no compatible Vulkan device was "
+                       "found on your system.");
+
+        ts = jitc_vulkan_thread_state_new();
+        ts->device = 0;
+        thread_state_vulkan = ts;
+
+        ts->backend = backend;
+        ts->scope = jitc_scope_next();
+        state.tss.push_back(ts);
+        return ts;
     }
 #endif
 
@@ -565,6 +585,13 @@ void jitc_sync_thread(ThreadState *ts) {
         return;
     }
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (jitc_is_vulkan(backend)) {
+        // All Vulkan thread states share the command stream of the device
+        jitc_vulkan_sync(true);
+        return;
+    }
+#endif
     if (jitc_is_llvm(backend)) {
         Task *task = jitc_task;
         if (!task)
@@ -606,6 +633,9 @@ void jitc_sync_thread() {
 #if defined(DRJIT_ENABLE_METAL)
     jitc_sync_thread(tl.ts_metal);
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    jitc_sync_thread(tl.ts_vulkan);
+#endif
 }
 
 void jitc_flush_thread(ThreadState *ts) {
@@ -614,14 +644,22 @@ void jitc_flush_thread(ThreadState *ts) {
         jitc_metal_flush(ts);
         return;
     }
-#else
-    (void) ts;
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (ts && jitc_is_vulkan(ts->backend)) {
+        jitc_vulkan_flush();
+        return;
+    }
+#endif
+    (void) ts;
 }
 
 void jitc_flush_thread() {
 #if defined(DRJIT_ENABLE_METAL)
     jitc_flush_thread(jitc_thread_local().ts_metal);
+#endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    jitc_flush_thread(jitc_thread_local().ts_vulkan);
 #endif
 }
 
@@ -637,6 +675,12 @@ void jitc_sync_device() {
             cuda_check(cuCtxSynchronize());
         }
     }
+#endif
+
+#if defined(DRJIT_ENABLE_VULKAN)
+    // (releases the lock while waiting)
+    if (tl.ts_vulkan)
+        jitc_vulkan_sync(true);
 #endif
 
     if (tl.ts_llvm) {
@@ -664,9 +708,16 @@ void jitc_sync_all_devices() {
 #if defined(DRJIT_ENABLE_METAL)
     jitc_sync_thread(jitc_thread_local().ts_metal);
 
-    // Wait for the command buffers that other threads have committed
-    unlock_guard guard(state.lock);
-    jitc_metal_sync_devices();
+    /* Wait for the command buffers that other threads have committed */ {
+        unlock_guard guard(state.lock);
+        jitc_metal_sync_devices();
+    }
+#endif
+
+#if defined(DRJIT_ENABLE_VULKAN)
+    // Also wait for work enqueued by host callbacks and release staging
+    // memory (the loop above already synchronized any Vulkan thread states)
+    jitc_vulkan_sync_all();
 #endif
 }
 

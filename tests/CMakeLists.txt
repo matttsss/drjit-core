@@ -2,6 +2,12 @@ enable_testing()
 
 set(TEST_FILES basics.cpp mem.cpp loop.cpp vcall.cpp graphviz.cpp reductions.cpp array.cpp record.cpp)
 
+if (DRJIT_ENABLE_VULKAN)
+  # Device initialization, memory allocation, transfers, and synchronization
+  # of the Vulkan backend. Skipped at runtime if no compatible device is found.
+  list(APPEND TEST_FILES vulkan.cpp)
+endif()
+
 add_executable(test_half half.cpp)
 add_test(NAME test_half COMMAND test_half
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -102,6 +108,12 @@ endif()
 set_property(TARGET test_basics PROPERTY CXX_STANDARD 17)
 #set_property(TARGET test_vcall PROPERTY CXX_STANDARD 17)
 set_property(TARGET test_loop PROPERTY CXX_STANDARD 17)
+if (DRJIT_ENABLE_VULKAN)
+  set_property(TARGET test_vulkan PROPERTY CXX_STANDARD 17)
+  # (the test spawns threads)
+  find_package(Threads REQUIRED)
+  target_link_libraries(test_vulkan PRIVATE Threads::Threads)
+endif()
 
 if (DRJIT_ENABLE_OPTIX)
  add_executable(optix_triangle optix_triangle.cpp optix_stubs.h optix_stubs.cpp)

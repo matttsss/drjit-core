@@ -215,7 +215,11 @@ if (DRJIT_ENABLE_VULKAN)
   # list as they are implemented.
   set(DRJIT_VULKAN_FILES
     src/vulkan_api.h
-    src/vulkan_api.cpp)
+    src/vulkan_api.cpp
+    src/vulkan.h
+    src/vulkan_core.cpp
+    src/vulkan_ts.h
+    src/vulkan_ts.cpp)
 endif()
 
 

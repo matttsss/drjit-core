@@ -145,7 +145,9 @@ extern JIT_EXPORT void jit_shutdown(int light JIT_DEF(0));
  *
  * Each thread using Dr.Jit will issue computation to an independent queue.
  * This function only synchronizes with computation issued to the queue of the
- * calling thread.
+ * calling thread. (The Vulkan backend currently records the work of all
+ * threads into a single queue, in which case this function waits for all of
+ * it.)
  */
 extern JIT_EXPORT void jit_sync_thread();
 
@@ -155,8 +157,9 @@ extern JIT_EXPORT void jit_sync_thread();
  *
  * Unlike \ref jit_sync_thread(), this never blocks the host. It only guarantees
  * that the work scheduled so far is committed to the backend's queue/stream.
- * This operation is only relevant for Metal. On backends that submit work as it
- * is issued (CUDA, LLVM) this is a no-op.
+ * This operation is only relevant for Metal and Vulkan (where it submits the
+ * work recorded by all threads using the Vulkan device). On backends that
+ * submit work as it is issued (CUDA, LLVM) this is a no-op.
  */
 extern JIT_EXPORT void jit_flush_thread();
 
@@ -386,6 +389,77 @@ extern JIT_EXPORT void *jit_vulkan_instance();
  * by Dr.Jit. Raises an exception if the function cannot be found.
  */
 extern JIT_EXPORT void *jit_vulkan_lookup(const char *name);
+
+/**
+ * \brief Return the Vulkan device (\c VkDevice) used by the Vulkan backend
+ *
+ * The Vulkan backend currently uses a single device, which it selects
+ * automatically (preferring discrete GPUs over integrated, virtual, and CPU
+ * devices). Set the environment variable <tt>DRJIT_VULKAN_DEVICE</tt> to the
+ * index of a physical device (in the order reported by
+ * <tt>vkEnumeratePhysicalDevices()</tt>) to override this choice.
+ *
+ * Like the other device queries below, this function returns \c NULL if the
+ * Vulkan backend has no active device, i.e., before it has been successfully
+ * initialized via \ref jit_init() (see \ref jit_has_backend()) or after a
+ * full \ref jit_shutdown(). The device remains active across light shutdowns.
+ */
+extern JIT_EXPORT void *jit_vulkan_device_handle();
+
+/// Return the physical device (\c VkPhysicalDevice) used by the Vulkan backend
+extern JIT_EXPORT void *jit_vulkan_physical_device();
+
+/**
+ * \brief Return the queue (\c VkQueue) that the Vulkan backend submits work to
+ *
+ * Dr.Jit submits work to this queue while holding its internal lock.
+ * Applications that submit work to the same queue must ensure that this never
+ * happens concurrently with Dr.Jit operations, as required by the Vulkan
+ * specification.
+ */
+extern JIT_EXPORT void *jit_vulkan_queue();
+
+/// Return the queue family index of \ref jit_vulkan_queue() (or -1)
+extern JIT_EXPORT int jit_vulkan_queue_family();
+
+/**
+ * \brief Return the index of the physical device used by the Vulkan backend
+ * (or -1)
+ *
+ * The index refers to the order of devices reported by
+ * <tt>vkEnumeratePhysicalDevices()</tt>, which is also used by the
+ * <tt>DRJIT_VULKAN_DEVICE</tt> environment variable.
+ */
+extern JIT_EXPORT int jit_vulkan_device_index();
+
+/// Return the name of the device used by the Vulkan backend (or \c NULL).
+/// The string remains valid until the next full \ref jit_shutdown().
+extern JIT_EXPORT const char *jit_vulkan_device_name();
+
+/**
+ * \brief Look up the Vulkan buffer (\c VkBuffer) containing a pointer
+ *
+ * Memory allocated by the Vulkan backend is represented by pointers that
+ * denote device addresses (for device-local memory) or host addresses (for
+ * shared memory, which is persistently mapped). Each allocation is backed by
+ * a dedicated \c VkBuffer.
+ *
+ * This function returns the buffer containing the pointer \c ptr, and it
+ * writes the byte offset of \c ptr within the buffer to \c offset (if
+ * specified). Returns \c NULL (and sets \c offset to zero) if \c ptr is not
+ * part of an allocation made by the Vulkan backend.
+ */
+extern JIT_EXPORT void *jit_vulkan_lookup_buffer(const void *ptr,
+                                                 size_t *offset JIT_DEF(0));
+
+/**
+ * \brief Return the device address (\c VkDeviceAddress) corresponding to a
+ * pointer of the Vulkan backend
+ *
+ * For device-local memory, this is the pointer itself. Returns \c 0 if \c ptr
+ * is not part of an allocation made by the Vulkan backend.
+ */
+extern JIT_EXPORT uint64_t jit_vulkan_device_address(const void *ptr);
 
 // ====================================================================
 //                        Logging infrastructure
@@ -3128,6 +3202,12 @@ extern JIT_EXPORT void jit_set_source_location(const char *fname,
  * backend operations have finished.
  *
  * Note that the callback might run right away if the backend's queue is empty.
+ *
+ * The Vulkan backend currently runs the callbacks of finished work during a
+ * later synchronization (e.g., \ref jit_sync_thread()) on the thread
+ * performing it, or right away if no work is pending when the callback is
+ * enqueued. Callbacks may therefore run concurrently when multiple threads
+ * synchronize.
  */
 extern JIT_EXPORT void jit_enqueue_host_func(JitBackend backend,
                                              void (*callback)(void *),

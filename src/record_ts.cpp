@@ -2713,6 +2713,10 @@ void jitc_freeze_start(JitBackend backend, const uint32_t *inputs,
         jitc_fail("Tried to record a thread_state while inside another "
                   "FreezingScope!");
 
+    if (jitc_is_vulkan(backend))
+        jitc_raise("jit_freeze_start(): frozen functions are not supported "
+                   "by the Vulkan backend yet.");
+
     // Increment scope, can be used to track missing inputs
     jitc_new_scope(backend);
 
@@ -2727,6 +2731,9 @@ void jitc_freeze_start(JitBackend backend, const uint32_t *inputs,
 #if defined(DRJIT_ENABLE_METAL)
         set_disabled_thread_state(&thread_state_metal, backend);
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+        set_disabled_thread_state(&thread_state_vulkan, backend);
+#endif
     } else
 #endif
 #if defined(DRJIT_ENABLE_METAL)
@@ -2736,6 +2743,9 @@ void jitc_freeze_start(JitBackend backend, const uint32_t *inputs,
         set_disabled_thread_state(&thread_state_cuda, backend);
 #endif
         set_disabled_thread_state(&thread_state_llvm, backend);
+#if defined(DRJIT_ENABLE_VULKAN)
+        set_disabled_thread_state(&thread_state_vulkan, backend);
+#endif
     } else
 #endif
     {
@@ -2745,6 +2755,9 @@ void jitc_freeze_start(JitBackend backend, const uint32_t *inputs,
 #endif
 #if defined(DRJIT_ENABLE_METAL)
         set_disabled_thread_state(&thread_state_metal, backend);
+#endif
+#if defined(DRJIT_ENABLE_VULKAN)
+        set_disabled_thread_state(&thread_state_vulkan, backend);
 #endif
     }
 
@@ -2782,6 +2795,9 @@ Recording *jitc_freeze_stop(JitBackend backend, const uint32_t *outputs,
 #if defined(DRJIT_ENABLE_METAL)
             unset_disabled_thread_state(&thread_state_metal);
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+            unset_disabled_thread_state(&thread_state_vulkan);
+#endif
         } else
 #endif
 #if defined(DRJIT_ENABLE_METAL)
@@ -2791,6 +2807,9 @@ Recording *jitc_freeze_stop(JitBackend backend, const uint32_t *outputs,
             unset_disabled_thread_state(&thread_state_cuda);
 #endif
             unset_disabled_thread_state(&thread_state_llvm);
+#if defined(DRJIT_ENABLE_VULKAN)
+            unset_disabled_thread_state(&thread_state_vulkan);
+#endif
         } else
 #endif
         {
@@ -2800,6 +2819,9 @@ Recording *jitc_freeze_stop(JitBackend backend, const uint32_t *outputs,
 #endif
 #if defined(DRJIT_ENABLE_METAL)
             unset_disabled_thread_state(&thread_state_metal);
+#endif
+#if defined(DRJIT_ENABLE_VULKAN)
+            unset_disabled_thread_state(&thread_state_vulkan);
 #endif
         }
 
@@ -2846,6 +2868,9 @@ void jitc_freeze_abort(JitBackend backend) {
 #if defined(DRJIT_ENABLE_METAL)
             unset_disabled_thread_state(&thread_state_metal);
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+            unset_disabled_thread_state(&thread_state_vulkan);
+#endif
         } else
 #endif
 #if defined(DRJIT_ENABLE_METAL)
@@ -2855,6 +2880,9 @@ void jitc_freeze_abort(JitBackend backend) {
             unset_disabled_thread_state(&thread_state_cuda);
 #endif
             unset_disabled_thread_state(&thread_state_llvm);
+#if defined(DRJIT_ENABLE_VULKAN)
+            unset_disabled_thread_state(&thread_state_vulkan);
+#endif
         } else
 #endif
         {
@@ -2864,6 +2892,9 @@ void jitc_freeze_abort(JitBackend backend) {
 #endif
 #if defined(DRJIT_ENABLE_METAL)
             unset_disabled_thread_state(&thread_state_metal);
+#endif
+#if defined(DRJIT_ENABLE_VULKAN)
+            unset_disabled_thread_state(&thread_state_vulkan);
 #endif
         }
 

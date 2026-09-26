@@ -20,6 +20,9 @@
 #if defined(DRJIT_ENABLE_METAL)
 #  include "metal.h"
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+#  include "vulkan.h"
+#endif
 #include <algorithm>
 #include <string>
 #include <unordered_set>
@@ -771,6 +774,9 @@ uint32_t jitc_var_new(Variable &v, bool disable_lvn) {
 #endif
 #if defined(DRJIT_ENABLE_METAL)
         case JitBackend::Metal: ts = tl.ts_metal; break;
+#endif
+#if defined(DRJIT_ENABLE_VULKAN)
+        case JitBackend::Vulkan: ts = tl.ts_vulkan; break;
 #endif
         case JitBackend::LLVM:  ts = tl.ts_llvm;  break;
         default:                ts = nullptr;      break;
@@ -1637,6 +1643,10 @@ uint32_t jitc_var_eval_force(uint32_t index, Variable &v_, void **ptr_out) {
         if (tl.ts_metal)
             tl.ts_metal->notify_init_undefined(result);
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+        if (tl.ts_vulkan)
+            tl.ts_vulkan->notify_init_undefined(result);
+#endif
     }
 
     jitc_log(Debug,
@@ -2199,6 +2209,13 @@ uint32_t jitc_var_migrate(uint32_t src_index, JitBackend dst_backend) {
             } else {
                 src_backend = JitBackend::CUDA;
             }
+        } else
+#endif
+#if defined(DRJIT_ENABLE_VULKAN)
+        if (jitc_is_vulkan(v->backend)) {
+            // Is this a pointer into a Vulkan allocation or host memory?
+            src_backend = jitc_vulkan_find_buffer(v->data) ? JitBackend::Vulkan
+                                                           : JitBackend::None;
         } else
 #endif
         if (jitc_is_metal(v->backend)) {

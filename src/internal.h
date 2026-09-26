@@ -767,6 +767,84 @@ struct MetalDevice {
 };
 #endif
 
+#if defined(DRJIT_ENABLE_VULKAN)
+/// Command stream of a Vulkan device (see vulkan.h)
+struct VulkanStream;
+
+/**
+ * \brief Caches basic information about a Vulkan device (see vulkan_core.cpp)
+ *
+ * The Vulkan backend currently uses a single device. Dr.Jit pointers to
+ * device-local memory are raw device addresses (\c VkDeviceAddress), and
+ * pointers to shared memory are the host addresses of persistently mapped
+ * allocations.
+ */
+struct VulkanDevice {
+    /// Vulkan handles (opaque pointers to keep Vulkan types out of shared
+    /// headers): VkPhysicalDevice, VkDevice, and the compute-capable VkQueue
+    void *physical_device = nullptr;
+    void *device = nullptr;
+    void *queue = nullptr;
+
+    /// Timeline semaphore (VkSemaphore) signaled by every submission to 'queue'
+    void *timeline = nullptr;
+
+    /// Value of the most recently submitted signal operation of 'timeline'.
+    /// Incremented while holding 'state.lock' along with each vkQueueSubmit().
+    uint64_t timeline_value = 0;
+
+    /// Command stream shared by all thread states using this device
+    VulkanStream *stream = nullptr;
+
+    /// Index of the device in the list of physical devices reported by
+    /// vkEnumeratePhysicalDevices() (see the DRJIT_VULKAN_DEVICE variable)
+    int index = -1;
+
+    /// Queue family index of 'queue'
+    uint32_t queue_family = 0;
+
+    /// Vulkan API version used with this device (min. of instance and device)
+    uint32_t api_version = 0;
+
+    /// PCI vendor/device ID and VkPhysicalDeviceType
+    uint32_t vendor_id = 0, device_id = 0, device_type = 0;
+
+    /// Default subgroup size
+    uint32_t subgroup_size = 0;
+
+    /// Selected device limits
+    uint32_t max_push_constants_size = 0;
+    uint32_t max_compute_shared_memory_size = 0;
+    uint32_t max_compute_work_group_invocations = 0;
+    uint32_t max_compute_work_group_count[3] { };
+    uint32_t max_compute_work_group_size[3] { };
+    uint32_t max_memory_allocation_count = 0;
+    uint32_t max_storage_buffer_range = 0;
+    uint64_t max_memory_allocation_size = 0;
+
+    /// Memory type indices for device-local and host-visible ("shared")
+    /// allocations, in order of decreasing preference
+    uint8_t device_mem_types[32] { }, shared_mem_types[32] { };
+    uint32_t device_mem_type_count = 0, shared_mem_type_count = 0;
+
+    /// Optional capabilities, enabled at device creation when supported.
+    /// (Device-address buffers, timeline semaphores, scalar block layout,
+    /// and 64-bit integers are required.)
+    bool shader_int8 = false, shader_int16 = false;
+    bool shader_float16 = false, shader_float64 = false;
+    bool storage_buffer_8bit = false, storage_buffer_16bit = false;
+    bool shader_int64_atomics = false;
+    bool shader_float32_atomic_add = false, shader_float64_atomic_add = false;
+    bool vulkan_memory_model = false;
+
+    /// Ray tracing support (only detected for now, enabled in the future)
+    bool supports_ray_query = false, supports_accel = false;
+
+    /// Human-readable device name (owned, freed at shutdown)
+    char *name = nullptr;
+};
+#endif
+
 /// Represents a single stream of a parallel communication
 struct ThreadStateBase {
     /// Backend type
@@ -826,7 +904,8 @@ struct ThreadStateBase {
      *
      * This value may differ from the CUDA device ID if the machine contains
      * CUDA devices that are incompatible with DrJit. For CUDA it indexes
-     * \ref state.devices, for Metal \ref state.metal_devices.
+     * \ref state.devices, for Metal \ref state.metal_devices, and for Vulkan
+     * \ref state.vulkan_devices.
      *
      * Equals -1 for LLVM ThreadState instances.
      */
@@ -1151,6 +1230,12 @@ struct State {
 #if defined(DRJIT_ENABLE_METAL)
     /// Available Metal devices (Apple Silicon only)
     std::vector<MetalDevice> metal_devices;
+#endif
+
+#if defined(DRJIT_ENABLE_VULKAN)
+    /// Vulkan device used by Dr.Jit (the backend currently supports at most
+    /// one device, see jitc_vulkan_init())
+    std::vector<VulkanDevice> vulkan_devices;
 #endif
 
     /// State associated with each DrJit thread

@@ -337,6 +337,11 @@ static void jitc_var_traverse(uint32_t size, uint32_t index, uint32_t depth = 0)
 void jitc_assemble(ThreadState *ts, ScheduledGroup group) {
     JitBackend backend = ts->backend;
 
+    if (jitc_is_vulkan(backend))
+        jitc_raise("jit_eval(): the Vulkan backend cannot compile kernels "
+                   "yet. It currently only supports memory operations (e.g., "
+                   "allocations, copies, and evaluating literals).");
+
     kernel_params.clear();
     kernel_param_ids.clear();
     kernel_param_info.clear();

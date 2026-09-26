@@ -43,6 +43,9 @@ static const uint32_t BackendLLVM   = 1u << (uint32_t) JitBackend::LLVM,
 
 static bool have_llvm = false;
 
+/// Does the system have a Vulkan device that is compatible with Dr.Jit?
+static bool have_device = false;
+
 /// Does 'func()' raise an exception?
 template <typename Func> static bool raises(Func func) {
     try {
@@ -133,6 +136,7 @@ static void check_unloaded() {
     CHECK(major == 0 && minor == 0 && patch == 0);
     CHECK(raises([] { jit_vulkan_lookup("vkCreateDevice"); }));
     CHECK(!jit_has_backend(JitBackend::Vulkan));
+    CHECK(jit_vulkan_device_handle() == nullptr);
 }
 
 /// Check that the Vulkan libraries are loaded
@@ -144,8 +148,9 @@ static void check_loaded() {
     CHECK(jit_vulkan_lookup("vkCreateDevice") != nullptr);
     CHECK(jit_vulkan_lookup("spvTextToBinary") != nullptr);
 
-    // The backend itself only becomes available once devices are supported
-    CHECK(!jit_has_backend(JitBackend::Vulkan));
+    // The backend is available if the system has a compatible device
+    CHECK((bool) jit_has_backend(JitBackend::Vulkan) == have_device);
+    CHECK((jit_vulkan_device_handle() != nullptr) == have_device);
 }
 
 /// Check that the LLVM backend is unaffected by what happens with Vulkan
@@ -576,6 +581,11 @@ int main(int argc, char **argv) {
                "unavailable, see above).\n");
         return EXIT_SUCCESS;
     }
+    have_device = jit_has_backend(JitBackend::Vulkan);
+    printf("  Vulkan device: %s\n",
+           have_device ? jit_vulkan_device_name() : "(none)");
+    if (require)
+        CHECK(have_device);
     check_loaded();
     check_llvm();
 
