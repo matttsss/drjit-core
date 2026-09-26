@@ -656,6 +656,8 @@ static void jitc_vulkan_require_subgroup() {
 //  Main kernel assembly routine
 // ----------------------------------------------------------------------------
 
+static uint32_t active_vulkan_wg_size = 256;
+
 void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
                           uint32_t /*n_regs*/, uint32_t n_params) {
     const VulkanDevice &dev = state.vulkan_devices[ts->device];
@@ -668,6 +670,7 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
                                   dev.max_compute_work_group_size[0] });
     if (unlikely(wg_size == 0))
         wg_size = 64u;
+    active_vulkan_wg_size = wg_size;
 
     bool params_in_pc =
         (size_t) n_params * sizeof(void *) <= dev.max_push_constants_size;
@@ -1031,7 +1034,15 @@ static void jitc_vulkan_render(Variable *v) {
         case VarKind::Sqrt:
         case VarKind::SqrtApprox:
             jitc_vulkan_require_glsl450();
-            fmt("$v = OpExtInst $t %glsl450 Sqrt $v\n", v, v, a0);
+            if (jitc_is_half(v)) {
+                jitc_vulkan_require_type(VarType::Float32);
+                fmt("$v_0 = OpFConvert %f32 $v\n"
+                    "$v_1 = OpExtInst %f32 %glsl450 Sqrt $v_0\n"
+                    "$v = OpFConvert $t $v_1\n",
+                    v, a0, v, v, v, v, v);
+            } else {
+                fmt("$v = OpExtInst $t %glsl450 Sqrt $v\n", v, v, a0);
+            }
             break;
 
         case VarKind::Abs:
@@ -1066,18 +1077,36 @@ static void jitc_vulkan_render(Variable *v) {
 
         case VarKind::Div:
         case VarKind::DivApprox:
-            if (jitc_is_float(v))
+            if (jitc_is_half(v)) {
+                jitc_vulkan_require_type(VarType::Float32);
+                fmt("$v_0 = OpFConvert %f32 $v\n"
+                    "$v_1 = OpFConvert %f32 $v\n"
+                    "$v_2 = OpFDiv %f32 $v_0 $v_1\n"
+                    "$v = OpFConvert $t $v_2\n",
+                    v, a0, v, a1, v, v, v, v, v, v);
+            } else if (jitc_is_float(v)) {
                 fmt("$v = OpFDiv $t $v $v\n", v, v, a0, a1);
-            else if (jitc_is_uint(v))
+            } else if (jitc_is_uint(v)) {
                 fmt("$v = OpUDiv $t $v $v\n", v, v, a0, a1);
-            else
+            } else {
                 fmt("$v = OpSDiv $t $v $v\n", v, v, a0, a1);
+            }
             break;
 
         case VarKind::Mod:
-            fmt(jitc_is_uint(v) ? "$v = OpUMod $t $v $v\n"
-                                : "$v = OpSRem $t $v $v\n",
-                v, v, a0, a1);
+            if (jitc_is_uint(v)) {
+                fmt("$v = OpUMod $t $v $v\n", v, v, a0, a1);
+            } else {
+                // GLSL / Vulkan Shader capability leaves OpSRem undefined when
+                // either operand is negative (NVIDIA lowers OpSRem as unsigned
+                // modulo). Compute C99 signed remainder from OpSDiv: a - (a / b) * b.
+                fmt("$v_q = OpSDiv $t $v $v\n"
+                    "$v_p = OpIMul $t $v_q $v\n"
+                    "$v = OpISub $t $v $v_p\n",
+                    v, v, a0, a1,
+                    v, v, v, a1,
+                    v, v, a0, v);
+            }
             break;
 
         case VarKind::MulHi: {
@@ -1561,15 +1590,31 @@ static void jitc_vulkan_render(Variable *v) {
             break;
 
         case VarKind::Rcp:
-        case VarKind::RcpApprox: {
-            const char *one_c = jitc_vulkan_require_one(vt);
-            fmt("$v = OpFDiv $t $s $v\n", v, v, one_c, a0);
+        case VarKind::RcpApprox:
+            if (jitc_is_half(v)) {
+                jitc_vulkan_require_type(VarType::Float32);
+                const char *one_c = jitc_vulkan_require_one(VarType::Float32);
+                fmt("$v_0 = OpFConvert %f32 $v\n"
+                    "$v_1 = OpFDiv %f32 $s $v_0\n"
+                    "$v = OpFConvert $t $v_1\n",
+                    v, a0, v, one_c, v, v, v, v);
+            } else {
+                const char *one_c = jitc_vulkan_require_one(vt);
+                fmt("$v = OpFDiv $t $s $v\n", v, v, one_c, a0);
+            }
             break;
-        }
 
         case VarKind::RSqrtApprox:
             jitc_vulkan_require_glsl450();
-            fmt("$v = OpExtInst $t %glsl450 InverseSqrt $v\n", v, v, a0);
+            if (jitc_is_half(v)) {
+                jitc_vulkan_require_type(VarType::Float32);
+                fmt("$v_0 = OpFConvert %f32 $v\n"
+                    "$v_1 = OpExtInst %f32 %glsl450 InverseSqrt $v_0\n"
+                    "$v = OpFConvert $t $v_1\n",
+                    v, a0, v, v, v, v, v);
+            } else {
+                fmt("$v = OpExtInst $t %glsl450 InverseSqrt $v\n", v, v, a0);
+            }
             break;
 
         case VarKind::Sin:
@@ -2381,4 +2426,213 @@ static void jitc_vulkan_render(Variable *v) {
                        "operation yet)!",
                        var_kind_name[v->kind]);
     }
+}
+
+// ----------------------------------------------------------------------------
+//  Runtime SPIR-V compilation & VkPipeline creation
+// ----------------------------------------------------------------------------
+
+/// Vulkan unit artifacts store the VkDevice in ptr[0], the VkShaderModule in
+/// value, and the SPIR-V binary byte size in size.
+static void jitc_vulkan_unit_release(UnitArtifact &a) {
+    if (a.ptr[0] && a.value)
+        vkDestroyShaderModule((VkDevice) a.ptr[0], (VkShaderModule) a.value,
+                              nullptr);
+}
+
+/// Fold device identity, driver version, pipeline cache UUID, SPIRV-Tools
+/// version, and cache version into a disk-cache key.
+static XXH128_hash_t jitc_vulkan_disk_key(const VulkanDevice &dev,
+                                          XXH128_hash_t hash) {
+    XXH3_state_t xs;
+    XXH3_INITSTATE(&xs);
+    XXH3_128bits_reset_withSeed(&xs, DRJIT_CACHE_VERSION);
+    XXH3_128bits_update(&xs, &hash, sizeof(XXH128_hash_t));
+    XXH3_128bits_update(&xs, &dev.vendor_id, sizeof(uint32_t));
+    XXH3_128bits_update(&xs, &dev.device_id, sizeof(uint32_t));
+    XXH3_128bits_update(&xs, &dev.driver_version, sizeof(uint32_t));
+    XXH3_128bits_update(&xs, dev.pipeline_cache_uuid,
+                        sizeof(dev.pipeline_cache_uuid));
+    if (dev.name)
+        XXH3_128bits_update(&xs, dev.name, strlen(dev.name));
+    if (spvSoftwareVersionString) {
+        if (const char *ver = spvSoftwareVersionString())
+            XXH3_128bits_update(&xs, ver, strlen(ver));
+    }
+    return XXH3_128bits_digest(&xs);
+}
+
+/// Format a few lines of SPIR-V source context around a 0-based line/column
+/// diagnostic position.
+static std::string jitc_vulkan_format_spv_diag(const char *src, size_t size,
+                                               size_t err_line,
+                                               size_t err_col) {
+    std::string out = "\n\n--- Diagnostic context ---\n";
+    size_t cur_line = 0, line_start = 0;
+    for (size_t i = 0; i <= size; ++i) {
+        if (i == size || src[i] == '\n') {
+            if (cur_line + 2 >= err_line && cur_line <= err_line + 2) {
+                char prefix[32];
+                snprintf(prefix, sizeof(prefix), "%s %5zu | ",
+                         cur_line == err_line ? ">" : " ", cur_line + 1);
+                out += prefix;
+                out.append(src + line_start, i - line_start);
+                out += '\n';
+                if (cur_line == err_line) {
+                    out += "        | ";
+                    size_t col = std::min(err_col, i - line_start);
+                    out.append(col, ' ');
+                    out += "^\n";
+                }
+            }
+            if (cur_line > err_line + 2)
+                break;
+            cur_line++;
+            line_start = i + 1;
+        }
+    }
+    return out;
+}
+
+bool jitc_vulkan_kernel_compile(ThreadState *ts, Kernel &kernel) {
+    const VulkanDevice &dev = state.vulkan_devices[ts->device];
+    VkDevice device = (VkDevice) dev.device;
+    uint64_t cache_salt = (uint64_t) (uintptr_t) device;
+
+    UnitCompileJob job;
+    jitc_unit_job_init(0, job);
+
+    UnitArtifact artifact {};
+    bool unit_hit = jitc_unit_cache_lookup(JitBackend::Vulkan, job.unit_hash,
+                                           cache_salt, artifact);
+    XXH128_hash_t disk_key = unit_hit ? XXH128_hash_t { 0, 0 }
+                                      : jitc_vulkan_disk_key(dev, job.unit_hash);
+
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    bool from_disk = false;
+
+    // Release the lock while assembling SPIR-V and creating the pipeline.
+    // 'job.source' remains valid because 'state.eval_lock' is held throughout.
+    {
+        unlock_guard guard(state.lock);
+
+        if (unit_hit) {
+            module = (VkShaderModule) artifact.value;
+        } else {
+            std::vector<uint8_t> spv_data;
+            from_disk = jitc_cache_blob_load(CacheKind::VulkanSpirv, disk_key,
+                                             spv_data);
+            if (from_disk && (spv_data.size() < 20 || (spv_data.size() & 3) != 0)) {
+                from_disk = false;
+                spv_data.clear();
+            }
+
+            if (!from_disk) {
+                if (unlikely(!jitc_vulkan_spv_context || !spvTextToBinary))
+                    jitc_fail("jitc_vulkan_kernel_compile(): SPIRV-Tools "
+                              "context is not initialized!");
+
+                spv_binary binary = nullptr;
+                spv_diagnostic diag = nullptr;
+                spv_result_t spv_rv = spvTextToBinary(
+                    jitc_vulkan_spv_context, job.source, job.source_size,
+                    &binary, &diag);
+
+                if (unlikely(spv_rv != SPV_SUCCESS || !binary)) {
+                    std::string err_msg = (diag && diag->error)
+                                              ? diag->error
+                                              : "<unknown error>";
+                    size_t err_line = diag ? diag->position.line : 0;
+                    size_t err_col  = diag ? diag->position.column : 0;
+                    bool is_text    = diag ? diag->isTextSource : false;
+                    if (diag)
+                        spvDiagnosticDestroy(diag);
+                    if (binary)
+                        spvBinaryDestroy(binary);
+
+                    std::string context_lines =
+                        is_text ? jitc_vulkan_format_spv_diag(job.source,
+                                                              job.source_size,
+                                                              err_line, err_col)
+                                : std::string();
+
+                    jitc_fail("jitc_vulkan_kernel_compile(): SPIR-V assembly "
+                              "of \"%s\" failed at line %zu, column %zu "
+                              "(error %d): %s%s\n\n--- Source code ---\n%s",
+                              job.symbol, err_line + 1, err_col + 1,
+                              (int) spv_rv, err_msg.c_str(),
+                              context_lines.c_str(), job.source);
+                }
+
+                if (diag)
+                    spvDiagnosticDestroy(diag);
+
+                size_t byte_size = binary->wordCount * sizeof(uint32_t);
+                spv_data.resize(byte_size);
+                memcpy(spv_data.data(), binary->code, byte_size);
+                spvBinaryDestroy(binary);
+            }
+
+            VkShaderModuleCreateInfo module_info {};
+            module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            module_info.codeSize = spv_data.size();
+            module_info.pCode = (const uint32_t *) spv_data.data();
+
+            VkResult vk_rv = vkCreateShaderModule(device, &module_info, nullptr,
+                                                  &module);
+            if (unlikely(vk_rv != VK_SUCCESS))
+                jitc_fail("jitc_vulkan_kernel_compile(): vkCreateShaderModule() "
+                          "failed for \"%s\": %s\n\n--- Source code ---\n%s",
+                          job.symbol, jitc_vulkan_error_name(vk_rv), job.source);
+
+            uint32_t code_size = (uint32_t) spv_data.size();
+            if (!from_disk)
+                jitc_cache_blob_store_async(CacheKind::VulkanSpirv, disk_key,
+                                            std::move(spv_data));
+
+            artifact = UnitArtifact {
+                { (void *) device, nullptr },
+                (uint64_t) module,
+                code_size
+            };
+            jitc_unit_cache_insert(JitBackend::Vulkan, job.unit_hash,
+                                   cache_salt, artifact,
+                                   jitc_vulkan_unit_release);
+            module = (VkShaderModule) artifact.value;
+        }
+
+        VkComputePipelineCreateInfo pipeline_info {};
+        pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        pipeline_info.stage.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeline_info.stage.module = module;
+        pipeline_info.stage.pName = job.symbol;
+        pipeline_info.layout = (VkPipelineLayout) dev.pipeline_layout;
+
+        VkResult vk_rv = vkCreateComputePipelines(
+            device, (VkPipelineCache) dev.pipeline_cache, 1, &pipeline_info,
+            nullptr, &pipeline);
+        if (unlikely(vk_rv != VK_SUCCESS))
+            jitc_fail("jitc_vulkan_kernel_compile(): vkCreateComputePipelines() "
+                      "failed for \"%s\": %s\n\n--- Source code ---\n%s",
+                      job.symbol, jitc_vulkan_error_name(vk_rv), job.source);
+    }
+
+    kernel.vulkan.pipeline = (uint64_t) pipeline;
+    kernel.vulkan.layout = (uint64_t) dev.pipeline_layout;
+    kernel.vulkan.module = (uint64_t) module;
+    kernel.vulkan.workgroup_size = active_vulkan_wg_size;
+    kernel.size = artifact.size ? artifact.size : (uint32_t) job.source_size;
+
+    return unit_hit || from_disk;
+}
+
+void jitc_vulkan_kernel_free(int device_id, const Kernel &kernel) {
+    if (device_id < 0 || (size_t) device_id >= state.vulkan_devices.size())
+        return;
+    VkDevice device = (VkDevice) state.vulkan_devices[device_id].device;
+    if (kernel.vulkan.pipeline)
+        vkDestroyPipeline(device, (VkPipeline) kernel.vulkan.pipeline, nullptr);
 }

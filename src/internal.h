@@ -789,6 +789,13 @@ struct VulkanDevice {
     /// Timeline semaphore (VkSemaphore) signaled by every submission to 'queue'
     void *timeline = nullptr;
 
+    /// Shared compute pipeline layout (VkPipelineLayout) with a push constant
+    /// range covering [0, max_push_constants_size)
+    void *pipeline_layout = nullptr;
+
+    /// Driver pipeline cache (VkPipelineCache), loaded from and saved to disk
+    void *pipeline_cache = nullptr;
+
     /// Value of the most recently submitted signal operation of 'timeline'.
     /// Incremented while holding 'state.lock' along with each vkQueueSubmit().
     uint64_t timeline_value = 0;
@@ -806,8 +813,11 @@ struct VulkanDevice {
     /// Vulkan API version used with this device (min. of instance and device)
     uint32_t api_version = 0;
 
-    /// PCI vendor/device ID and VkPhysicalDeviceType
-    uint32_t vendor_id = 0, device_id = 0, device_type = 0;
+    /// PCI vendor/device ID, driver version, and VkPhysicalDeviceType
+    uint32_t vendor_id = 0, device_id = 0, driver_version = 0, device_type = 0;
+
+    /// Physical device pipelineCacheUUID
+    uint8_t pipeline_cache_uuid[16] { };
 
     /// Default subgroup size
     uint32_t subgroup_size = 0;

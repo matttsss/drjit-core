@@ -10,15 +10,22 @@
 
 #include "vulkan.h"
 #include "vulkan_ts.h"
+#include "io.h"
+#include "unit.h"
 #include "log.h"
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <map>
 #include <memory>
+#if !defined(_WIN32)
+#  include <unistd.h>
+#endif
 
 /// Size of the shared memory chunks used by jitc_vulkan_stage()
 static constexpr size_t VulkanArenaSize = 65536;
@@ -1064,11 +1071,75 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
 
     const VkPhysicalDeviceLimits &limits = info.props.limits;
 
+    // Shared compute pipeline layout with push constant range covering the
+    // device's maximum push constant size
+    VkPushConstantRange pc_range {};
+    pc_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pc_range.offset = 0;
+    pc_range.size = limits.maxPushConstantsSize;
+
+    VkPipelineLayoutCreateInfo layout_info {};
+    layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &pc_range;
+
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    rv = vkCreatePipelineLayout(device, &layout_info, nullptr,
+                                &pipeline_layout);
+    if (rv != VK_SUCCESS) {
+        vkDestroyCommandPool(device, pool, nullptr);
+        vkDestroySemaphore(device, timeline, nullptr);
+        vkDestroyDevice(device, nullptr);
+        return vulkan_init_fail("vkCreatePipelineLayout() failed: %s",
+                                jitc_vulkan_error_name(rv));
+    }
+
+    // Load persistent driver pipeline cache from ~/.drjit/ if available
+    std::vector<uint8_t> cache_data;
+    if (const char *dir = jitc_cache_dir()) {
+        const uint8_t *u = info.props.pipelineCacheUUID;
+        char name[64];
+        snprintf(name, sizeof(name),
+                 "vulkan_pipeline_cache_%02x%02x%02x%02x%02x%02x%02x%02x"
+                 "%02x%02x%02x%02x%02x%02x%02x%02x.bin",
+                 u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+                 u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+        std::filesystem::path cache_path = std::filesystem::path(dir) / name;
+        std::ifstream file(cache_path, std::ios::binary | std::ios::ate);
+        if (file) {
+            std::streamsize fsize = file.tellg();
+            if (fsize > 0 && fsize <= (std::streamsize) (64 * 1024 * 1024)) {
+                cache_data.resize((size_t) fsize);
+                file.seekg(0);
+                if (!file.read((char *) cache_data.data(), fsize))
+                    cache_data.clear();
+            }
+        }
+    }
+
+    VkPipelineCacheCreateInfo cache_info {};
+    cache_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    cache_info.initialDataSize = cache_data.size();
+    cache_info.pInitialData = cache_data.empty() ? nullptr : cache_data.data();
+
+    VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
+    rv = vkCreatePipelineCache(device, &cache_info, nullptr, &pipeline_cache);
+    if (rv != VK_SUCCESS && !cache_data.empty()) {
+        cache_info.initialDataSize = 0;
+        cache_info.pInitialData = nullptr;
+        rv = vkCreatePipelineCache(device, &cache_info, nullptr,
+                                   &pipeline_cache);
+    }
+    if (rv != VK_SUCCESS)
+        pipeline_cache = VK_NULL_HANDLE;
+
     VulkanDevice dev;
     dev.physical_device = info.handle;
     dev.device = device;
     dev.queue = queue;
     dev.timeline = timeline;
+    dev.pipeline_layout = pipeline_layout;
+    dev.pipeline_cache = pipeline_cache;
     dev.timeline_value = 0;
     dev.stream = new VulkanStream();
     dev.stream->pool = pool;
@@ -1077,7 +1148,10 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
     dev.api_version = std::min(info.props.apiVersion, jitc_vulkan_api_version);
     dev.vendor_id = info.props.vendorID;
     dev.device_id = info.props.deviceID;
+    dev.driver_version = info.props.driverVersion;
     dev.device_type = (uint32_t) info.props.deviceType;
+    memcpy(dev.pipeline_cache_uuid, info.props.pipelineCacheUUID,
+           sizeof(dev.pipeline_cache_uuid));
     dev.subgroup_size = info.props11.subgroupSize;
     dev.max_push_constants_size = limits.maxPushConstantsSize;
     dev.max_compute_shared_memory_size = limits.maxComputeSharedMemorySize;
@@ -1228,6 +1302,9 @@ void jitc_vulkan_shutdown() {
     for (VulkanDevice &dev : state.vulkan_devices)
         vkDeviceWaitIdle((VkDevice) dev.device);
 
+    // Evict cached VkShaderModules before destroying the Vulkan device
+    jitc_unit_cache_flush((int) JitBackend::Vulkan);
+
     // Release cached allocations (normally, jitc_malloc_shutdown() already
     // did so)
     std::vector<void *> cached;
@@ -1266,6 +1343,66 @@ void jitc_vulkan_shutdown() {
 
     for (VulkanDevice &dev : state.vulkan_devices) {
         VkDevice device = (VkDevice) dev.device;
+
+        if (dev.pipeline_cache) {
+            VkPipelineCache cache = (VkPipelineCache) dev.pipeline_cache;
+            const char *dir = jitc_cache_dir();
+            if (dir && jitc_cache_writable()) {
+                size_t cache_size = 0;
+                if (vkGetPipelineCacheData(device, cache, &cache_size,
+                                           nullptr) == VK_SUCCESS &&
+                    cache_size > 0) {
+                    std::vector<uint8_t> data(cache_size);
+                    if (vkGetPipelineCacheData(device, cache, &cache_size,
+                                               data.data()) == VK_SUCCESS) {
+                        const uint8_t *u = dev.pipeline_cache_uuid;
+                        char name[64], tmp_suffix[24];
+                        snprintf(name, sizeof(name),
+                                 "vulkan_pipeline_cache_"
+                                 "%02x%02x%02x%02x%02x%02x%02x%02x"
+                                 "%02x%02x%02x%02x%02x%02x%02x%02x.bin",
+                                 u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+                                 u[8], u[9], u[10], u[11], u[12], u[13], u[14],
+                                 u[15]);
+#if defined(_WIN32)
+                        snprintf(tmp_suffix, sizeof(tmp_suffix), ".%u.tmp",
+                                 (unsigned) GetCurrentProcessId());
+#else
+                        snprintf(tmp_suffix, sizeof(tmp_suffix), ".%u.tmp",
+                                 (unsigned) getpid());
+#endif
+                        std::filesystem::path cache_path =
+                                                  std::filesystem::path(dir) /
+                                                  name,
+                                              tmp_path = cache_path;
+                        tmp_path += tmp_suffix;
+                        std::ofstream file(tmp_path,
+                                           std::ios::binary | std::ios::trunc);
+                        if (file.write((const char *) data.data(), cache_size)) {
+                            file.close();
+                            if (file.good()) {
+                                std::error_code ec;
+                                std::filesystem::rename(tmp_path, cache_path,
+                                                        ec);
+                                if (ec)
+                                    std::filesystem::remove(tmp_path, ec);
+                            }
+                        } else {
+                            file.close();
+                            std::error_code ec;
+                            std::filesystem::remove(tmp_path, ec);
+                        }
+                    }
+                }
+            }
+            vkDestroyPipelineCache(device, cache, nullptr);
+        }
+
+        if (dev.pipeline_layout)
+            vkDestroyPipelineLayout(device,
+                                    (VkPipelineLayout) dev.pipeline_layout,
+                                    nullptr);
+
         vkDestroyCommandPool(device, dev.stream->pool, nullptr);
         delete dev.stream;
         vkDestroySemaphore(device, (VkSemaphore) dev.timeline, nullptr);

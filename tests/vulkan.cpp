@@ -1,12 +1,12 @@
 /*
     tests/vulkan.cpp -- Tests of the Vulkan backend: device selection, memory
-    allocation, transfers, synchronization, and host callbacks
+    allocation, transfers, synchronization, host callbacks, SPIR-V 1.6 codegen,
+    runtime pipeline compilation, and compute kernel execution
 
-    The Vulkan backend cannot compile kernels yet, hence these tests exercise
-    the operations that it implements using transfer commands. They are
-    skipped when no compatible Vulkan device is found, unless the environment
-    variable DRJIT_TEST_REQUIRE_VULKAN=1 is set. Set DRJIT_VULKAN_DEVICE to
-    the index of a physical device to run them on a specific device.
+    These tests are skipped when no compatible Vulkan device is found, unless
+    the environment variable DRJIT_TEST_REQUIRE_VULKAN=1 is set. Set
+    DRJIT_VULKAN_DEVICE to the index of a physical device to run them on a
+    specific device.
 
     Copyright (c) 2026 Wenzel Jakob <wenzel.jakob@epfl.ch>
 
@@ -18,8 +18,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -818,13 +820,28 @@ TEST_VULKAN(14_threads) {
 }
 
 TEST_VULKAN(15_errors) {
-    // Kernels cannot be compiled yet
+    // Unimplemented kernel operations (e.g. local arrays) raise a clear error
     {
-        UInt32 a = UInt32::copy(std::vector<uint32_t>(10, 1).data(), 10);
-        UInt32 b = a + a;
-        jit_assert(raises([&] { b.eval(); }, "cannot compile kernels"));
-        jit_assert(jit_var_state(b.index()) == VarState::Unevaluated);
+        uint32_t arr = jit_array_create(Backend, VarType::UInt32, 10, 4);
+        uint32_t idx = jit_var_counter(Backend, 10);
+        uint8_t mask_val = 1;
+        uint32_t mask =
+            jit_var_literal(Backend, VarType::Bool, &mask_val, 10, 0);
+        uint32_t zero_val = 0;
+        uint32_t zero =
+            jit_var_literal(Backend, VarType::UInt32, &zero_val, 1, 0);
+        uint32_t arr2 = jit_array_write(arr, zero, idx, mask);
+        uint32_t elem = jit_array_read(arr2, zero, mask);
+        jit_var_schedule(elem);
+        jit_assert(raises([&] { jit_eval(); }, "cannot compile kernels"));
+        jit_assert(jit_var_state(elem) == VarState::Unevaluated);
         jit_eval(); // (nothing left to do)
+        jit_var_dec_ref(elem);
+        jit_var_dec_ref(arr2);
+        jit_var_dec_ref(zero);
+        jit_var_dec_ref(mask);
+        jit_var_dec_ref(idx);
+        jit_var_dec_ref(arr);
     }
 
     // Events and frozen functions are unsupported
@@ -1000,13 +1017,13 @@ static std::string assemble_and_validate_spirv(uint32_t var_idx = 0) {
 
     if (var_idx)
         jit_var_schedule(var_idx);
-    bool threw = raises([] { jit_eval(); }, "cannot compile kernels");
+    jit_eval();
+    jit_sync_thread();
 
     jit_set_flag(JitFlag::PrintIR, prev_print_ir);
     jit_set_log_level_callback(prev_callback, nullptr);
     jit_set_log_level_stderr(prev_stderr);
 
-    jit_assert(threw);
     jit_assert(!g_captured_spirv.empty());
 
     // Check module structure and patched 32-hex entry point name
@@ -1955,5 +1972,1188 @@ TEST_VULKAN(20_spirv_memory_ops) {
     jit_var_dec_ref(mask_vec);
 }
 
+// ====================================================================
+//  End-to-end compute execution & numerical verification (Step 2.4)
+// ====================================================================
 
+template <typename T> bool vulkan_test_const_prop() {
+    using Value = typename T::Value;
+    constexpr JitBackend Backend = T::Backend;
+    constexpr bool IsFloat  = drjit::detail::is_floating_point_v<Value>;
+    constexpr bool IsSigned = drjit::detail::is_signed_v<Value>;
+    constexpr bool IsMask   = std::is_same<Value, bool>::value;
+    constexpr bool IsInt    = !IsFloat && !IsMask;
+    constexpr size_t Size   = IsMask ? 2 : 10;
 
+    bool fast_math = jit_flags() & (uint32_t) JitFlag::FastMath;
+    jit_set_flag(JitFlag::FastMath, false);
+
+    bool fail = false;
+    Value values[Size];
+    for (uint32_t i = 0; i < Size; ++i) {
+        values[i] = (Value) ((IsMask || !IsSigned) ? (int) i : ((int) i - 4));
+        if constexpr (IsFloat) {
+            if (values[i] < Value(-1) || values[i] > Value(1))
+                values[i] = (Value) (1.1f * values[i]);
+        }
+    }
+
+    uint8_t *shared_read = (uint8_t *) jit_malloc(Backend, 64 * 1024, true);
+    size_t read_cursor = 0;
+
+    struct StagedRead {
+        uint32_t var_id;
+        size_t offset;
+        size_t count;
+        size_t elem_size;
+        bool is_scalar;
+        bool is_lit;
+    };
+    std::vector<StagedRead> staged_reads;
+
+    auto reset_reads = [&]() {
+        read_cursor = 0;
+        staged_reads.clear();
+    };
+
+    auto stage_read = [&](uint32_t var_id, size_t count, size_t elem_size) -> size_t {
+        size_t offset = (read_cursor + 7) & ~size_t(7);
+        read_cursor = offset + count * elem_size;
+        StagedRead sr { var_id, offset, count, elem_size,
+                        jit_var_size(var_id) == 1,
+                        jit_var_state(var_id) == VarState::Literal };
+        staged_reads.push_back(sr);
+        return offset;
+    };
+
+    auto flush_reads = [&]() {
+        jit_eval();
+        for (StagedRead &sr : staged_reads) {
+            sr.is_scalar = jit_var_size(sr.var_id) == 1;
+            sr.is_lit    = jit_var_state(sr.var_id) == VarState::Literal;
+            if (!sr.is_lit) {
+                void *ptr = nullptr;
+                uint32_t ref_id = jit_var_data(sr.var_id, &ptr);
+                size_t copy_n = sr.is_scalar ? 1 : sr.count;
+                jit_memcpy_async(Backend, shared_read + sr.offset, ptr,
+                                 copy_n * sr.elem_size);
+                jit_var_dec_ref(ref_id);
+            }
+        }
+        jit_sync_thread();
+        for (const StagedRead &sr : staged_reads) {
+            if (sr.is_lit) {
+                uint8_t scalar[8] { };
+                jit_var_read(sr.var_id, 0, scalar);
+                for (size_t i = 0; i < sr.count; ++i)
+                    memcpy(shared_read + sr.offset + i * sr.elem_size,
+                           scalar, sr.elem_size);
+            } else if (sr.is_scalar) {
+                uint8_t scalar[8] { };
+                memcpy(scalar, shared_read + sr.offset, sr.elem_size);
+                for (size_t i = 1; i < sr.count; ++i)
+                    memcpy(shared_read + sr.offset + i * sr.elem_size,
+                           scalar, sr.elem_size);
+            }
+        }
+    };
+
+    uint32_t lit_in[Size] { };
+    for (uint32_t i = 0; i < Size; ++i)
+        lit_in[i] = jit_var_literal(Backend, T::Type, &values[i], 1, 0);
+
+    // 1. Unary operations
+    struct UnaryBatch {
+        JitOp op;
+        Value ref[Size];
+        uint32_t gpu_out;
+        size_t read_off;
+    };
+    std::vector<UnaryBatch> unary_batches;
+    reset_reads();
+
+    for (JitOp op :
+         { JitOp::Not, JitOp::Neg, JitOp::Abs, JitOp::Sqrt, JitOp::Rcp,
+           JitOp::Rsqrt, JitOp::Ceil, JitOp::Floor, JitOp::Round,
+           JitOp::Trunc, JitOp::Popc, JitOp::Clz, JitOp::Ctz, JitOp::Brev }) {
+        if ((op == JitOp::Popc || op == JitOp::Clz || op == JitOp::Ctz ||
+             op == JitOp::Brev) && !IsInt)
+            continue;
+        else if (op == JitOp::Not && !IsMask && !IsInt)
+            continue;
+        else if ((op == JitOp::Sqrt || op == JitOp::Rcp ||
+                  op == JitOp::Rsqrt || op == JitOp::Ceil ||
+                  op == JitOp::Floor || op == JitOp::Round ||
+                  op == JitOp::Trunc) && !IsFloat)
+            continue;
+        else if ((op == JitOp::Neg || op == JitOp::Abs) && IsMask)
+            continue;
+
+        UnaryBatch ub { };
+        ub.op = op;
+        Value safe_vals[Size] { };
+        for (uint32_t i = 0; i < Size; ++i) {
+            bool skip = (op == JitOp::Rcp && values[i] == Value(0));
+            safe_vals[i] = skip ? Value(1) : values[i];
+            if (!skip) {
+                uint32_t l_id = jit_var_op(op, &lit_in[i]);
+                jit_assert(jit_var_state(l_id) == VarState::Literal);
+                jit_var_read(l_id, 0, &ub.ref[i]);
+                jit_var_dec_ref(l_id);
+            }
+        }
+
+        uint32_t gpu_in = jit_var_mem_copy(Backend, T::Type, safe_vals, Size, 1);
+        ub.gpu_out = jit_var_op(op, &gpu_in);
+        jit_var_schedule(ub.gpu_out);
+        jit_var_dec_ref(gpu_in);
+        ub.read_off = stage_read(ub.gpu_out, Size, sizeof(Value));
+        unary_batches.push_back(ub);
+    }
+    flush_reads();
+
+    for (const UnaryBatch &ub : unary_batches) {
+        const Value *got = (const Value *) (shared_read + ub.read_off);
+        for (uint32_t i = 0; i < Size; ++i) {
+            if (ub.op == JitOp::Rcp && values[i] == Value(0))
+                continue;
+            Value value = got[i], r = ub.ref[i];
+            if (memcmp(&value, &r, sizeof(Value)) != 0) {
+                if (std::isnan((double) value) && std::isnan((double) r))
+                    continue;
+                if ((ub.op == JitOp::Sqrt || ub.op == JitOp::Rcp ||
+                     ub.op == JitOp::Rsqrt) &&
+                    std::abs(double(value) - double(r)) < 1e-5)
+                    continue;
+                if (double(value) == 0.0 && double(r) == 0.0)
+                    continue;
+                fprintf(stderr, "Unary mismatch (type=%s, op=%d, a=%g): got %g vs ref %g\n",
+                        typeid(Value).name(), (int) ub.op, double(values[i]),
+                        double(value), double(r));
+                fail = true;
+            }
+        }
+        jit_var_dec_ref(ub.gpu_out);
+    }
+
+    // 2. Binary operations: tests (lit,lit), (eval,lit), (lit,eval), and (eval,eval)
+    struct BinBatch {
+        JitOp op;
+        bool is_cmp;
+        Value lhs_safe[Size];
+        Value rhs_safe[Size];
+        Value ref_val[Size][Size];
+        bool  ref_cmp[Size][Size];
+        uint32_t out_el[Size];
+        uint32_t out_le[Size];
+        uint32_t out_ee[Size];
+        size_t off_el[Size];
+        size_t off_le[Size];
+        size_t off_ee[Size];
+    };
+    std::vector<BinBatch> bin_batches;
+    reset_reads();
+
+    for (JitOp op :
+         { JitOp::Add, JitOp::Sub, JitOp::Mul, JitOp::Div,
+           JitOp::Mod, JitOp::Min, JitOp::Max, JitOp::And, JitOp::Or,
+           JitOp::Xor, JitOp::Shl, JitOp::Shr, JitOp::Eq, JitOp::Neq,
+           JitOp::Lt, JitOp::Le, JitOp::Gt, JitOp::Ge, JitOp::MulHi }) {
+        if (op == JitOp::Mod && IsFloat)
+            continue;
+        if ((IsFloat || IsMask) && (op == JitOp::Shl || op == JitOp::Shr))
+            continue;
+        if (IsMask && !(op == JitOp::Or || op == JitOp::And || op == JitOp::Xor))
+            continue;
+        if ((!IsInt || sizeof(Value) < 4) && op == JitOp::MulHi)
+            continue;
+
+        BinBatch b { };
+        b.op = op;
+        b.is_cmp = (op == JitOp::Eq || op == JitOp::Neq || op == JitOp::Lt ||
+                    op == JitOp::Le || op == JitOp::Gt  || op == JitOp::Ge);
+        size_t out_esize = b.is_cmp ? sizeof(bool) : sizeof(Value);
+
+        uint32_t lit_lhs_safe[Size] { }, lit_rhs_safe[Size] { }, gpu_rhs_scalar[Size] { };
+        for (uint32_t i = 0; i < Size; ++i) {
+            bool bad_lhs = IsSigned && op == JitOp::Shl && values[i] < Value(0);
+            bool bad_rhs = ((op == JitOp::Div || op == JitOp::Mod) && values[i] == Value(0)) ||
+                           ((op == JitOp::Shr || op == JitOp::Shl) &&
+                            (values[i] < Value(0) || (size_t) values[i] >= sizeof(Value) * 8));
+            b.lhs_safe[i] = bad_lhs ? Value(0) : values[i];
+            b.rhs_safe[i] = bad_rhs ? Value(1) : values[i];
+            lit_lhs_safe[i]   = jit_var_literal(Backend, T::Type, &b.lhs_safe[i], 1, 0);
+            lit_rhs_safe[i]   = jit_var_literal(Backend, T::Type, &b.rhs_safe[i], 1, 0);
+            gpu_rhs_scalar[i] = jit_var_literal(Backend, T::Type, &b.rhs_safe[i], 1, 1);
+        }
+
+        uint32_t gpu_lhs_vec = jit_var_mem_copy(Backend, T::Type, b.lhs_safe, Size, 1);
+        uint32_t gpu_rhs_vec = jit_var_mem_copy(Backend, T::Type, b.rhs_safe, Size, 1);
+
+        for (uint32_t i = 0; i < Size; ++i) {
+            for (uint32_t k = 0; k < Size; ++k) {
+                uint32_t deps[2] = { lit_lhs_safe[i], lit_rhs_safe[k] };
+                uint32_t l_id = jit_var_op(op, deps);
+                jit_assert(jit_var_state(l_id) == VarState::Literal);
+                if (b.is_cmp)
+                    jit_var_read(l_id, 0, &b.ref_cmp[i][k]);
+                else
+                    jit_var_read(l_id, 0, &b.ref_val[i][k]);
+                jit_var_dec_ref(l_id);
+            }
+        }
+
+        for (uint32_t k = 0; k < Size; ++k) {
+            uint32_t deps_el[2] = { gpu_lhs_vec, lit_rhs_safe[k] };
+            uint32_t deps_le[2] = { lit_lhs_safe[k], gpu_rhs_vec };
+            uint32_t deps_ee[2] = { gpu_lhs_vec, gpu_rhs_scalar[k] };
+            b.out_el[k] = jit_var_op(op, deps_el);
+            b.out_le[k] = jit_var_op(op, deps_le);
+            b.out_ee[k] = jit_var_op(op, deps_ee);
+            jit_var_schedule(b.out_el[k]);
+            jit_var_schedule(b.out_le[k]);
+            jit_var_schedule(b.out_ee[k]);
+            b.off_el[k] = stage_read(b.out_el[k], Size, out_esize);
+            b.off_le[k] = stage_read(b.out_le[k], Size, out_esize);
+            b.off_ee[k] = stage_read(b.out_ee[k], Size, out_esize);
+            jit_var_dec_ref(lit_lhs_safe[k]);
+            jit_var_dec_ref(lit_rhs_safe[k]);
+            jit_var_dec_ref(gpu_rhs_scalar[k]);
+        }
+        jit_var_dec_ref(gpu_lhs_vec);
+        jit_var_dec_ref(gpu_rhs_vec);
+        bin_batches.push_back(b);
+    }
+    flush_reads();
+
+    for (const BinBatch &b : bin_batches) {
+        auto check_vec = [&](size_t off, uint32_t fixed_idx, bool fixed_is_rhs, const char *mode) {
+            if (b.is_cmp) {
+                const bool *got = (const bool *) (shared_read + off);
+                for (uint32_t m = 0; m < Size; ++m) {
+                    uint32_t i = fixed_is_rhs ? m : fixed_idx;
+                    uint32_t k = fixed_is_rhs ? fixed_idx : m;
+                    if (got[m] != b.ref_cmp[i][k]) {
+                        fprintf(stderr, "Cmp mismatch (%s, type=%s, op=%d, a=%g, b=%g): got %d vs ref %d\n",
+                                mode, typeid(Value).name(), (int) b.op,
+                                double(b.lhs_safe[i]), double(b.rhs_safe[k]),
+                                (int) got[m], (int) b.ref_cmp[i][k]);
+                        fail = true;
+                    }
+                }
+            } else {
+                const Value *got = (const Value *) (shared_read + off);
+                for (uint32_t m = 0; m < Size; ++m) {
+                    uint32_t i = fixed_is_rhs ? m : fixed_idx;
+                    uint32_t k = fixed_is_rhs ? fixed_idx : m;
+                    Value value = got[m], r = b.ref_val[i][k];
+                    if (memcmp(&value, &r, sizeof(Value)) != 0) {
+                        if (b.op == JitOp::Div &&
+                            std::abs(double(value) - double(r)) < 1e-5)
+                            continue;
+                        if (double(value) == 0.0 && double(r) == 0.0)
+                            continue;
+                        fprintf(stderr, "Binary mismatch (%s, type=%s, op=%d, a=%g, b=%g): got %g vs ref %g\n",
+                                mode, typeid(Value).name(), (int) b.op,
+                                double(b.lhs_safe[i]), double(b.rhs_safe[k]),
+                                double(value), double(r));
+                        fail = true;
+                    }
+                }
+            }
+        };
+
+        for (uint32_t k = 0; k < Size; ++k) {
+            check_vec(b.off_el[k], k, true,  "eval,lit");
+            check_vec(b.off_le[k], k, false, "lit,eval");
+            check_vec(b.off_ee[k], k, true,  "eval,eval");
+            jit_var_dec_ref(b.out_el[k]);
+            jit_var_dec_ref(b.out_le[k]);
+            jit_var_dec_ref(b.out_ee[k]);
+        }
+    }
+
+    // 3. Ternary operations (Fma & Select)
+    constexpr uint32_t Small = IsMask ? 2 : 4;
+    Value svals[Small];
+    uint32_t lit_s[Small] { }, gpu_s[Small] { };
+    for (uint32_t i = 0; i < Small; ++i) {
+        svals[i] = (Value) ((IsMask || !IsSigned) ? (int) i : ((int) i - 2));
+        if constexpr (IsFloat) {
+            if (svals[i] < Value(-1) || svals[i] > Value(1))
+                svals[i] = (Value) (1.1f * svals[i]);
+        }
+        lit_s[i] = jit_var_literal(Backend, T::Type, &svals[i], 1, 0);
+        gpu_s[i] = jit_var_literal(Backend, T::Type, &svals[i], 1, 1);
+    }
+    uint32_t gpu_s_vec = jit_var_mem_copy(Backend, T::Type, svals, Small, 1);
+    uint32_t in_b[4] { };
+    for (uint32_t i = 0; i < 4; ++i) {
+        bool b = i & 1;
+        in_b[i] = jit_var_literal(Backend, VarType::Bool, &b, 1, i >= 2);
+    }
+
+    for (JitOp op : { JitOp::Fma, JitOp::Select }) {
+        if (op == JitOp::Fma && IsMask)
+            continue;
+
+        uint32_t n_i = (op == JitOp::Select) ? 2 : Small;
+        Value ref_t[4][Small][Small] { };
+        for (uint32_t i = 0; i < n_i; ++i) {
+            for (uint32_t j = 0; j < Small; ++j) {
+                for (uint32_t k = 0; k < Small; ++k) {
+                    uint32_t deps[3] = { op == JitOp::Select ? in_b[i] : lit_s[i],
+                                         lit_s[j], lit_s[k] };
+                    uint32_t l_id = jit_var_op(op, deps);
+                    jit_assert(jit_var_state(l_id) == VarState::Literal);
+                    jit_var_read(l_id, 0, &ref_t[i][j][k]);
+                    jit_var_dec_ref(l_id);
+                }
+            }
+        }
+
+        reset_reads();
+        uint32_t out_t[4][Small] { };
+        size_t off_t[4][Small] { };
+        for (uint32_t i = 0; i < n_i; ++i) {
+            for (uint32_t j = 0; j < Small; ++j) {
+                uint32_t a0 = (op == JitOp::Select) ? in_b[i + 2] : gpu_s[i];
+                uint32_t deps[3] = { a0, gpu_s[j], gpu_s_vec };
+                out_t[i][j] = jit_var_op(op, deps);
+                jit_var_schedule(out_t[i][j]);
+                off_t[i][j] = stage_read(out_t[i][j], Small, sizeof(Value));
+            }
+        }
+        flush_reads();
+
+        for (uint32_t i = 0; i < n_i; ++i) {
+            for (uint32_t j = 0; j < Small; ++j) {
+                const Value *got = (const Value *) (shared_read + off_t[i][j]);
+                for (uint32_t k = 0; k < Small; ++k) {
+                    Value value = got[k], r = ref_t[i][j][k];
+                    if (memcmp(&value, &r, sizeof(Value)) != 0) {
+                        if (op == JitOp::Fma &&
+                            std::abs(double(value) - double(r)) < 1e-5)
+                            continue;
+                        fprintf(stderr, "Ternary mismatch (type=%s, op=%d): got %g vs ref %g\n",
+                                typeid(Value).name(), (int) op, double(value), double(r));
+                        fail = true;
+                    }
+                }
+                jit_var_dec_ref(out_t[i][j]);
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < 4; ++i)
+        jit_var_dec_ref(in_b[i]);
+    jit_var_dec_ref(gpu_s_vec);
+    for (uint32_t i = 0; i < Small; ++i) {
+        jit_var_dec_ref(lit_s[i]);
+        jit_var_dec_ref(gpu_s[i]);
+    }
+    for (uint32_t i = 0; i < Size; ++i)
+        jit_var_dec_ref(lit_in[i]);
+    jit_free(shared_read);
+
+    jit_set_flag(JitFlag::FastMath, fast_math);
+    return fail;
+}
+
+TEST_VULKAN(21_eval_arithmetic_and_casts) {
+    // 1. Counter, scalar/vector load-store, masks, and >32-param PSB fallback
+    {
+        UInt32 ctr = arange<UInt32>(64);
+        UInt32 y = ctr * UInt32(3) + UInt32(7);
+        y.eval();
+        for (uint32_t i = 0; i < 64; ++i)
+            jit_assert(y.read(i) == i * 3 + 7);
+
+        Mask even = eq(ctr & UInt32(1), UInt32(0));
+        Mask odd  = ~even;
+        even.eval();
+        odd.eval();
+        for (uint32_t i = 0; i < 64; ++i) {
+            jit_assert(even.read(i) == ((i & 1) == 0));
+            jit_assert(odd.read(i)  == ((i & 1) == 1));
+        }
+
+        // > 32 input buffers (triggers PhysicalStorageBuffer parameter block)
+        const int n_inputs = 40;
+        const uint32_t width = 64;
+        std::vector<uint32_t> inputs(n_inputs);
+        for (int k = 0; k < n_inputs; ++k) {
+            std::vector<uint32_t> host(width);
+            for (uint32_t i = 0; i < width; ++i)
+                host[i] = (uint32_t) k * 100u + i;
+            inputs[k] = jit_var_mem_copy(Backend, VarType::UInt32,
+                                         host.data(), width, 1);
+        }
+        uint32_t acc = jit_var_inc_ref(inputs[0]);
+        for (int k = 1; k < n_inputs; ++k) {
+            uint32_t next = jit_var_add(acc, inputs[k]);
+            jit_var_dec_ref(acc);
+            acc = next;
+        }
+        void *acc_ptr = nullptr;
+        uint32_t acc_ref = jit_var_data(acc, &acc_ptr);
+        std::vector<uint32_t> got_acc(width);
+        jit_memcpy(Backend, got_acc.data(), acc_ptr, width * sizeof(uint32_t));
+        jit_var_dec_ref(acc_ref);
+        for (uint32_t i = 0; i < width; ++i) {
+            uint32_t expected = 100u * (uint32_t) (n_inputs * (n_inputs - 1) / 2) +
+                                (uint32_t) n_inputs * i;
+            jit_assert(got_acc[i] == expected);
+        }
+        jit_var_dec_ref(acc);
+        for (int k = 0; k < n_inputs; ++k)
+            jit_var_dec_ref(inputs[k]);
+    }
+
+    // 2. Constant propagation vs. GPU evaluation across all types & ops
+    bool fail = false;
+    fail |= vulkan_test_const_prop<VulkanArray<float>>();
+    fail |= vulkan_test_const_prop<VulkanArray<drjit::half>>();
+    fail |= vulkan_test_const_prop<VulkanArray<double>>();
+    fail |= vulkan_test_const_prop<VulkanArray<int8_t>>();
+    fail |= vulkan_test_const_prop<VulkanArray<uint8_t>>();
+    fail |= vulkan_test_const_prop<VulkanArray<int16_t>>();
+    fail |= vulkan_test_const_prop<VulkanArray<uint16_t>>();
+    fail |= vulkan_test_const_prop<VulkanArray<int32_t>>();
+    fail |= vulkan_test_const_prop<VulkanArray<uint32_t>>();
+    fail |= vulkan_test_const_prop<VulkanArray<int64_t>>();
+    fail |= vulkan_test_const_prop<VulkanArray<uint64_t>>();
+    fail |= vulkan_test_const_prop<VulkanArray<bool>>();
+    jit_assert(!fail);
+
+    // 3. Special floating-point ops: Min/Max NaN propagation, FMin/FMax,
+    //    Copysign, MulHi (8/16-bit), MulWide, and fused float-to-int rounding
+    {
+        int prev_cp = jit_flag(JitFlag::ConstantPropagation);
+        jit_set_flag(JitFlag::ConstantPropagation, 0);
+
+        float nan_f = std::numeric_limits<float>::quiet_NaN();
+        float val_f = 3.5f, neg_f = -2.25f;
+        uint32_t v_nan = jit_var_literal(Backend, VarType::Float32, &nan_f, 4, 1);
+        uint32_t v_val = jit_var_literal(Backend, VarType::Float32, &val_f, 4, 1);
+        uint32_t v_neg = jit_var_literal(Backend, VarType::Float32, &neg_f, 4, 1);
+
+        // Min/Max propagate quiet NaN
+        uint32_t r_min_nan = jit_var_min(v_val, v_nan);
+        uint32_t r_max_nan = jit_var_max(v_nan, v_val);
+        // FMin/FMax select the non-NaN operand
+        uint32_t r_fmin = jit_var_fmin(v_val, v_nan);
+        uint32_t r_fmax = jit_var_fmax(v_nan, v_neg);
+
+        // Fused float-to-int rounding (requires ConstantPropagation = 1)
+        jit_set_flag(JitFlag::ConstantPropagation, 1);
+        uint32_t t_ceil    = jit_var_ceil(v_val),
+                 t_floor   = jit_var_floor(v_neg),
+                 t_trunc   = jit_var_trunc(v_neg),
+                 t_round   = jit_var_round(v_val);
+        uint32_t r_ceil_i  = jit_var_cast(t_ceil,  VarType::Int32, 0),
+                 r_floor_i = jit_var_cast(t_floor, VarType::Int32, 0),
+                 r_trunc_i = jit_var_cast(t_trunc, VarType::Int32, 0),
+                 r_round_i = jit_var_cast(t_round, VarType::Int32, 0);
+        for (uint32_t t : { t_ceil, t_floor, t_trunc, t_round })
+            jit_var_dec_ref(t);
+        jit_set_flag(JitFlag::ConstantPropagation, 0);
+
+        for (uint32_t r : { r_min_nan, r_max_nan, r_fmin, r_fmax,
+                            r_ceil_i, r_floor_i, r_trunc_i, r_round_i })
+            jit_var_schedule(r);
+        jit_eval();
+
+        float out_f = 0.f;
+        jit_var_read(r_min_nan, 0, &out_f); jit_assert(std::isnan(out_f));
+        jit_var_read(r_max_nan, 0, &out_f); jit_assert(std::isnan(out_f));
+        jit_var_read(r_fmin, 0, &out_f);    jit_assert(out_f == 3.5f);
+        jit_var_read(r_fmax, 0, &out_f);    jit_assert(out_f == -2.25f);
+
+        int32_t out_i = 0;
+        jit_var_read(r_ceil_i, 0, &out_i);  jit_assert(out_i == 4);
+        jit_var_read(r_floor_i, 0, &out_i); jit_assert(out_i == -3);
+        jit_var_read(r_trunc_i, 0, &out_i); jit_assert(out_i == -2);
+        jit_var_read(r_round_i, 0, &out_i); jit_assert(out_i == 4);
+
+        for (uint32_t r : { r_min_nan, r_max_nan, r_fmin, r_fmax,
+                            r_ceil_i, r_floor_i, r_trunc_i, r_round_i,
+                            v_nan, v_val, v_neg })
+            jit_var_dec_ref(r);
+
+        // MulHi for 8-bit and 16-bit integers, plus MulWide (32-bit -> 64-bit)
+        int8_t  i8a = -100, i8b = 50;
+        uint8_t u8a = 200,  u8b = 100;
+        int16_t i16a = -20000, i16b = 15000;
+        uint16_t u16a = 50000, u16b = 40000;
+        int32_t sa = -100000, sb = 300000;
+        uint32_t ua = 4000000000u, ub = 3u;
+
+        uint32_t vi8a  = jit_var_literal(Backend, VarType::Int8,   &i8a,  4, 1);
+        uint32_t vi8b  = jit_var_literal(Backend, VarType::Int8,   &i8b,  4, 1);
+        uint32_t vu8a  = jit_var_literal(Backend, VarType::UInt8,  &u8a,  4, 1);
+        uint32_t vu8b  = jit_var_literal(Backend, VarType::UInt8,  &u8b,  4, 1);
+        uint32_t vi16a = jit_var_literal(Backend, VarType::Int16,  &i16a, 4, 1);
+        uint32_t vi16b = jit_var_literal(Backend, VarType::Int16,  &i16b, 4, 1);
+        uint32_t vu16a = jit_var_literal(Backend, VarType::UInt16, &u16a, 4, 1);
+        uint32_t vu16b = jit_var_literal(Backend, VarType::UInt16, &u16b, 4, 1);
+        uint32_t vsa   = jit_var_literal(Backend, VarType::Int32,  &sa,   4, 1);
+        uint32_t vsb   = jit_var_literal(Backend, VarType::Int32,  &sb,   4, 1);
+        uint32_t vua   = jit_var_literal(Backend, VarType::UInt32, &ua,   4, 1);
+        uint32_t vub   = jit_var_literal(Backend, VarType::UInt32, &ub,   4, 1);
+
+        uint32_t d_i8[2]  = { vi8a, vi8b },   d_u8[2]  = { vu8a, vu8b };
+        uint32_t d_i16[2] = { vi16a, vi16b }, d_u16[2] = { vu16a, vu16b };
+        uint32_t s_deps[2] = { vsa, vsb },    u_deps[2] = { vua, vub };
+
+        uint32_t r_mh_i8  = jit_var_op(JitOp::MulHi,   d_i8);
+        uint32_t r_mh_u8  = jit_var_op(JitOp::MulHi,   d_u8);
+        uint32_t r_mh_i16 = jit_var_op(JitOp::MulHi,   d_i16);
+        uint32_t r_mh_u16 = jit_var_op(JitOp::MulHi,   d_u16);
+        uint32_t r_swide  = jit_var_op(JitOp::MulWide, s_deps);
+        uint32_t r_uwide  = jit_var_op(JitOp::MulWide, u_deps);
+
+        for (uint32_t r : { r_mh_i8, r_mh_u8, r_mh_i16, r_mh_u16, r_swide, r_uwide })
+            jit_var_schedule(r);
+        jit_eval();
+
+        int8_t got_i8 = 0;     uint8_t got_u8 = 0;
+        int16_t got_i16 = 0;   uint16_t got_u16 = 0;
+        int64_t got_s = 0;     uint64_t got_u = 0;
+        jit_var_read(r_mh_i8,  0, &got_i8);
+        jit_var_read(r_mh_u8,  0, &got_u8);
+        jit_var_read(r_mh_i16, 0, &got_i16);
+        jit_var_read(r_mh_u16, 0, &got_u16);
+        jit_var_read(r_swide,  0, &got_s);
+        jit_var_read(r_uwide,  0, &got_u);
+
+        jit_assert(got_i8  == (int8_t)  (((int16_t) i8a * (int16_t) i8b) >> 8));
+        jit_assert(got_u8  == (uint8_t) (((uint16_t) u8a * (uint16_t) u8b) >> 8));
+        jit_assert(got_i16 == (int16_t) (((int32_t) i16a * (int32_t) i16b) >> 16));
+        jit_assert(got_u16 == (uint16_t) (((uint32_t) u16a * (uint32_t) u16b) >> 16));
+        jit_assert(got_s   == (int64_t) sa * (int64_t) sb);
+        jit_assert(got_u   == (uint64_t) ua * (uint64_t) ub);
+
+        for (uint32_t r : { r_mh_i8, r_mh_u8, r_mh_i16, r_mh_u16, r_swide, r_uwide,
+                            vi8a, vi8b, vu8a, vu8b, vi16a, vi16b, vu16a, vu16b,
+                            vsa, vsb, vua, vub })
+            jit_var_dec_ref(r);
+
+        jit_set_flag(JitFlag::ConstantPropagation, prev_cp);
+    }
+
+    // 4. Pairwise Cast and Bitcast across all 12 scalar types
+    {
+        VarType types[] = {
+            VarType::Float16, VarType::Float32, VarType::Float64,
+            VarType::Int8,    VarType::UInt8,   VarType::Int16,
+            VarType::UInt16,  VarType::Int32,   VarType::UInt32,
+            VarType::Int64,   VarType::UInt64,  VarType::Bool
+        };
+        size_t type_sizes[(int) VarType::Count] = {
+            0, 1, 0, 1, 1, 2, 2, 4, 4, 8, 8, 8, 0, 2, 4, 8
+        };
+
+        struct CastJob {
+            uint32_t gpu_d;
+            size_t bytes;
+            size_t read_off;
+            uint8_t ref_buf[80];
+        };
+
+        uint8_t *cast_shared = (uint8_t *) jit_malloc(Backend, 32 * 1024, true);
+
+        for (VarType source_type : types) {
+            std::vector<CastJob> jobs;
+            size_t cast_off = 0;
+            for (int reinterpret = 0; reinterpret < 2; ++reinterpret) {
+                for (VarType target_type : types) {
+                    bool source_bool = source_type == VarType::Bool,
+                         target_bool = target_type == VarType::Bool;
+                    bool test_sign =
+                        source_type != VarType::UInt8 &&
+                        source_type != VarType::UInt16 &&
+                        source_type != VarType::UInt32 &&
+                        source_type != VarType::UInt64 &&
+                        !source_bool &&
+                        target_type != VarType::UInt8 &&
+                        target_type != VarType::UInt16 &&
+                        target_type != VarType::UInt32 &&
+                        target_type != VarType::UInt64 &&
+                        !target_bool;
+
+                    if (reinterpret &&
+                        (source_bool ? 0 : type_sizes[(int) source_type]) !=
+                        (target_bool ? 0 : type_sizes[(int) target_type]))
+                        continue;
+
+                    int size = source_bool ? 2 : 10;
+                    size_t src_esize = type_sizes[(int) source_type];
+                    size_t dst_esize = type_sizes[(int) target_type];
+                    uint8_t src_buf[80] { };
+                    CastJob job { };
+                    job.bytes = size * dst_esize;
+                    job.read_off = (cast_off + 7) & ~size_t(7);
+                    cast_off = job.read_off + job.bytes;
+
+                    for (int i = 0; i < size; ++i) {
+                        int64_t value = i;
+                        if (test_sign)
+                            value -= 4;
+                        if (source_type == VarType::Float32) {
+                            float f = (float) value;
+                            if (std::abs(f) > 2.f)
+                                f += f * .1f;
+                            value = 0;
+                            memcpy(&value, &f, sizeof(float));
+                        } else if (source_type == VarType::Float64) {
+                            double d = (double) value;
+                            if (std::abs(d) > 2.0)
+                                d += d * .1;
+                            memcpy(&value, &d, sizeof(double));
+                        } else if (source_type == VarType::Float16) {
+                            drjit::half h((float) value);
+                            if (std::abs((float) h) > 2.f)
+                                h = drjit::half((float) h * 1.1f);
+                            value = 0;
+                            memcpy(&value, &h, sizeof(drjit::half));
+                        }
+
+                        memcpy(src_buf + i * src_esize, &value, src_esize);
+                        uint32_t lit_s = jit_var_literal(Backend, source_type, &value, 1, 0);
+                        uint32_t lit_d = jit_var_cast(lit_s, target_type, reinterpret);
+                        jit_var_read(lit_d, 0, job.ref_buf + i * dst_esize);
+                        jit_var_dec_ref(lit_d);
+                        jit_var_dec_ref(lit_s);
+                    }
+
+                    uint32_t gpu_s = jit_var_mem_copy(Backend, source_type, src_buf, size, 1);
+                    job.gpu_d = jit_var_cast(gpu_s, target_type, reinterpret);
+                    jit_var_schedule(job.gpu_d);
+                    jit_var_dec_ref(gpu_s);
+                    jobs.push_back(job);
+                }
+            }
+            jit_eval();
+
+            for (const CastJob &job : jobs) {
+                void *dst_ptr = nullptr;
+                uint32_t dst_ref = jit_var_data(job.gpu_d, &dst_ptr);
+                jit_memcpy_async(Backend, cast_shared + job.read_off, dst_ptr, job.bytes);
+                jit_var_dec_ref(dst_ref);
+            }
+            jit_sync_thread();
+
+            for (const CastJob &job : jobs) {
+                jit_assert(memcmp(cast_shared + job.read_off, job.ref_buf, job.bytes) == 0);
+                jit_var_dec_ref(job.gpu_d);
+            }
+        }
+        jit_free(cast_shared);
+    }
+}
+
+TEST_VULKAN(22_eval_memory_and_atomics) {
+    // 1. Gather and Scatter (unmasked & masked) across Int8, UInt16, Int32, Float32, Float64, Bool
+    {
+        const uint32_t n = 16;
+        uint32_t idx_host[n], sidx_host[n];
+        uint8_t mask_host[n], bool_src[n];
+        int8_t i8_src[n];
+        uint16_t u16_src[n];
+        int32_t i32_src[n];
+        float f32_src[n];
+        double f64_src[n];
+
+        for (uint32_t i = 0; i < n; ++i) {
+            idx_host[i]  = (i * 5 + 3) % n;
+            sidx_host[i] = (i * 7 + 1) % n; // bijection on 0..15
+            mask_host[i] = (uint8_t) ((i % 3) != 0);
+            bool_src[i]  = (uint8_t) (i & 1);
+            i8_src[i]    = (int8_t) (i * 3 - 20);
+            u16_src[i]   = (uint16_t) (i * 100 + 7);
+            i32_src[i]   = (int32_t) (i * 1000 - 5000);
+            f32_src[i]   = (float) i * 1.5f - 4.0f;
+            f64_src[i]   = (double) i * 2.25 - 10.0;
+        }
+
+        uint32_t idx  = jit_var_mem_copy(Backend, VarType::UInt32, idx_host, n, 0);
+        uint32_t sidx = jit_var_mem_copy(Backend, VarType::UInt32, sidx_host, n, 0);
+        uint32_t mask = jit_var_mem_copy(Backend, VarType::Bool, mask_host, n, 0);
+
+        auto check_gather_scatter = [&](VarType vt, const void *src_ptr, size_t esize) {
+            uint32_t src = jit_var_mem_copy(Backend, vt, src_ptr, n, 0);
+            uint32_t g   = jit_var_gather(src, idx, mask);
+
+            std::vector<uint8_t> zeros_buf(n * esize, 0);
+            uint32_t dst = jit_var_mem_copy(Backend, vt, zeros_buf.data(), n, 0);
+            uint32_t out_dst = jit_var_scatter(dst, src, sidx, mask,
+                                               ReduceOp::Identity, ReduceMode::Auto);
+            jit_var_dec_ref(dst);
+
+            jit_var_schedule(g);
+            jit_var_schedule(out_dst);
+            jit_eval();
+
+            const uint8_t *src_bytes = (const uint8_t *) src_ptr;
+            for (uint32_t i = 0; i < n; ++i) {
+                uint8_t got_g[8] { }, exp_g[8] { };
+                jit_var_read(g, i, got_g);
+                if (mask_host[i])
+                    memcpy(exp_g, src_bytes + idx_host[i] * esize, esize);
+                jit_assert(memcmp(got_g, exp_g, esize) == 0);
+            }
+
+            std::vector<uint8_t> exp_dst(n * esize, 0);
+            for (uint32_t i = 0; i < n; ++i) {
+                if (mask_host[i])
+                    memcpy(exp_dst.data() + sidx_host[i] * esize,
+                           src_bytes + i * esize, esize);
+            }
+            for (uint32_t i = 0; i < n; ++i) {
+                uint8_t got_d[8] { };
+                jit_var_read(out_dst, i, got_d);
+                jit_assert(memcmp(got_d, exp_dst.data() + i * esize, esize) == 0);
+            }
+
+            jit_var_dec_ref(out_dst);
+            jit_var_dec_ref(g);
+            jit_var_dec_ref(src);
+        };
+
+        check_gather_scatter(VarType::Bool,    bool_src, 1);
+        check_gather_scatter(VarType::Int8,    i8_src,   1);
+        check_gather_scatter(VarType::UInt16,  u16_src,  2);
+        check_gather_scatter(VarType::Int32,   i32_src,  4);
+        check_gather_scatter(VarType::Float32, f32_src,  4);
+        check_gather_scatter(VarType::Float64, f64_src,  8);
+
+        jit_var_dec_ref(mask);
+        jit_var_dec_ref(sidx);
+        jit_var_dec_ref(idx);
+    }
+
+    // 2. PacketGather and PacketScatter (packet width 4, masked)
+    {
+        int prev_pkt = jit_flag(JitFlag::PacketOps);
+        jit_set_flag(JitFlag::PacketOps, 1);
+
+        const uint32_t n = 8, pkt = 4;
+        float src_host[n * pkt];
+        uint32_t idx_host[n];
+        uint8_t mask_host[n];
+        for (uint32_t i = 0; i < n * pkt; ++i)
+            src_host[i] = (float) (i + 1) * 0.5f;
+        for (uint32_t i = 0; i < n; ++i) {
+            idx_host[i]  = (i * 3 + 1) % n; // bijection on 0..7
+            mask_host[i] = (uint8_t) ((i & 1) == 0);
+        }
+
+        uint32_t src  = jit_var_mem_copy(Backend, VarType::Float32, src_host, n * pkt, 0);
+        uint32_t idx  = jit_var_mem_copy(Backend, VarType::UInt32, idx_host, n, 0);
+        uint32_t mask = jit_var_mem_copy(Backend, VarType::Bool, mask_host, n, 0);
+
+        uint32_t pg_outs[pkt] { };
+        jit_var_gather_packet(pkt, src, idx, mask, pg_outs);
+
+        std::vector<float> zero_dst(n * pkt, 0.f);
+        uint32_t dst = jit_var_mem_copy(Backend, VarType::Float32, zero_dst.data(), n * pkt, 0);
+        uint32_t out_dst = jit_var_scatter_packet(pkt, dst, pg_outs, idx, mask,
+                                                  ReduceOp::Identity, ReduceMode::Auto);
+        jit_var_dec_ref(dst);
+
+        for (uint32_t c = 0; c < pkt; ++c)
+            jit_var_schedule(pg_outs[c]);
+        jit_var_schedule(out_dst);
+        jit_eval();
+
+        for (uint32_t i = 0; i < n; ++i) {
+            for (uint32_t c = 0; c < pkt; ++c) {
+                float got = 0.f;
+                jit_var_read(pg_outs[c], i, &got);
+                float exp = mask_host[i] ? src_host[idx_host[i] * pkt + c] : 0.f;
+                jit_assert(got == exp);
+            }
+        }
+
+        for (uint32_t i = 0; i < n; ++i) {
+            for (uint32_t c = 0; c < pkt; ++c) {
+                float got = 0.f;
+                jit_var_read(out_dst, idx_host[i] * pkt + c, &got);
+                float exp = mask_host[i] ? src_host[idx_host[i] * pkt + c] : 0.f;
+                jit_assert(got == exp);
+            }
+        }
+
+        jit_var_dec_ref(out_dst);
+        for (uint32_t c = 0; c < pkt; ++c)
+            jit_var_dec_ref(pg_outs[c]);
+        jit_var_dec_ref(mask);
+        jit_var_dec_ref(idx);
+        jit_var_dec_ref(src);
+        jit_set_flag(JitFlag::PacketOps, prev_pkt);
+    }
+
+    // 3. ScatterReduce (Add, Min, Max, And, Or; Direct & Local modes; Int32, Int64, Float32, Float64)
+    {
+        const uint32_t n = 128, bins = 4;
+        uint32_t idx_colliding[n], idx_uniform[n];
+        uint8_t mask_host[n];
+        int32_t i32_vals[n];
+        int64_t i64_vals[n];
+        float f32_vals[n];
+        double f64_vals[n];
+
+        for (uint32_t i = 0; i < n; ++i) {
+            idx_colliding[i] = i % bins;
+            idx_uniform[i]   = 0;
+            mask_host[i]     = (uint8_t) ((i % 5) != 0);
+            i32_vals[i]      = (int32_t) (i * 7 - 400);
+            i64_vals[i]      = (int64_t) (i * 13 - 800);
+            f32_vals[i]      = (float) ((int) i - 64) * 1.25f;
+            f64_vals[i]      = (double) ((int) i - 64) * 0.75;
+        }
+
+        uint32_t idx_c = jit_var_mem_copy(Backend, VarType::UInt32, idx_colliding, n, 0);
+        uint32_t idx_u = jit_var_mem_copy(Backend, VarType::UInt32, idx_uniform, n, 0);
+        uint32_t mask  = jit_var_mem_copy(Backend, VarType::Bool, mask_host, n, 0);
+
+        for (ReduceMode mode : { ReduceMode::Direct, ReduceMode::Local }) {
+            for (int uniform_idx = 0; uniform_idx < 2; ++uniform_idx) {
+                uint32_t cur_idx = uniform_idx ? idx_u : idx_c;
+                const uint32_t *host_idx = uniform_idx ? idx_uniform : idx_colliding;
+
+                // Int32 Add, Min, Max, And, Or
+                for (ReduceOp op : { ReduceOp::Add, ReduceOp::Min, ReduceOp::Max,
+                                     ReduceOp::And, ReduceOp::Or }) {
+                    int32_t init_val = (op == ReduceOp::Min) ? 1000000
+                                     : (op == ReduceOp::Max) ? -1000000
+                                     : (op == ReduceOp::And) ? -1 : 0;
+                    std::vector<int32_t> init_bins(bins, init_val);
+                    std::vector<int32_t> exp_bins = init_bins;
+                    for (uint32_t i = 0; i < n; ++i) {
+                        if (!mask_host[i])
+                            continue;
+                        uint32_t b = host_idx[i];
+                        if (op == ReduceOp::Add) exp_bins[b] += i32_vals[i];
+                        if (op == ReduceOp::Min) exp_bins[b] = std::min(exp_bins[b], i32_vals[i]);
+                        if (op == ReduceOp::Max) exp_bins[b] = std::max(exp_bins[b], i32_vals[i]);
+                        if (op == ReduceOp::And) exp_bins[b] &= i32_vals[i];
+                        if (op == ReduceOp::Or)  exp_bins[b] |= i32_vals[i];
+                    }
+
+                    uint32_t dst = jit_var_mem_copy(Backend, VarType::Int32, init_bins.data(), bins, 0);
+                    uint32_t val = jit_var_mem_copy(Backend, VarType::Int32, i32_vals, n, 0);
+                    uint32_t out = jit_var_scatter(dst, val, cur_idx, mask, op, mode);
+                    jit_var_dec_ref(dst);
+                    jit_var_dec_ref(val);
+                    jit_var_eval(out);
+
+                    for (uint32_t b = 0; b < bins; ++b) {
+                        int32_t got = 0;
+                        jit_var_read(out, b, &got);
+                        jit_assert(got == exp_bins[b]);
+                    }
+                    jit_var_dec_ref(out);
+
+                    if (jit_can_scatter_reduce(Backend, VarType::Int64, op)) {
+                        int64_t init_val64 = (op == ReduceOp::Min) ? 1000000LL
+                                           : (op == ReduceOp::Max) ? -1000000LL
+                                           : (op == ReduceOp::And) ? -1LL : 0LL;
+                        std::vector<int64_t> init_bins64(bins, init_val64);
+                        std::vector<int64_t> exp_bins64 = init_bins64;
+                        for (uint32_t i = 0; i < n; ++i) {
+                            if (!mask_host[i])
+                                continue;
+                            uint32_t b = host_idx[i];
+                            if (op == ReduceOp::Add) exp_bins64[b] += i64_vals[i];
+                            if (op == ReduceOp::Min) exp_bins64[b] = std::min(exp_bins64[b], i64_vals[i]);
+                            if (op == ReduceOp::Max) exp_bins64[b] = std::max(exp_bins64[b], i64_vals[i]);
+                            if (op == ReduceOp::And) exp_bins64[b] &= i64_vals[i];
+                            if (op == ReduceOp::Or)  exp_bins64[b] |= i64_vals[i];
+                        }
+
+                        uint32_t dst64 = jit_var_mem_copy(Backend, VarType::Int64, init_bins64.data(), bins, 0);
+                        uint32_t val64 = jit_var_mem_copy(Backend, VarType::Int64, i64_vals, n, 0);
+                        uint32_t out64 = jit_var_scatter(dst64, val64, cur_idx, mask, op, mode);
+                        jit_var_dec_ref(dst64);
+                        jit_var_dec_ref(val64);
+                        jit_var_eval(out64);
+
+                        for (uint32_t b = 0; b < bins; ++b) {
+                            int64_t got = 0;
+                            jit_var_read(out64, b, &got);
+                            jit_assert(got == exp_bins64[b]);
+                        }
+                        jit_var_dec_ref(out64);
+                    }
+                }
+
+                // Float32 & Float64 Add, Min, Max (tests negative float atomics & CAS fallback)
+                for (ReduceOp op : { ReduceOp::Add, ReduceOp::Min, ReduceOp::Max }) {
+                    float init_f32 = (op == ReduceOp::Min) ? 1e6f
+                                   : (op == ReduceOp::Max) ? -1e6f : 0.f;
+                    std::vector<float> init_bins_f32(bins, init_f32), exp_bins_f32 = init_bins_f32;
+                    for (uint32_t i = 0; i < n; ++i) {
+                        if (!mask_host[i])
+                            continue;
+                        uint32_t b = host_idx[i];
+                        if (op == ReduceOp::Add) exp_bins_f32[b] += f32_vals[i];
+                        if (op == ReduceOp::Min) exp_bins_f32[b] = std::min(exp_bins_f32[b], f32_vals[i]);
+                        if (op == ReduceOp::Max) exp_bins_f32[b] = std::max(exp_bins_f32[b], f32_vals[i]);
+                    }
+
+                    uint32_t dst32 = jit_var_mem_copy(Backend, VarType::Float32, init_bins_f32.data(), bins, 0);
+                    uint32_t val32 = jit_var_mem_copy(Backend, VarType::Float32, f32_vals, n, 0);
+                    uint32_t out32 = jit_var_scatter(dst32, val32, cur_idx, mask, op, mode);
+                    jit_var_dec_ref(dst32);
+                    jit_var_dec_ref(val32);
+                    jit_var_eval(out32);
+
+                    for (uint32_t b = 0; b < bins; ++b) {
+                        float got = 0.f;
+                        jit_var_read(out32, b, &got);
+                        jit_assert(got == exp_bins_f32[b]);
+                    }
+                    jit_var_dec_ref(out32);
+
+                    if (jit_can_scatter_reduce(Backend, VarType::Float64, op)) {
+                        double init_f64 = (op == ReduceOp::Min) ? 1e6
+                                        : (op == ReduceOp::Max) ? -1e6 : 0.0;
+                        std::vector<double> init_bins_f64(bins, init_f64), exp_bins_f64 = init_bins_f64;
+                        for (uint32_t i = 0; i < n; ++i) {
+                            if (!mask_host[i])
+                                continue;
+                            uint32_t b = host_idx[i];
+                            if (op == ReduceOp::Add) exp_bins_f64[b] += f64_vals[i];
+                            if (op == ReduceOp::Min) exp_bins_f64[b] = std::min(exp_bins_f64[b], f64_vals[i]);
+                            if (op == ReduceOp::Max) exp_bins_f64[b] = std::max(exp_bins_f64[b], f64_vals[i]);
+                        }
+
+                        uint32_t dst64 = jit_var_mem_copy(Backend, VarType::Float64, init_bins_f64.data(), bins, 0);
+                        uint32_t val64 = jit_var_mem_copy(Backend, VarType::Float64, f64_vals, n, 0);
+                        uint32_t out64 = jit_var_scatter(dst64, val64, cur_idx, mask, op, mode);
+                        jit_var_dec_ref(dst64);
+                        jit_var_dec_ref(val64);
+                        jit_var_eval(out64);
+
+                        for (uint32_t b = 0; b < bins; ++b) {
+                            double got = 0.0;
+                            jit_var_read(out64, b, &got);
+                            jit_assert(got == exp_bins_f64[b]);
+                        }
+                        jit_var_dec_ref(out64);
+                    }
+                }
+            }
+        }
+
+        jit_var_dec_ref(mask);
+        jit_var_dec_ref(idx_u);
+        jit_var_dec_ref(idx_c);
+    }
+
+    // 4. ScatterInc (masked compaction of 1024 lanes)
+    {
+        constexpr uint32_t n = 1024;
+        UInt32 counter(0);
+        UInt32 index = arange<UInt32>(n);
+        UInt32 out   = zeros<UInt32>(n);
+        Mask active  = eq(index & UInt32(1), UInt32(0));
+        UInt32 offset = scatter_inc(counter, UInt32(0), active);
+        scatter(out, index, offset, active);
+        out.eval();
+
+        jit_assert(counter.read(0) == n / 2);
+        std::vector<uint32_t> out_cpu(n);
+        jit_memcpy(Backend, out_cpu.data(), out.data(), n * sizeof(uint32_t));
+        std::sort(out_cpu.begin(), out_cpu.begin() + n / 2);
+        for (uint32_t i = 0; i < n / 2; ++i)
+            jit_assert(out_cpu[i] == i * 2);
+        for (uint32_t i = n / 2; i < n; ++i)
+            jit_assert(out_cpu[i] == 0);
+    }
+
+    // 5. ScatterExch and ScatterCAS (Int32 and Int64)
+    {
+        const uint32_t n = 16;
+        int32_t dst_init[n], exch_in[n], cas_cmp[n], cas_new[n];
+        uint32_t idx_host[n];
+        uint8_t mask_host[n];
+        for (uint32_t i = 0; i < n; ++i) {
+            dst_init[i]  = (int32_t) (i + 100);
+            exch_in[i]   = (int32_t) (i + 500);
+            cas_cmp[i]   = (i % 2 == 0) ? (int32_t) (i + 500) : -999;
+            cas_new[i]   = (int32_t) (i + 900);
+            idx_host[i]  = i;
+            mask_host[i] = (uint8_t) ((i % 4) != 0);
+        }
+
+        uint32_t dst  = jit_var_mem_copy(Backend, VarType::Int32, dst_init, n, 0);
+        uint32_t vin  = jit_var_mem_copy(Backend, VarType::Int32, exch_in, n, 0);
+        uint32_t idx  = jit_var_mem_copy(Backend, VarType::UInt32, idx_host, n, 0);
+        uint32_t mask = jit_var_mem_copy(Backend, VarType::Bool, mask_host, n, 0);
+
+        uint32_t old_exch = jit_var_scatter_exch(&dst, vin, idx, mask);
+        jit_var_schedule(old_exch);
+        jit_var_schedule(dst);
+        jit_eval();
+
+        for (uint32_t i = 0; i < n; ++i) {
+            int32_t got_old = 0, got_dst = 0;
+            jit_var_read(old_exch, i, &got_old);
+            jit_var_read(dst, i, &got_dst);
+            jit_assert(got_old == (mask_host[i] ? dst_init[i] : 0));
+            jit_assert(got_dst == (mask_host[i] ? exch_in[i] : dst_init[i]));
+        }
+
+        uint32_t vcmp = jit_var_mem_copy(Backend, VarType::Int32, cas_cmp, n, 0);
+        uint32_t vnew = jit_var_mem_copy(Backend, VarType::Int32, cas_new, n, 0);
+        uint32_t cas_old = 0, cas_ok = 0;
+        jit_var_scatter_cas(&dst, vcmp, vnew, idx, mask, &cas_old, &cas_ok);
+        jit_var_schedule(cas_old);
+        jit_var_schedule(cas_ok);
+        jit_var_schedule(dst);
+        jit_eval();
+
+        for (uint32_t i = 0; i < n; ++i) {
+            int32_t prev_val = mask_host[i] ? exch_in[i] : dst_init[i];
+            bool should_swap = mask_host[i] && (prev_val == cas_cmp[i]);
+            int32_t got_old = 0, got_dst = 0;
+            uint8_t got_ok = 0;
+            jit_var_read(cas_old, i, &got_old);
+            jit_var_read(cas_ok, i, &got_ok);
+            jit_var_read(dst, i, &got_dst);
+            jit_assert(got_old == (mask_host[i] ? prev_val : 0));
+            jit_assert((bool) got_ok == should_swap);
+            jit_assert(got_dst == (should_swap ? cas_new[i] : prev_val));
+        }
+
+        for (uint32_t r : { cas_old, cas_ok, vcmp, vnew, old_exch, mask, idx, vin, dst })
+            jit_var_dec_ref(r);
+    }
+
+    // 6. Debug BoundsCheck: out-of-bounds Gather and Scatter safely mask off and warn
+    {
+        int prev_dbg = jit_flag(JitFlag::Debug);
+        LogLevel prev_cb = jit_log_level_callback();
+        jit_set_flag(JitFlag::Debug, 1);
+        scoped_set_log_level suppress_stderr(LogLevel::Error);
+
+        static std::string s_bounds_log;
+        jit_set_log_level_callback(LogLevel::Warn, [](LogLevel, const char *msg) {
+            if (msg) {
+                s_bounds_log += msg;
+                s_bounds_log += '\n';
+            }
+        });
+
+        uint32_t src_host[4] = { 10, 20, 30, 40 };
+        uint32_t idx_host[4] = { 0, 2, 99, 3 }; // lane 2 is out of bounds
+        int32_t sidx_host[4] = { 1, -5, 2, 0 }; // lane 1 is negative out of bounds
+        uint32_t src  = jit_var_mem_copy(Backend, VarType::UInt32, src_host, 4, 0);
+        uint32_t idx  = jit_var_mem_copy(Backend, VarType::UInt32, idx_host, 4, 0);
+        uint32_t sidx = jit_var_mem_copy(Backend, VarType::Int32, sidx_host, 4, 0);
+        uint8_t m_one = 1;
+        uint32_t mask = jit_var_literal(Backend, VarType::Bool, &m_one, 4, 0);
+
+        s_bounds_log.clear();
+        uint32_t g = jit_var_gather(src, idx, mask);
+        jit_var_eval(g);
+        jit_assert(s_bounds_log.find("out-of-bounds") != std::string::npos);
+
+        uint32_t expected_g[4] = { 10, 30, 0, 40 };
+        for (uint32_t i = 0; i < 4; ++i) {
+            uint32_t got = 999;
+            jit_var_read(g, i, &got);
+            jit_assert(got == expected_g[i]);
+        }
+
+        s_bounds_log.clear();
+        uint32_t dst_init[4] = { 1, 2, 3, 4 };
+        uint32_t dst = jit_var_mem_copy(Backend, VarType::UInt32, dst_init, 4, 0);
+        uint32_t out_dst = jit_var_scatter(dst, src, sidx, mask,
+                                           ReduceOp::Identity, ReduceMode::Auto);
+        jit_var_dec_ref(dst);
+        jit_var_eval(out_dst);
+        jit_assert(s_bounds_log.find("out-of-bounds") != std::string::npos);
+
+        // Lanes 0 -> dst[1]=10, lane 1 (-5) -> masked off, lane 2 -> dst[2]=30, lane 3 -> dst[0]=40
+        uint32_t expected_d[4] = { 40, 10, 30, 4 };
+        for (uint32_t i = 0; i < 4; ++i) {
+            uint32_t got = 999;
+            jit_var_read(out_dst, i, &got);
+            jit_assert(got == expected_d[i]);
+        }
+
+        for (uint32_t r : { out_dst, g, mask, sidx, idx, src })
+            jit_var_dec_ref(r);
+        jit_set_log_level_callback(prev_cb, nullptr);
+        jit_set_flag(JitFlag::Debug, prev_dbg);
+    }
+}
+
+TEST_VULKAN(23_kernel_cache_and_history) {
+    int prev_kh = jit_flag(JitFlag::KernelHistory);
+    jit_set_flag(JitFlag::KernelHistory, 1);
+    jit_flush_kernel_cache();
+
+    // Use a unique literal constant derived from high-resolution time so the
+    // first launch is guaranteed to be a cold compile (not on disk yet).
+    uint32_t unique_c = (uint32_t) std::chrono::steady_clock::now()
+                            .time_since_epoch().count() | 1u;
+
+    auto run_kernel = [&](uint32_t base_offset, KernelHistory **out_hist) {
+        uint64_t start = jit_kernel_history_begin();
+        uint32_t host_in[16];
+        for (uint32_t i = 0; i < 16; ++i)
+            host_in[i] = base_offset + i;
+        uint32_t x = jit_var_mem_copy(Backend, VarType::UInt32, host_in, 16, 0);
+        uint32_t c = jit_var_literal(Backend, VarType::UInt32, &unique_c, 16, 0);
+        uint32_t y = jit_var_add(x, c);
+        jit_var_eval(y);
+        *out_hist = jit_kernel_history_end(start);
+
+        for (uint32_t i = 0; i < 16; ++i) {
+            uint32_t got = 0;
+            jit_var_read(y, i, &got);
+            jit_assert(got == base_offset + i + unique_c);
+        }
+        jit_var_dec_ref(y);
+        jit_var_dec_ref(c);
+        jit_var_dec_ref(x);
+    };
+
+    // 1. Cold compile: neither in-memory nor on-disk cache hit
+    KernelHistory *h1 = nullptr;
+    run_kernel(100, &h1);
+    jit_assert(jit_kernel_history_size(h1) == 1);
+    jit_assert(jit_kernel_history_query(h1, 0, KernelHistoryField::Backend) ==
+               (uint64_t) JitBackend::Vulkan);
+    jit_assert(jit_kernel_history_query(h1, 0, KernelHistoryField::Size) == 16);
+    jit_assert(jit_kernel_history_query(h1, 0, KernelHistoryField::CacheHit) == 0);
+    jit_assert(jit_kernel_history_query(h1, 0, KernelHistoryField::CacheDisk) == 0);
+    jit_assert(jit_kernel_history_query(h1, 0, KernelHistoryField::OperationCount) > 0);
+    std::string spv_src = jit_kernel_history_source(h1, 0);
+    jit_assert(spv_src.find("OpCapability Shader") != std::string::npos);
+    jit_kernel_history_free(h1);
+
+    // 2. Second launch of identical kernel graph: in-memory cache hit
+    KernelHistory *h2 = nullptr;
+    run_kernel(200, &h2);
+    jit_assert(jit_kernel_history_size(h2) == 1);
+    jit_assert(jit_kernel_history_query(h2, 0, KernelHistoryField::CacheHit) == 1);
+    jit_assert(jit_kernel_history_query(h2, 0, KernelHistoryField::CacheDisk) == 0);
+    jit_kernel_history_free(h2);
+
+    // 3. Flush in-memory kernel & unit caches, then relaunch: disk cache hit
+    jit_flush_kernel_cache();
+    KernelHistory *h3 = nullptr;
+    run_kernel(300, &h3);
+    jit_assert(jit_kernel_history_size(h3) == 1);
+    jit_assert(jit_kernel_history_query(h3, 0, KernelHistoryField::CacheHit) == 1);
+    jit_assert(jit_kernel_history_query(h3, 0, KernelHistoryField::CacheDisk) == 1);
+    jit_kernel_history_free(h3);
+
+    jit_set_flag(JitFlag::KernelHistory, prev_kh);
+}

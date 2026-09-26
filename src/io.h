@@ -52,6 +52,7 @@ struct KernelIsectUnit {
 struct Kernel {
     uint32_t size;
     uint32_t operation_count;
+    JitBackend backend;
 
     /// Generated source code and its length
     char *src;
@@ -162,6 +163,7 @@ enum class CacheKind : uint32_t {
     /// Relocatable object file of the LLVM backend
     Object,
 
+#if defined(DRJIT_ENABLE_METAL)
     /// Metal library image produced by the MSL front end
     MetalLibrary,
 
@@ -169,7 +171,13 @@ enum class CacheKind : uint32_t {
     MetalFunction,
 
     /// Metal binary archive holding a kernel's pipeline
-    MetalPipeline
+    MetalPipeline,
+#endif
+
+#if defined(DRJIT_ENABLE_VULKAN)
+    /// SPIR-V binary module of the Vulkan backend
+    VulkanSpirv,
+#endif
 };
 
 /// Typed cache entries holding a single binary artifact. A store leaves a

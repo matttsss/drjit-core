@@ -330,11 +330,88 @@ void VulkanThreadState::barrier() {
     jitc_vulkan_flush();
 }
 
-Task *VulkanThreadState::launch(Kernel, KernelKey &, XXH128_hash_t, uint32_t,
-                                std::vector<void *> &,
-                                const std::vector<uint32_t> &,
-                                KernelHistoryEntry *) {
-    vulkan_unsupported("jit_launch");
+Task *VulkanThreadState::launch(Kernel kernel, KernelKey & /*key*/,
+                                XXH128_hash_t /*hash*/, uint32_t size,
+                                std::vector<void *> &kernel_params,
+                                const std::vector<uint32_t> & /*kernel_param_ids*/,
+                                KernelHistoryEntry *kernel_history_entry) {
+    if (size == 0)
+        return nullptr;
+
+    VulkanDevice &dev = vulkan_device(this);
+    size_t n_params = kernel_params.size();
+    size_t params_bytes = n_params * sizeof(void *);
+    bool params_in_pc = params_bytes <= dev.max_push_constants_size;
+
+    // In jitc_vulkan_assemble(), %Params always declares at least 1 element in
+    // args[] (16 bytes total) even when n_params == 1.
+    void *pc_fallback[2] = { n_params > 0 ? kernel_params[0] : nullptr,
+                             nullptr };
+    const void *pc_data = n_params == 1 ? (const void *) pc_fallback
+                                        : (const void *) kernel_params.data();
+    size_t pc_size = n_params == 1 ? 2 * sizeof(void *) : params_bytes;
+
+    uint64_t params_device_addr = 0;
+    void *large_staging = nullptr;
+
+    if (!params_in_pc) {
+        // Reserve staging memory *before* jitc_vulkan_cmd(), since
+        // jitc_vulkan_stage() or jitc_malloc() may allocate a new buffer.
+        void *staging = nullptr;
+        if (pc_size <= VulkanMaxStageSize) {
+            staging = jitc_vulkan_stage(dev, pc_size);
+        } else {
+            large_staging = jitc_malloc(JitBackend::Vulkan, pc_size, true);
+            staging = large_staging;
+        }
+        std::memcpy(staging, pc_data, pc_size);
+
+        size_t staging_offset = 0;
+        VulkanBuffer *staging_buf =
+            jitc_vulkan_find_buffer(staging, &staging_offset);
+        if (unlikely(!staging_buf))
+            jitc_fail("VulkanThreadState::launch(): staging buffer not found!");
+        params_device_addr = staging_buf->address + staging_offset;
+    }
+
+    VkCommandBuffer cmd = jitc_vulkan_cmd(dev);
+    jitc_vulkan_access(dev, true);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      (VkPipeline) kernel.vulkan.pipeline);
+
+    if (params_in_pc) {
+        vkCmdPushConstants(cmd, (VkPipelineLayout) kernel.vulkan.layout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           (uint32_t) pc_size, pc_data);
+    } else {
+        vkCmdPushConstants(cmd, (VkPipelineLayout) kernel.vulkan.layout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           sizeof(uint64_t), &params_device_addr);
+    }
+
+    uint32_t wg_size = kernel.vulkan.workgroup_size;
+    uint32_t group_count = (size + wg_size - 1) / wg_size;
+    if (dev.max_compute_work_group_count[0] > 0 &&
+        group_count > dev.max_compute_work_group_count[0])
+        group_count = dev.max_compute_work_group_count[0];
+
+    vkCmdDispatch(cmd, group_count, 1, 1);
+
+    if (unlikely(large_staging))
+        jitc_free(large_staging);
+
+    if (unlikely(jit_flag(JitFlag::LaunchBlocking)))
+        jitc_vulkan_sync(false);
+    else
+        jitc_vulkan_maybe_submit(dev);
+
+    if (unlikely(kernel_history_entry)) {
+        kernel_history_entry->size = size;
+        jitc_kernel_history_append(*kernel_history_entry);
+    }
+
+    return nullptr;
 }
 
 void VulkanThreadState::memset_async(void *ptr, uint32_t size, uint32_t isize,

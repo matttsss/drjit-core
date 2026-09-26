@@ -714,11 +714,6 @@ static void jitc_kernel_attach_source(Kernel &kernel) {
 }
 
 Task *jitc_run(ThreadState *ts, ScheduledGroup group) {
-    if (jitc_is_vulkan(ts->backend))
-        jitc_raise("jit_eval(): the Vulkan backend cannot compile kernels "
-                   "yet. It currently only supports memory operations (e.g., "
-                   "allocations, copies, and evaluating literals).");
-
     uint64_t flags = 0;
 
 #if defined(DRJIT_ENABLE_OPTIX)
@@ -738,6 +733,7 @@ Task *jitc_run(ThreadState *ts, ScheduledGroup group) {
     Kernel kernel;
     memset(&kernel, 0, sizeof(Kernel)); // quench uninitialized variable warning on MSVC
     kernel.operation_count = n_ops_total;
+    kernel.backend = ts->backend;
 
     if (it == state.kernel_cache.end()) {
         bool cache_hit = false;
@@ -759,6 +755,12 @@ Task *jitc_run(ThreadState *ts, ScheduledGroup group) {
         if (jitc_is_metal(ts->backend)) {
             ProfilerPhase profiler(profiler_region_backend_compile);
             cache_hit = jitc_metal_kernel_compile(ts, kernel);
+        } else
+#endif
+#if defined(DRJIT_ENABLE_VULKAN)
+        if (jitc_is_vulkan(ts->backend)) {
+            ProfilerPhase profiler(profiler_region_backend_compile);
+            cache_hit = jitc_vulkan_kernel_compile(ts, kernel);
         } else
 #endif
         {

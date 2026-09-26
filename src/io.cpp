@@ -145,6 +145,9 @@ static CacheKindInfo jitc_cache_kinds[] = {
     { "func.metallib", lz4_dict_metallib },
     { "pso.metallib", lz4_dict_mpso },
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    { "spv", lz4_dict_object },
+#endif
 };
 
 char *jitc_lz4_inflate(const char *compressed, size_t compressed_size,
@@ -668,34 +671,47 @@ void jitc_kernel_free(int device_id, const Kernel &kernel) {
     free(kernel.src);
     free(kernel.isect);
 
-    if (device_id == -1) {
-        // The per-unit images referenced by 'reloc' are owned by the unit
-        // cache and released in jitc_unit_cache_flush()
-        free(kernel.llvm.reloc);
-    } else {
+    switch (kernel.backend) {
+        case JitBackend::LLVM:
+            // The per-unit images referenced by 'reloc' are owned by the unit
+            // cache and released in jitc_unit_cache_flush()
+            free(kernel.llvm.reloc);
+            break;
+
+#if defined(DRJIT_ENABLE_CUDA)
+        case JitBackend::CUDA: {
+            const CUDADevice &device = state.devices.at(device_id);
+            scoped_set_context guard(device.context);
+            if (kernel.size) {
+                cuda_check(cuModuleUnload(kernel.cuda.mod));
+            } else {
+#if defined(DRJIT_ENABLE_OPTIX)
+                jitc_optix_free(kernel);
+#endif
+            }
+            break;
+        }
+#endif
+
 #if defined(DRJIT_ENABLE_METAL)
-        if ((state.backends & (1u << (uint32_t) JitBackend::CUDA)) == 0 &&
-            (state.backends & (1u << (uint32_t) JitBackend::Metal)) != 0) {
-            // Metal kernel.
+        case JitBackend::Metal: {
             extern void jitc_metal_kernel_free(Kernel &);
             jitc_metal_kernel_free(const_cast<Kernel &>(kernel));
-            return;
+            break;
         }
 #endif
-#if defined(DRJIT_ENABLE_CUDA)
-        const CUDADevice &device = state.devices.at(device_id);
-        scoped_set_context guard(device.context);
-        if (kernel.size) {
-            cuda_check(cuModuleUnload(kernel.cuda.mod));
-        } else {
-#if defined(DRJIT_ENABLE_OPTIX)
-            jitc_optix_free(kernel);
-#endif
+
+#if defined(DRJIT_ENABLE_VULKAN)
+        case JitBackend::Vulkan: {
+            extern void jitc_vulkan_kernel_free(int, const Kernel &);
+            jitc_vulkan_kernel_free(device_id, kernel);
+            break;
         }
-#else
-        (void) device_id;
-        (void) kernel;
 #endif
+
+        default:
+            (void) device_id;
+            break;
     }
 }
 

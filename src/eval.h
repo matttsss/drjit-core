@@ -167,12 +167,20 @@ extern void jitc_metal_render_prologue();
 #endif
 
 #if defined(DRJIT_ENABLE_VULKAN)
+struct Kernel;
+
 /// Used by jitc_eval() to generate Vulkan SPIR-V source code
 extern void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
                                  uint32_t n_regs, uint32_t n_params);
 
 /// Reset per-kernel Vulkan assembly state at the start of jitc_assemble()
 extern void jitc_vulkan_assemble_reset();
+
+/// Compile a Vulkan compute kernel from its assembled SPIR-V unit(s)
+extern bool jitc_vulkan_kernel_compile(ThreadState *ts, Kernel &kernel);
+
+/// Release a compiled Vulkan compute kernel
+extern void jitc_vulkan_kernel_free(int device_id, const Kernel &kernel);
 #endif
 
 #if defined(DRJIT_ENABLE_CUDA)
