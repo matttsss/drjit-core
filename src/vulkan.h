@@ -284,4 +284,44 @@ extern VkPipeline jitc_vulkan_reduce_pipeline(VulkanDevice &dev,
                                               VulkanReduceKind kind,
                                               ReduceOp op, VarType vt);
 
+// ---------------------------------------------------------------------
+//  Ray tracing scene & native handle accessors
+// ---------------------------------------------------------------------
+
+struct VulkanScene {
+    int device_id = 0;
+    VkDevice device = nullptr;
+    VkAccelerationStructureKHR tlas = nullptr;
+    uint64_t tlas_address = 0;
+
+    /// Host-visible shared buffer of uint64_t[isect_count], populated by
+    /// jit_isect_bind() with each binding's b->record.data device address
+    void *isect_table = nullptr;
+    uint64_t isect_table_address = 0;
+    uint32_t isect_count = 0;
+    uint32_t geometry_types_mask = 0x1;
+
+    /// Cached VarKind::Evaluated backing variables for ResourceKind::Accel and
+    /// ResourceKind::IFT handles (used by RecordThreadState / dr.freeze)
+    uint32_t owner_handle = 0;
+    uint32_t ift_handle = 0;
+
+    /// Optional user-supplied cleanup callback invoked when the scene expires
+    void (*cleanup_callback)(void *) = nullptr;
+    void *cleanup_payload = nullptr;
+};
+
+extern uint32_t jitc_vulkan_configure_scene(void *tlas,
+                                            uint32_t n_isect_entries,
+                                            uint32_t geometry_types_mask);
+extern void jitc_vulkan_scene_set_cleanup(uint32_t scene_index,
+                                          void (*callback)(void *),
+                                          void *payload);
+extern uint32_t jitc_vulkan_scene_owner_handle(uint32_t scene_index);
+extern VulkanScene *jitc_vulkan_get_scene(uint32_t scene_index);
+extern void jitc_vulkan_ray_trace(uint32_t n_args, uint32_t *args,
+                                  uint32_t mask, uint32_t *out,
+                                  uint32_t n_out, uint32_t scene, int shadow);
+
 #endif // defined(DRJIT_ENABLE_VULKAN)
+

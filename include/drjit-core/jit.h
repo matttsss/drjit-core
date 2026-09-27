@@ -461,6 +461,10 @@ extern JIT_EXPORT void *jit_vulkan_lookup_buffer(const void *ptr,
  */
 extern JIT_EXPORT uint64_t jit_vulkan_device_address(const void *ptr);
 
+/// Return whether the active Vulkan device supports hardware ray tracing
+/// (\c VK_KHR_acceleration_structure and \c VK_KHR_ray_query).
+extern JIT_EXPORT int jit_vulkan_supports_ray_tracing();
+
 // ====================================================================
 //                        Logging infrastructure
 // ====================================================================

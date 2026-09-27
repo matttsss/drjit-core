@@ -20,6 +20,7 @@
 #  include "cuda_green.h"
 #endif
 #if defined(DRJIT_ENABLE_VULKAN)
+#  include <drjit-core/vulkan.h>
 #  include "vulkan_api.h"
 #  include "vulkan.h"
 #endif
@@ -691,6 +692,81 @@ uint64_t jit_vulkan_device_address(const void *ptr) {
     return 0;
 #endif
 }
+
+int jit_vulkan_supports_ray_tracing() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_VULKAN)
+    const VulkanDevice *dev = jitc_vulkan_active_device();
+    return (dev && dev->supports_ray_query) ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+void *jit_vulkan_command_buffer() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (state.vulkan_devices.empty())
+        return nullptr;
+    VulkanDevice &dev = state.vulkan_devices[0];
+    VkCommandBuffer cmd = jitc_vulkan_cmd(dev);
+    jitc_vulkan_access(dev, true);
+    return (void *) cmd;
+#else
+    return nullptr;
+#endif
+}
+
+uint32_t jit_vulkan_configure_scene(void *tlas,
+                                    uint32_t n_isect_entries,
+                                    uint32_t geometry_types_mask) {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_VULKAN)
+    return jitc_vulkan_configure_scene(tlas, n_isect_entries,
+                                       geometry_types_mask);
+#else
+    (void) tlas; (void) n_isect_entries; (void) geometry_types_mask;
+    jit_raise("jit_vulkan_configure_scene(): Vulkan backend not enabled.");
+    return 0;
+#endif
+}
+
+void jit_vulkan_ray_trace(uint32_t n_args, uint32_t *args,
+                          uint32_t mask, uint32_t *out, uint32_t n_out,
+                          uint32_t scene, int shadow) {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_VULKAN)
+    jitc_vulkan_ray_trace(n_args, args, mask, out, n_out, scene, shadow);
+#else
+    (void) n_args; (void) args; (void) mask; (void) out; (void) n_out;
+    (void) scene; (void) shadow;
+    jit_raise("jit_vulkan_ray_trace(): Vulkan backend not enabled.");
+#endif
+}
+
+uint32_t jit_vulkan_scene_owner_handle(uint32_t scene_index) {
+#if defined(DRJIT_ENABLE_VULKAN)
+    lock_guard guard(state.lock);
+    return jitc_vulkan_scene_owner_handle(scene_index);
+#else
+    (void) scene_index;
+    jit_raise("jit_vulkan_scene_owner_handle(): Vulkan backend not enabled.");
+    return 0;
+#endif
+}
+
+void jit_vulkan_scene_set_cleanup(uint32_t scene_index,
+                                  void (*callback)(void *), void *payload) {
+#if defined(DRJIT_ENABLE_VULKAN)
+    lock_guard guard(state.lock);
+    VulkanScene *scene = jitc_vulkan_get_scene(scene_index);
+    scene->cleanup_callback = callback;
+    scene->cleanup_payload = payload;
+#else
+    (void) scene_index; (void) callback; (void) payload;
+#endif
+}
+
 
 void jit_llvm_set_target(const char *target_cpu,
                          const char *target_features,

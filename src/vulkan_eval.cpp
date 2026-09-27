@@ -31,6 +31,8 @@
 #include "cond.h"
 #include "loop.h"
 #include "array.h"
+#include "isect.h"
+#include "trace.h"
 #include <tsl/robin_set.h>
 #include <algorithm>
 
@@ -41,8 +43,9 @@ StringBuffer spv_types_consts { 1024 };
 StringBuffer spv_func_locals  { 256 };
 static StringBuffer spv_body  { 1024 };
 
-// Forward declaration
+// Forward declarations
 static void jitc_vulkan_render(Variable *v);
+static void jitc_vulkan_render_trace(Variable *v);
 
 // ----------------------------------------------------------------------------
 //  Per-kernel SPIR-V type, constant, and capability tracking
@@ -66,6 +69,7 @@ enum EmittedFlag : uint16_t {
     EmittedPsbVec4Ptr = 1u << 12,
     EmittedVec2Zero   = 1u << 13,
     EmittedVec4Zero   = 1u << 14,
+    EmittedInf        = 1u << 15,
 };
 
 enum SpvFlag : uint32_t {
@@ -81,6 +85,8 @@ enum SpvFlag : uint32_t {
     SpvCapSubgroup       = 1u << 9,
     SpvNeedGlsl450       = 1u << 10,
     SpvBoolStorageConsts = 1u << 11,
+    SpvCapRayQuery       = 1u << 12,
+    SpvIsectTypes        = 1u << 13,
 };
 
 static uint16_t emitted_flags[(size_t) VarType::Count];
@@ -524,6 +530,59 @@ static void jitc_vulkan_require_subgroup() {
     put_tc("%ptr_in_u32 = OpTypePointer Input %u32\n"
            "%gl_SubgroupLocalInvocationId = OpVariable %ptr_in_u32 Input\n");
     spv_flags |= SpvCapSubgroup;
+}
+
+static const char *jitc_vulkan_require_inf(VarType vt) {
+    uint32_t idx = (uint32_t) vt;
+    const char *name = jitc_vulkan_id("%c_inf_", idx);
+    const char *val_str = nullptr;
+    switch (vt) {
+        case VarType::Float16: val_str = "!0x7c00";          break;
+        case VarType::Float32: val_str = "!0x7f800000";      break;
+        case VarType::Float64: val_str = "!0x0 !0x7ff00000"; break;
+        default:
+            jitc_fail("jitc_vulkan_require_inf(): unsupported type %u!", idx);
+    }
+
+    if (jitc_vulkan_mark_emitted(idx, EmittedInf))
+        return name;
+
+    jitc_vulkan_require_type(vt);
+    fmt_tc("$s = OpConstant $s $s\n", name, type_name_vulkan[idx], val_str);
+    return name;
+}
+
+static void jitc_vulkan_require_ray_query() {
+    if (spv_flags & SpvCapRayQuery)
+        return;
+    const VulkanDevice &dev = *active_vulkan_dev;
+    if (unlikely(!dev.supports_ray_query))
+        jitc_raise("jit_eval(): the Vulkan device \"%s\" does not support "
+                   "ray tracing queries (VK_KHR_ray_query)!", dev.name);
+    spv_flags |= SpvCapRayQuery;
+    jitc_vulkan_require_type(VarType::Bool);
+    jitc_vulkan_require_type(VarType::UInt32);
+    jitc_vulkan_require_type(VarType::UInt64);
+    jitc_vulkan_require_type(VarType::Float32);
+    jitc_vulkan_require_vec_type(VarType::Float32, 2);
+    put_tc("%v3_f32 = OpTypeVector %f32 3\n"
+           "%AccelStruct = OpTypeAccelerationStructureKHR\n"
+           "%RayQuery = OpTypeRayQueryKHR\n"
+           "%ptr_fn_RayQuery = OpTypePointer Function %RayQuery\n");
+}
+
+static void jitc_vulkan_require_isect_types() {
+    if (spv_flags & SpvIsectTypes)
+        return;
+    spv_flags |= SpvIsectTypes;
+    jitc_vulkan_require_type(VarType::Bool);
+    jitc_vulkan_require_type(VarType::UInt32);
+    jitc_vulkan_require_type(VarType::UInt64);
+    jitc_vulkan_require_type(VarType::Float32);
+    put_tc("%Tuple_isect_ret = OpTypeStruct %bool %f32 %u32 %u32\n"
+           "%c_zero_Tuple_isect_ret = OpConstantNull %Tuple_isect_ret\n"
+           "%fn_isect = OpTypeFunction %Tuple_isect_ret %u64 "
+           "%f32 %f32 %f32 %f32 %f32 %f32 %f32 %f32 %u32\n");
 }
 
 // ----------------------------------------------------------------------------
@@ -1070,7 +1129,10 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
         if (likely(ptype == ParamType::Input)) {
             if (v->is_literal()) {
                 if (vt == VarType::Pointer) {
-                    if (v->resource_kind() != ResourceKind::Buffer)
+                    ResourceKind rk = v->resource_kind();
+                    if (rk != ResourceKind::Buffer &&
+                        rk != ResourceKind::Accel &&
+                        rk != ResourceKind::IFT)
                         jitc_raise("jitc_vulkan_assemble(): resource handles "
                                    "are not supported yet (the Vulkan backend "
                                    "cannot compile kernels with this operation "
@@ -1190,6 +1252,8 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
                               "OpCapability GroupNonUniformVote\n"
                               "OpCapability GroupNonUniformBallot\n"
                               "OpCapability GroupNonUniformArithmetic\n" },
+        { SpvCapRayQuery,     "OpCapability RayQueryKHR\n"
+                              "OpCapability RayTraversalPrimitiveCullingKHR\n" },
     };
 
     put_header("OpCapability Shader\n"
@@ -1202,6 +1266,9 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
 
     if (spv_flags & (SpvCapAtomicF32Add | SpvCapAtomicF64Add))
         put_header("OpExtension \"SPV_EXT_shader_atomic_float_add\"\n");
+
+    if (spv_flags & SpvCapRayQuery)
+        put_header("OpExtension \"SPV_KHR_ray_query\"\n");
 
     if (spv_flags & SpvNeedGlsl450)
         put_header("%glsl450 = OpExtInstImport \"GLSL.std.450\"\n");
@@ -2971,7 +3038,11 @@ static void jitc_vulkan_render(Variable *v) {
             jitc_vulkan_render_array_select(v, a0, a1, a2);
             break;
 
-        // ================ Polymorphic Calls ================
+        // ================ Polymorphic Calls & Ray Tracing ================
+
+        case VarKind::TraceRay:
+            jitc_vulkan_render_trace(v);
+            break;
 
         case VarKind::Call:
             jitc_var_call_assemble((CallData *) v->data, v->reg_index,
@@ -3311,15 +3382,21 @@ static void jitc_vulkan_render_func_body(const CallData *call, uint32_t inst) {
                     break;
             }
             jitc_vulkan_require_type(vt);
-            fmt("$v = OpCopyObject $t %in_r0_$u\n", v, v, in_i);
+            if (call->isect && vt == VarType::Float64)
+                fmt("$v = OpFConvert %f64 %in_r0_$u\n", v, in_i);
+            else
+                fmt("$v = OpCopyObject $t %in_r0_$u\n", v, v, in_i);
         } else if (kind == VarKind::CallSelf) {
             jitc_vulkan_require_type(vt);
             fmt("$v = OpCopyObject $t %self_r0\n", v, v);
         } else if (v->is_evaluated() ||
                    (vt == VarType::Pointer && kind == VarKind::Literal)) {
             uint32_t offset = jitc_call_slot_rel_offset(call, inst, v, sv.index);
+            ResourceKind rk = v->resource_kind();
             if (vt == VarType::Pointer &&
-                v->resource_kind() != ResourceKind::Buffer)
+                rk != ResourceKind::Buffer &&
+                rk != ResourceKind::Accel &&
+                rk != ResourceKind::IFT)
                 jitc_raise("jitc_vulkan_assemble_func(): resource handles "
                            "are not supported yet!");
 
@@ -3420,6 +3497,566 @@ void jitc_vulkan_assemble_func(const CallData *call, uint32_t inst) {
 
     spv_aux_id = saved_aux_id;
     memcpy(current_block_label, saved_label, sizeof(saved_label));
+}
+
+void jitc_vulkan_assemble_isect(const CallData *call) {
+    if (!active_vulkan_dev) {
+        ThreadState *ts = thread_state(JitBackend::Vulkan);
+        active_vulkan_dev = &state.vulkan_devices[ts->device];
+    }
+
+    jitc_vulkan_require_isect_types();
+
+    put("%isect_^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ = OpFunction %Tuple_isect_ret None %fn_isect\n"
+        "%data_r0 = OpFunctionParameter %u64\n"
+        "%in_r0_0 = OpFunctionParameter %f32\n"
+        "%in_r0_1 = OpFunctionParameter %f32\n"
+        "%in_r0_2 = OpFunctionParameter %f32\n"
+        "%in_r0_3 = OpFunctionParameter %f32\n"
+        "%in_r0_4 = OpFunctionParameter %f32\n"
+        "%in_r0_5 = OpFunctionParameter %f32\n"
+        "%in_r0_6 = OpFunctionParameter %f32\n"
+        "%in_r0_7 = OpFunctionParameter %f32\n"
+        "%in_r0_8 = OpFunctionParameter %u32\n"
+        "%entry_r0 = OpLabel\n");
+
+    size_t body_offset = buffer.size();
+    size_t locals_start = spv_func_locals.size();
+    uint32_t saved_aux_id = spv_aux_id;
+    spv_aux_id = 0;
+
+    char saved_label[64];
+    memcpy(saved_label, current_block_label, sizeof(saved_label));
+    jitc_vulkan_set_label("entry", 0);
+
+    jitc_vulkan_render_func_body(call, 0);
+
+    Variable *v_hit = jitc_var(call->inner_out[0]),
+             *v_t   = jitc_var(call->inner_out[1]),
+             *v_a0  = jitc_var(call->inner_out[2]),
+             *v_a1  = jitc_var(call->inner_out[3]);
+
+    if ((VarType) v_t->type == VarType::Float64)
+        fmt("%t_f32_r0 = OpFConvert %f32 $v\n", v_t);
+    else
+        fmt("%t_f32_r0 = OpCopyObject %f32 $v\n", v_t);
+
+    fmt("%ret_r0 = OpCompositeConstruct %Tuple_isect_ret $v %t_f32_r0 $v $v\n"
+        "OpReturnValue %ret_r0\n"
+        "OpFunctionEnd\n",
+        v_hit, v_a0, v_a1);
+
+    if (spv_func_locals.size() > locals_start) {
+        size_t suffix_start = buffer.size();
+        put(spv_func_locals.get() + locals_start,
+            spv_func_locals.size() - locals_start);
+        buffer.move_suffix(suffix_start, body_offset);
+        spv_func_locals.rewind_to(locals_start);
+    }
+
+    spv_aux_id = saved_aux_id;
+    memcpy(current_block_label, saved_label, sizeof(saved_label));
+}
+
+static void jitc_vulkan_render_trace(Variable *v) {
+    TraceData *td = (TraceData *) v->data;
+    bool shadow = td->shadow;
+
+    Variable *valid   = jitc_var(v->dep[0]);
+    Variable *scene_v = jitc_var(v->dep[1]);
+    Variable *accel_h = jitc_var(v->dep[2]);
+    Variable *ift_h   = v->dep[3] ? jitc_var(v->dep[3]) : nullptr;
+
+    VulkanScene *scene = (VulkanScene *) (uintptr_t) scene_v->literal;
+    uint32_t gmask = scene ? scene->geometry_types_mask : 0x1u;
+    bool has_triangles = (gmask & 0x1u) != 0;
+    bool has_aabbs     = ((gmask & 0x2u) != 0) && (ift_h != nullptr);
+    bool cull_backface = (gmask & 0x8u) != 0;
+
+    std::vector<JitIsectBindingExt *> scene_bindings;
+    if (has_aabbs) {
+        jitc_isect_assemble_scene(JitBackend::Vulkan, (uintptr_t) scene);
+        for (JitIsectBindingExt *b : isect_bindings) {
+            if (b->func->call->backend == JitBackend::Vulkan &&
+                b->scene == (uintptr_t) scene) {
+                bool replaced = false;
+                for (JitIsectBindingExt *&eb : scene_bindings) {
+                    if (eb->record_index == b->record_index) {
+                        eb = b;
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced)
+                    scene_bindings.push_back(b);
+            }
+        }
+        if (scene_bindings.empty())
+            has_aabbs = false;
+    }
+
+    jitc_vulkan_require_ray_query();
+    if (has_aabbs)
+        jitc_vulkan_require_isect_types();
+
+    Variable *ox   = jitc_var(td->indices[0]),
+             *oy   = jitc_var(td->indices[1]),
+             *oz   = jitc_var(td->indices[2]),
+             *dx   = jitc_var(td->indices[3]),
+             *dy   = jitc_var(td->indices[4]),
+             *dz   = jitc_var(td->indices[5]),
+             *tmin = jitc_var(td->indices[6]),
+             *tmax = jitc_var(td->indices[7]),
+             *time = jitc_var(td->indices[8]),
+             *rmask = td->indices.size() > 9 ? jitc_var(td->indices[9]) : nullptr;
+
+    VarType ray_vt = (VarType) ox->type;
+    bool is_f64 = (ray_vt == VarType::Float64);
+    jitc_vulkan_require_type(ray_vt);
+
+    const char *zero_bool = jitc_vulkan_require_zero(VarType::Bool);
+    const char *one_bool  = jitc_vulkan_require_one(VarType::Bool);
+    const char *zero_f32  = jitc_vulkan_require_zero(VarType::Float32);
+    const char *zero_ray  = jitc_vulkan_require_zero(ray_vt);
+    const char *inf_ray   = jitc_vulkan_require_inf(ray_vt);
+    const char *zero_u32  = jitc_vulkan_require_zero(VarType::UInt32);
+
+    uint32_t ray_flags_val = 0;
+    if (has_triangles && !has_aabbs)
+        ray_flags_val |= 0x1u; // RayFlagsOpaqueKHR
+    if (shadow)
+        ray_flags_val |= 0x4u; // RayFlagsTerminateOnFirstHitKHR
+    if (cull_backface)
+        ray_flags_val |= 0x10u; // RayFlagsCullBackFacingTrianglesKHR
+
+    jitc_vulkan_require_u32_const(0);
+    jitc_vulkan_require_u32_const(1);
+    jitc_vulkan_require_u32_const(ray_flags_val);
+    if (!rmask)
+        jitc_vulkan_require_u32_const(255);
+
+    fmt_local("%rq_r$u = OpVariable %ptr_fn_RayQuery Function\n", v->reg_index);
+    if (has_aabbs && !shadow) {
+        const char *u32_fn_ptr = jitc_vulkan_require_fn_ptr(VarType::UInt32);
+        fmt_local("%a0_r$u = OpVariable $s Function\n"
+                  "%a1_r$u = OpVariable $s Function\n",
+                  v->reg_index, u32_fn_ptr,
+                  v->reg_index, u32_fn_ptr);
+    }
+
+    bool is_masked = !valid->is_literal() || valid->literal != 1;
+    char before_label[64];
+    memcpy(before_label, current_block_label, sizeof(before_label));
+
+    if (is_masked) {
+        fmt("OpSelectionMerge %trace_done_r$u None\n"
+            "OpBranchConditional $v %trace_then_r$u %trace_done_r$u\n"
+            "%trace_then_r$u = OpLabel\n",
+            v->reg_index,
+            valid, v->reg_index, v->reg_index,
+            v->reg_index);
+        jitc_vulkan_set_label("trace_then", v->reg_index);
+    }
+
+    if (is_f64) {
+        fmt("$v_ox = OpFConvert %f32 $v\n"
+            "$v_oy = OpFConvert %f32 $v\n"
+            "$v_oz = OpFConvert %f32 $v\n"
+            "$v_dx = OpFConvert %f32 $v\n"
+            "$v_dy = OpFConvert %f32 $v\n"
+            "$v_dz = OpFConvert %f32 $v\n"
+            "$v_tmin = OpFConvert %f32 $v\n"
+            "$v_tmax = OpFConvert %f32 $v\n"
+            "$v_time = OpFConvert %f32 $v\n",
+            v, ox, v, oy, v, oz,
+            v, dx, v, dy, v, dz,
+            v, tmin, v, tmax, v, time);
+    } else {
+        fmt("$v_ox = OpCopyObject %f32 $v\n"
+            "$v_oy = OpCopyObject %f32 $v\n"
+            "$v_oz = OpCopyObject %f32 $v\n"
+            "$v_dx = OpCopyObject %f32 $v\n"
+            "$v_dy = OpCopyObject %f32 $v\n"
+            "$v_dz = OpCopyObject %f32 $v\n"
+            "$v_tmin = OpCopyObject %f32 $v\n"
+            "$v_tmax = OpCopyObject %f32 $v\n"
+            "$v_time = OpCopyObject %f32 $v\n",
+            v, ox, v, oy, v, oz,
+            v, dx, v, dy, v, dz,
+            v, tmin, v, tmax, v, time);
+    }
+
+    if (has_aabbs && !shadow) {
+        fmt("OpStore %a0_r$u $s\n"
+            "OpStore %a1_r$u $s\n",
+            v->reg_index, zero_u32,
+            v->reg_index, zero_u32);
+    }
+
+    fmt("$v_as = OpConvertUToAccelerationStructureKHR %AccelStruct $v\n"
+        "$v_org = OpCompositeConstruct %v3_f32 $v_ox $v_oy $v_oz\n"
+        "$v_dir = OpCompositeConstruct %v3_f32 $v_dx $v_dy $v_dz\n",
+        v, accel_h,
+        v, v, v, v,
+        v, v, v, v);
+
+    if (rmask)
+        fmt("OpRayQueryInitializeKHR %rq_r$u $v_as %c_u32_$u $v $v_org $v_tmin $v_dir $v_tmax\n",
+            v->reg_index, v, ray_flags_val, rmask, v, v, v, v);
+    else
+        fmt("OpRayQueryInitializeKHR %rq_r$u $v_as %c_u32_$u %c_u32_255 $v_org $v_tmin $v_dir $v_tmax\n",
+            v->reg_index, v, ray_flags_val, v, v, v, v);
+
+    fmt("OpBranch %rq_hdr_r$u\n"
+        "%rq_hdr_r$u = OpLabel\n"
+        "$v_more = OpRayQueryProceedKHR %bool %rq_r$u\n"
+        "OpLoopMerge %rq_exit_r$u %rq_cont_r$u None\n"
+        "OpBranchConditional $v_more %rq_body_r$u %rq_exit_r$u\n"
+        "%rq_body_r$u = OpLabel\n",
+        v->reg_index,
+        v->reg_index,
+        v, v->reg_index,
+        v->reg_index, v->reg_index,
+        v, v->reg_index, v->reg_index,
+        v->reg_index);
+
+    if (has_aabbs) {
+        const char *u64_psb_ptr = jitc_vulkan_require_psb_ptr(VarType::UInt64);
+        fmt("$v_cand_ty = OpRayQueryGetIntersectionTypeKHR %u32 %rq_r$u %c_u32_0\n"
+            "$v_is_aabb = OpIEqual %bool $v_cand_ty %c_u32_1\n"
+            "OpSelectionMerge %rq_cand_done_r$u None\n"
+            "OpBranchConditional $v_is_aabb %rq_aabb_r$u %rq_tri_cand_r$u\n"
+            "%rq_tri_cand_r$u = OpLabel\n"
+            "OpRayQueryConfirmIntersectionKHR %rq_r$u\n"
+            "OpBranch %rq_cand_done_r$u\n"
+            "%rq_aabb_r$u = OpLabel\n"
+            "$v_sbt_off = OpRayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetKHR %u32 %rq_r$u %c_u32_0\n"
+            "$v_c_geom = OpRayQueryGetIntersectionGeometryIndexKHR %u32 %rq_r$u %c_u32_0\n"
+            "$v_rec_idx = OpIAdd %u32 $v_sbt_off $v_c_geom\n"
+            "$v_c_prim = OpRayQueryGetIntersectionPrimitiveIndexKHR %u32 %rq_r$u %c_u32_0\n"
+            "$v_c_o = OpRayQueryGetIntersectionObjectRayOriginKHR %v3_f32 %rq_r$u %c_u32_0\n"
+            "$v_c_d = OpRayQueryGetIntersectionObjectRayDirectionKHR %v3_f32 %rq_r$u %c_u32_0\n"
+            "$v_c_ox = OpCompositeExtract %f32 $v_c_o 0\n"
+            "$v_c_oy = OpCompositeExtract %f32 $v_c_o 1\n"
+            "$v_c_oz = OpCompositeExtract %f32 $v_c_o 2\n"
+            "$v_c_dx = OpCompositeExtract %f32 $v_c_d 0\n"
+            "$v_c_dy = OpCompositeExtract %f32 $v_c_d 1\n"
+            "$v_c_dz = OpCompositeExtract %f32 $v_c_d 2\n"
+            "$v_c_tmax = OpRayQueryGetIntersectionTKHR %f32 %rq_r$u %c_u32_1\n"
+            "$v_ift_base = OpConvertUToPtr $s $v\n"
+            "$v_ift_ptr = OpPtrAccessChain $s $v_ift_base $v_rec_idx\n"
+            "$v_dptr = OpLoad %u64 $v_ift_ptr Aligned 8\n",
+            v, v->reg_index,
+            v, v,
+            v->reg_index,
+            v, v->reg_index, v->reg_index,
+            v->reg_index,
+            v->reg_index,
+            v->reg_index,
+            v->reg_index,
+            v, v->reg_index,
+            v, v->reg_index,
+            v, v, v,
+            v, v->reg_index,
+            v, v->reg_index,
+            v, v->reg_index,
+            v, v,
+            v, v,
+            v, v,
+            v, v,
+            v, v,
+            v, v,
+            v, v->reg_index,
+            v, u64_psb_ptr, ift_h,
+            v, u64_psb_ptr, v, v,
+            v, v);
+
+        fmt("OpSelectionMerge %rq_sw_merge_r$u None\n"
+            "OpSwitch $v_rec_idx %rq_sw_def_r$u",
+            v->reg_index, v, v->reg_index);
+        for (size_t i = 0; i < scene_bindings.size(); ++i)
+            fmt(" $u %rq_sw_case_$u_r$u",
+                scene_bindings[i]->record_index, (uint32_t) i, v->reg_index);
+        put("\n");
+
+        for (size_t i = 0; i < scene_bindings.size(); ++i) {
+            XXH128_hash_t h = scene_bindings[i]->func->hash[0];
+            fmt("%rq_sw_case_$u_r$u = OpLabel\n"
+                "$v_iret_$u = OpFunctionCall %Tuple_isect_ret %isect_$Q$Q "
+                "$v_dptr $v_c_ox $v_c_oy $v_c_oz $v_c_dx $v_c_dy $v_c_dz "
+                "$v_c_tmax $v_time $v_c_prim\n"
+                "OpBranch %rq_sw_merge_r$u\n",
+                (uint32_t) i, v->reg_index,
+                v, (uint32_t) i, h.high64, h.low64,
+                v, v, v, v, v, v, v,
+                v, v, v,
+                v->reg_index);
+        }
+
+        fmt("%rq_sw_def_r$u = OpLabel\n"
+            "OpBranch %rq_sw_merge_r$u\n"
+            "%rq_sw_merge_r$u = OpLabel\n"
+            "$v_iret = OpPhi %Tuple_isect_ret %c_zero_Tuple_isect_ret %rq_sw_def_r$u",
+            v->reg_index, v->reg_index, v->reg_index, v, v->reg_index);
+        for (size_t i = 0; i < scene_bindings.size(); ++i)
+            fmt(" $v_iret_$u %rq_sw_case_$u_r$u",
+                v, (uint32_t) i, (uint32_t) i, v->reg_index);
+        put("\n");
+
+        fmt("$v_ihit = OpCompositeExtract %bool $v_iret 0\n"
+            "$v_it = OpCompositeExtract %f32 $v_iret 1\n"
+            "$v_ia0 = OpCompositeExtract %u32 $v_iret 2\n"
+            "$v_ia1 = OpCompositeExtract %u32 $v_iret 3\n"
+            "$v_ge_min = OpFOrdGreaterThanEqual %bool $v_it $v_tmin\n"
+            "$v_le_max = OpFOrdLessThanEqual %bool $v_it $v_c_tmax\n"
+            "$v_in_rng = OpLogicalAnd %bool $v_ge_min $v_le_max\n"
+            "$v_take = OpLogicalAnd %bool $v_ihit $v_in_rng\n"
+            "OpSelectionMerge %rq_gen_done_r$u None\n"
+            "OpBranchConditional $v_take %rq_gen_r$u %rq_gen_done_r$u\n"
+            "%rq_gen_r$u = OpLabel\n"
+            "OpRayQueryGenerateIntersectionKHR %rq_r$u $v_it\n",
+            v, v,
+            v, v,
+            v, v,
+            v, v,
+            v, v, v,
+            v, v, v,
+            v, v, v,
+            v, v, v,
+            v->reg_index,
+            v, v->reg_index, v->reg_index,
+            v->reg_index,
+            v->reg_index, v);
+
+        if (!shadow) {
+            fmt("OpStore %a0_r$u $v_ia0\n"
+                "OpStore %a1_r$u $v_ia1\n",
+                v->reg_index, v,
+                v->reg_index, v);
+        }
+
+        fmt("OpBranch %rq_gen_done_r$u\n"
+            "%rq_gen_done_r$u = OpLabel\n"
+            "OpBranch %rq_cand_done_r$u\n"
+            "%rq_cand_done_r$u = OpLabel\n",
+            v->reg_index,
+            v->reg_index,
+            v->reg_index,
+            v->reg_index);
+    }
+
+    fmt("OpBranch %rq_cont_r$u\n"
+        "%rq_cont_r$u = OpLabel\n"
+        "OpBranch %rq_hdr_r$u\n"
+        "%rq_exit_r$u = OpLabel\n",
+        v->reg_index,
+        v->reg_index,
+        v->reg_index,
+        v->reg_index);
+    jitc_vulkan_set_label("rq_exit", v->reg_index);
+
+    fmt("$v_comm = OpRayQueryGetIntersectionTypeKHR %u32 %rq_r$u %c_u32_1\n"
+        "$v_hit = OpINotEqual %bool $v_comm %c_u32_0\n"
+        "OpSelectionMerge %rq_after_hit_r$u None\n"
+        "OpBranchConditional $v_hit %rq_hit_r$u %rq_after_hit_r$u\n"
+        "%rq_hit_r$u = OpLabel\n",
+        v, v->reg_index,
+        v, v,
+        v->reg_index,
+        v, v->reg_index, v->reg_index,
+        v->reg_index);
+
+    if (shadow) {
+        fmt("$v_h_uid = OpRayQueryGetIntersectionInstanceCustomIndexKHR %u32 %rq_r$u %c_u32_1\n"
+            "OpBranch %rq_after_hit_r$u\n"
+            "%rq_after_hit_r$u = OpLabel\n"
+            "$v_m_uid = OpPhi %u32 $v_h_uid %rq_hit_r$u $s %rq_exit_r$u\n",
+            v, v->reg_index,
+            v->reg_index,
+            v->reg_index,
+            v, v, v->reg_index, zero_u32, v->reg_index);
+        jitc_vulkan_set_label("rq_after_hit", v->reg_index);
+
+        fmt("$v_out_1 = OpCopyObject $t $s\n"
+            "$v_out_2 = OpCopyObject $t $s\n"
+            "$v_out_3 = OpCopyObject $t $s\n"
+            "$v_out_4 = OpCopyObject %u32 $s\n"
+            "$v_out_5 = OpCopyObject %u32 $s\n"
+            "$v_out_6 = OpCopyObject %u32 $s\n",
+            v, ox, inf_ray,
+            v, ox, zero_ray,
+            v, ox, zero_ray,
+            v, zero_u32,
+            v, zero_u32,
+            v, zero_u32);
+
+        if (is_masked) {
+            fmt("OpBranch %trace_done_r$u\n"
+                "%trace_done_r$u = OpLabel\n"
+                "$v_out_0 = OpPhi %bool $v_hit %rq_after_hit_r$u $s $s\n"
+                "$v_out_7 = OpPhi %u32 $v_m_uid %rq_after_hit_r$u $s $s\n",
+                v->reg_index,
+                v->reg_index,
+                v, v, v->reg_index, zero_bool, before_label,
+                v, v, v->reg_index, zero_u32, before_label);
+            jitc_vulkan_set_label("trace_done", v->reg_index);
+        } else {
+            fmt("$v_out_0 = OpCopyObject %bool $v_hit\n"
+                "$v_out_7 = OpCopyObject %u32 $v_m_uid\n",
+                v, v,
+                v, v);
+        }
+        (void) one_bool;
+        return;
+    }
+
+    fmt("$v_ht_f32 = OpRayQueryGetIntersectionTKHR %f32 %rq_r$u %c_u32_1\n"
+        "$v_h_iid = OpRayQueryGetIntersectionInstanceIdKHR %u32 %rq_r$u %c_u32_1\n"
+        "$v_h_pid = OpRayQueryGetIntersectionPrimitiveIndexKHR %u32 %rq_r$u %c_u32_1\n"
+        "$v_h_gid = OpRayQueryGetIntersectionGeometryIndexKHR %u32 %rq_r$u %c_u32_1\n"
+        "$v_h_uid = OpRayQueryGetIntersectionInstanceCustomIndexKHR %u32 %rq_r$u %c_u32_1\n",
+        v, v->reg_index,
+        v, v->reg_index,
+        v, v->reg_index,
+        v, v->reg_index,
+        v, v->reg_index);
+
+    const char *hit_end_prefix = "rq_hit";
+    if (has_triangles && !has_aabbs) {
+        fmt("$v_bary = OpRayQueryGetIntersectionBarycentricsKHR %v2_f32 %rq_r$u %c_u32_1\n"
+            "$v_hu_f32 = OpCompositeExtract %f32 $v_bary 0\n"
+            "$v_hv_f32 = OpCompositeExtract %f32 $v_bary 1\n",
+            v, v->reg_index,
+            v, v,
+            v, v);
+    } else if (!has_triangles && has_aabbs) {
+        fmt("$v_au_u32 = OpLoad %u32 %a0_r$u\n"
+            "$v_av_u32 = OpLoad %u32 %a1_r$u\n"
+            "$v_hu_f32 = OpBitcast %f32 $v_au_u32\n"
+            "$v_hv_f32 = OpBitcast %f32 $v_av_u32\n",
+            v, v->reg_index,
+            v, v->reg_index,
+            v, v,
+            v, v);
+    } else if (has_triangles && has_aabbs) {
+        fmt("$v_is_tri = OpIEqual %bool $v_comm %c_u32_1\n"
+            "OpSelectionMerge %rq_uv_merge_r$u None\n"
+            "OpBranchConditional $v_is_tri %rq_tri_uv_r$u %rq_aabb_uv_r$u\n"
+            "%rq_tri_uv_r$u = OpLabel\n"
+            "$v_bary = OpRayQueryGetIntersectionBarycentricsKHR %v2_f32 %rq_r$u %c_u32_1\n"
+            "$v_tu_f32 = OpCompositeExtract %f32 $v_bary 0\n"
+            "$v_tv_f32 = OpCompositeExtract %f32 $v_bary 1\n"
+            "OpBranch %rq_uv_merge_r$u\n"
+            "%rq_aabb_uv_r$u = OpLabel\n"
+            "$v_au_u32 = OpLoad %u32 %a0_r$u\n"
+            "$v_av_u32 = OpLoad %u32 %a1_r$u\n"
+            "$v_au_f32 = OpBitcast %f32 $v_au_u32\n"
+            "$v_av_f32 = OpBitcast %f32 $v_av_u32\n"
+            "OpBranch %rq_uv_merge_r$u\n"
+            "%rq_uv_merge_r$u = OpLabel\n"
+            "$v_hu_f32 = OpPhi %f32 $v_tu_f32 %rq_tri_uv_r$u $v_au_f32 %rq_aabb_uv_r$u\n"
+            "$v_hv_f32 = OpPhi %f32 $v_tv_f32 %rq_tri_uv_r$u $v_av_f32 %rq_aabb_uv_r$u\n",
+            v, v,
+            v->reg_index,
+            v, v->reg_index, v->reg_index,
+            v->reg_index,
+            v, v->reg_index,
+            v, v,
+            v, v,
+            v->reg_index,
+            v->reg_index,
+            v, v->reg_index,
+            v, v->reg_index,
+            v, v,
+            v, v,
+            v->reg_index,
+            v->reg_index,
+            v, v, v->reg_index, v, v->reg_index,
+            v, v, v->reg_index, v, v->reg_index);
+        hit_end_prefix = "rq_uv_merge";
+    } else {
+        fmt("$v_hu_f32 = OpCopyObject %f32 $s\n"
+            "$v_hv_f32 = OpCopyObject %f32 $s\n",
+            v, zero_f32,
+            v, zero_f32);
+    }
+
+    if (is_f64) {
+        fmt("$v_ht = OpFConvert %f64 $v_ht_f32\n"
+            "$v_hu = OpFConvert %f64 $v_hu_f32\n"
+            "$v_hv = OpFConvert %f64 $v_hv_f32\n",
+            v, v,
+            v, v,
+            v, v);
+    } else {
+        fmt("$v_ht = OpCopyObject %f32 $v_ht_f32\n"
+            "$v_hu = OpCopyObject %f32 $v_hu_f32\n"
+            "$v_hv = OpCopyObject %f32 $v_hv_f32\n",
+            v, v,
+            v, v,
+            v, v);
+    }
+
+    fmt("OpBranch %rq_after_hit_r$u\n"
+        "%rq_after_hit_r$u = OpLabel\n"
+        "$v_m_t = OpPhi $t $v_ht %$s_r$u $s %rq_exit_r$u\n"
+        "$v_m_u = OpPhi $t $v_hu %$s_r$u $s %rq_exit_r$u\n"
+        "$v_m_v = OpPhi $t $v_hv %$s_r$u $s %rq_exit_r$u\n"
+        "$v_m_iid = OpPhi %u32 $v_h_iid %$s_r$u $s %rq_exit_r$u\n"
+        "$v_m_pid = OpPhi %u32 $v_h_pid %$s_r$u $s %rq_exit_r$u\n"
+        "$v_m_gid = OpPhi %u32 $v_h_gid %$s_r$u $s %rq_exit_r$u\n"
+        "$v_m_uid = OpPhi %u32 $v_h_uid %$s_r$u $s %rq_exit_r$u\n",
+        v->reg_index,
+        v->reg_index,
+        v, ox, v, hit_end_prefix, v->reg_index, inf_ray, v->reg_index,
+        v, ox, v, hit_end_prefix, v->reg_index, zero_ray, v->reg_index,
+        v, ox, v, hit_end_prefix, v->reg_index, zero_ray, v->reg_index,
+        v, v, hit_end_prefix, v->reg_index, zero_u32, v->reg_index,
+        v, v, hit_end_prefix, v->reg_index, zero_u32, v->reg_index,
+        v, v, hit_end_prefix, v->reg_index, zero_u32, v->reg_index,
+        v, v, hit_end_prefix, v->reg_index, zero_u32, v->reg_index);
+    jitc_vulkan_set_label("rq_after_hit", v->reg_index);
+
+    if (is_masked) {
+        fmt("OpBranch %trace_done_r$u\n"
+            "%trace_done_r$u = OpLabel\n"
+            "$v_out_0 = OpPhi %bool $v_hit %rq_after_hit_r$u $s $s\n"
+            "$v_out_1 = OpPhi $t $v_m_t %rq_after_hit_r$u $s $s\n"
+            "$v_out_2 = OpPhi $t $v_m_u %rq_after_hit_r$u $s $s\n"
+            "$v_out_3 = OpPhi $t $v_m_v %rq_after_hit_r$u $s $s\n"
+            "$v_out_4 = OpPhi %u32 $v_m_iid %rq_after_hit_r$u $s $s\n"
+            "$v_out_5 = OpPhi %u32 $v_m_pid %rq_after_hit_r$u $s $s\n"
+            "$v_out_6 = OpPhi %u32 $v_m_gid %rq_after_hit_r$u $s $s\n"
+            "$v_out_7 = OpPhi %u32 $v_m_uid %rq_after_hit_r$u $s $s\n",
+            v->reg_index,
+            v->reg_index,
+            v, v, v->reg_index, zero_bool, before_label,
+            v, ox, v, v->reg_index, inf_ray, before_label,
+            v, ox, v, v->reg_index, zero_ray, before_label,
+            v, ox, v, v->reg_index, zero_ray, before_label,
+            v, v, v->reg_index, zero_u32, before_label,
+            v, v, v->reg_index, zero_u32, before_label,
+            v, v, v->reg_index, zero_u32, before_label,
+            v, v, v->reg_index, zero_u32, before_label);
+        jitc_vulkan_set_label("trace_done", v->reg_index);
+    } else {
+        fmt("$v_out_0 = OpCopyObject %bool $v_hit\n"
+            "$v_out_1 = OpCopyObject $t $v_m_t\n"
+            "$v_out_2 = OpCopyObject $t $v_m_u\n"
+            "$v_out_3 = OpCopyObject $t $v_m_v\n"
+            "$v_out_4 = OpCopyObject %u32 $v_m_iid\n"
+            "$v_out_5 = OpCopyObject %u32 $v_m_pid\n"
+            "$v_out_6 = OpCopyObject %u32 $v_m_gid\n"
+            "$v_out_7 = OpCopyObject %u32 $v_m_uid\n",
+            v, v,
+            v, ox, v,
+            v, ox, v,
+            v, ox, v,
+            v, v,
+            v, v,
+            v, v,
+            v, v);
+    }
 }
 
 void jitc_var_call_getter_assemble_vulkan(Variable *v, const Variable *index,

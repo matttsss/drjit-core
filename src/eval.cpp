@@ -1359,7 +1359,10 @@ XXH128_hash_t jitc_assemble_func(const CallData *call, uint32_t inst,
 
 #if defined(DRJIT_ENABLE_VULKAN)
         case JitBackend::Vulkan:
-            jitc_vulkan_assemble_func(call, inst);
+            if (call->isect)
+                jitc_vulkan_assemble_isect(call);
+            else
+                jitc_vulkan_assemble_func(call, inst);
             break;
 #endif
 

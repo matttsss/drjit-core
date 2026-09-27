@@ -835,10 +835,8 @@ TEST_VULKAN(15_errors) {
         jit_var_dec_ref(idx);
     }
 
-    // Events and frozen functions are unsupported
+    // Events are unsupported
     jit_assert(raises([&] { jit_event_create(Backend, 0); },
-                      "not supported by the Vulkan backend"));
-    jit_assert(raises([&] { jit_freeze_start(Backend, nullptr, 0); },
                       "not supported by the Vulkan backend"));
 
     // Operations that are not implemented yet or receive invalid arguments

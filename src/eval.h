@@ -176,6 +176,9 @@ extern void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
 /// Used by jitc_call() to generate SPIR-V source code for callables
 extern void jitc_vulkan_assemble_func(const CallData *call, uint32_t inst);
 
+/// Generate the SPIR-V of an intersection function
+extern void jitc_vulkan_assemble_isect(const CallData *call);
+
 /// Reset per-kernel Vulkan assembly state at the start of jitc_assemble()
 extern void jitc_vulkan_assemble_reset();
 

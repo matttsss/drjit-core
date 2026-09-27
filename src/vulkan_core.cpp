@@ -10,6 +10,8 @@
 
 #include "vulkan.h"
 #include "vulkan_ts.h"
+#include "var.h"
+#include "trace.h"
 #include "io.h"
 #include "unit.h"
 #include "util.h"
@@ -122,13 +124,19 @@ VulkanBuffer *vulkan_buffer_new(const VulkanDevice &dev, size_t size,
 
     VkDevice device = (VkDevice) dev.device;
 
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                               VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    if (dev.supports_accel) {
+        usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+                 VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR;
+    }
+
     VkBufferCreateInfo buffer_info {};
     buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     buffer_info.size = size;
-    buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                        VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    buffer_info.usage = usage;
     buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -209,10 +217,7 @@ VulkanBuffer *vulkan_buffer_new(const VulkanDevice &dev, size_t size,
         sparse_info.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT |
                             VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT;
         sparse_info.size = size;
-        sparse_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                            VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        sparse_info.usage = usage;
         sparse_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
         if (vkCreateBuffer(device, &sparse_info, nullptr, &buffer) !=
@@ -963,15 +968,22 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
     VkPhysicalDeviceVulkan12Features features12 {};
     VkPhysicalDeviceVulkan13Features features13 {};
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomic_float {};
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR accel {};
+    VkPhysicalDeviceRayQueryFeaturesKHR ray_query {};
     features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
     features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     atomic_float.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
+    accel.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+    ray_query.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
     features.pNext = &features11;
     features11.pNext = &features12;
     features12.pNext = &features13;
+    void **next = &features13.pNext;
 
     const VkPhysicalDeviceFeatures &f = info.features.features;
     const VkPhysicalDeviceVulkan11Features &f11 = info.features11;
@@ -1001,7 +1013,7 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
     features13.maintenance4 = VK_TRUE;
     features13.synchronization2 = info.features13.synchronization2;
 
-    const char *extensions[2] = { };
+    const char *extensions[8] = { };
     uint32_t n_extensions = 0;
 
     // Non-conformant implementations (e.g. MoltenVK) require this extension
@@ -1019,7 +1031,31 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
         atomic_float.shaderBufferFloat64Atomics = faf.shaderBufferFloat64Atomics;
         atomic_float.shaderBufferFloat64AtomicAdd =
             faf.shaderBufferFloat64AtomicAdd;
-        features13.pNext = &atomic_float;
+        *next = &atomic_float;
+        next = &atomic_float.pNext;
+    }
+
+    bool supports_accel = jitc_vulkan_has_accel_api && info.has_accel &&
+                          info.has_deferred_host_operations &&
+                          info.accel.accelerationStructure;
+    bool supports_ray_query =
+        supports_accel && info.has_ray_query && info.ray_query.rayQuery;
+
+    if (supports_accel) {
+        extensions[n_extensions++] =
+            VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME;
+        extensions[n_extensions++] =
+            VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME;
+        accel.accelerationStructure = VK_TRUE;
+        *next = &accel;
+        next = &accel.pNext;
+    }
+
+    if (supports_ray_query) {
+        extensions[n_extensions++] = VK_KHR_RAY_QUERY_EXTENSION_NAME;
+        ray_query.rayQuery = VK_TRUE;
+        *next = &ray_query;
+        next = &ray_query.pNext;
     }
 
     VkDeviceCreateInfo device_info {};
@@ -1187,11 +1223,8 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
     dev.shader_float64_atomic_add =
         atomic_float_add && faf.shaderBufferFloat64AtomicAdd;
     dev.vulkan_memory_model = f12.vulkanMemoryModel;
-    dev.supports_accel = jitc_vulkan_has_accel_api && info.has_accel &&
-                         info.has_deferred_host_operations &&
-                         info.accel.accelerationStructure;
-    dev.supports_ray_query =
-        dev.supports_accel && info.has_ray_query && info.ray_query.rayQuery;
+    dev.supports_accel = supports_accel;
+    dev.supports_ray_query = supports_ray_query;
     dev.name = strdup(info.props.deviceName);
 
     state.vulkan_devices.push_back(dev);
@@ -1591,3 +1624,223 @@ void jitc_vulkan_shutdown() {
 ThreadState *jitc_vulkan_thread_state_new() {
     return new VulkanThreadState();
 }
+
+// ====================================================================
+//                        Ray tracing scene & queries
+// ====================================================================
+
+static uint32_t jitc_vulkan_make_resource_handle(void *ptr, ResourceKind kind) {
+    if (!ptr)
+        return 0;
+    uint32_t backing = jitc_var_mem_map(JitBackend::Vulkan, VarType::UInt64,
+                                        ptr, 1, /*free=*/0);
+    uint32_t handle = jitc_var_resource_pointer(backing, kind);
+    jitc_var_dec_ref(backing);
+    return handle;
+}
+
+static uint32_t jitc_vulkan_scene_resource_handle(VulkanScene *scene,
+                                                  ResourceKind kind) {
+    if (!scene)
+        return 0;
+    uint32_t &slot = (kind == ResourceKind::IFT) ? scene->ift_handle
+                                                 : scene->owner_handle;
+    if (!slot)
+        slot = jitc_vulkan_make_resource_handle(scene, kind);
+    jitc_var_inc_ref(slot);
+    return slot;
+}
+
+uint32_t jitc_vulkan_configure_scene(void *tlas_ptr,
+                                     uint32_t n_isect_entries,
+                                     uint32_t geometry_types_mask) {
+    if (!tlas_ptr)
+        jitc_raise("jit_vulkan_configure_scene(): 'tlas' must not be NULL.");
+
+    ThreadState *ts = thread_state(JitBackend::Vulkan);
+    VulkanDevice &dev = state.vulkan_devices[ts->device];
+    if (!dev.supports_ray_query)
+        jitc_raise("jit_vulkan_configure_scene(): the active Vulkan device "
+                   "does not support ray queries.");
+
+    VkAccelerationStructureDeviceAddressInfoKHR addr_info {};
+    addr_info.sType =
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
+    addr_info.accelerationStructure = (VkAccelerationStructureKHR) tlas_ptr;
+    VkDeviceAddress tlas_addr = vkGetAccelerationStructureDeviceAddressKHR(
+        (VkDevice) dev.device, &addr_info);
+    if (!tlas_addr)
+        jitc_raise("jit_vulkan_configure_scene(): failed to query the "
+                   "device address of the TLAS.");
+
+    VulkanScene *scene = new VulkanScene();
+    scene->device_id = ts->device;
+    scene->device = (VkDevice) dev.device;
+    scene->tlas = (VkAccelerationStructureKHR) tlas_ptr;
+    scene->tlas_address = (uint64_t) tlas_addr;
+    scene->isect_count = n_isect_entries;
+    scene->geometry_types_mask = geometry_types_mask;
+
+    if (n_isect_entries > 0) {
+        size_t table_bytes = (size_t) n_isect_entries * sizeof(uint64_t);
+        scene->isect_table =
+            jitc_malloc(JitBackend::Vulkan, table_bytes, /*shared=*/true);
+        memset(scene->isect_table, 0, table_bytes);
+        size_t offset = 0;
+        VulkanBuffer *buf = jitc_vulkan_find_buffer(scene->isect_table, &offset);
+        if (!buf)
+            jitc_fail("jit_vulkan_configure_scene(): could not resolve buffer "
+                      "for isect_table.");
+        scene->isect_table_address = (uint64_t) buf->address + offset;
+    }
+
+    uint32_t index =
+        jitc_var_new_node_0(JitBackend::Vulkan, VarKind::Nop,
+                            VarType::Void, 1, 0, (uintptr_t) scene);
+
+    auto callback = [](uint32_t /*index*/, int free, void *ptr) {
+        if (!free)
+            return;
+        auto *s = (VulkanScene *) ptr;
+        jitc_log(InfoSym, "jit_vulkan_configure_scene(): freeing VulkanScene "
+                          "(n_isect=%u)", s->isect_count);
+
+        if (s->owner_handle)
+            jitc_var_dec_ref(s->owner_handle);
+        if (s->ift_handle)
+            jitc_var_dec_ref(s->ift_handle);
+        if (s->isect_table)
+            jitc_free(s->isect_table);
+
+        if (s->cleanup_callback) {
+            unlock_guard guard(state.lock);
+            s->cleanup_callback(s->cleanup_payload);
+        }
+
+        delete s;
+    };
+
+    jitc_var_set_callback(index, callback, scene, true);
+    return index;
+}
+
+VulkanScene *jitc_vulkan_get_scene(uint32_t scene_index) {
+    Variable *v = scene_index ? jitc_var(scene_index) : nullptr;
+    if (!v || (VarKind) v->kind != VarKind::Nop ||
+        (VarType) v->type != VarType::Void)
+        jitc_fail("jitc_vulkan_get_scene(): r%u does not wrap a Vulkan scene.",
+                  scene_index);
+    return (VulkanScene *) v->literal;
+}
+
+uint32_t jitc_vulkan_scene_owner_handle(uint32_t scene_index) {
+    VulkanScene *scene = jitc_vulkan_get_scene(scene_index);
+    return jitc_var_mem_map(JitBackend::Vulkan, VarType::UInt64,
+                            (void *) scene, 1, /*free=*/0);
+}
+
+void jitc_vulkan_ray_trace(uint32_t n_args, uint32_t *args,
+                           uint32_t mask, uint32_t *out,
+                           uint32_t n_out, uint32_t scene, int shadow) {
+    if (n_args != 9 && n_args != 10)
+        jitc_raise("jit_vulkan_ray_trace(): expected 9 or 10 ray arguments, "
+                   "got %u.", n_args);
+    if (n_args == 10 && jitc_var_type(args[9]) != VarType::UInt32)
+        jitc_raise("jit_vulkan_ray_trace(): the ray visibility mask "
+                   "(argument 10) must be of type UInt32.");
+    if (n_out != 8)
+        jitc_raise("jit_vulkan_ray_trace(): expected 8 outputs, got %u.",
+                   n_out);
+    if (!scene)
+        jitc_raise("jit_vulkan_ray_trace(): a valid scene_index "
+                   "(returned by jit_vulkan_configure_scene) is required.");
+
+    if (jitc_var_type(scene) != VarType::Void)
+        jitc_raise("jit_vulkan_ray_trace(): type mismatch for scene argument!");
+
+    VarType vt = jitc_var_type(args[0]);
+    if (vt != VarType::Float32 && vt != VarType::Float64)
+        jitc_raise("jit_vulkan_ray_trace(): ray origin/direction/distance "
+                   "arguments must be of type Float32 or Float64.");
+    for (uint32_t i = 1; i < 9; ++i) {
+        if (jitc_var_type(args[i]) != vt)
+            jitc_raise("jit_vulkan_ray_trace(): ray arguments 0..8 must all "
+                       "have the same floating-point type.");
+    }
+
+    uint32_t size = 0;
+    bool symbolic = false;
+    for (uint32_t i = 0; i < n_args; ++i) {
+        const Variable *vi = jitc_var(args[i]);
+        size = std::max(size, vi->size);
+        symbolic |= (bool) vi->symbolic;
+    }
+    {
+        const Variable *vm = jitc_var(mask);
+        size = std::max(size, vm->size);
+        symbolic |= (bool) vm->symbolic;
+    }
+    if (size == 0)
+        size = 1;
+
+    // Apply mask stack
+    Ref valid = steal(jitc_var_mask_apply(mask, size));
+
+    // Build TraceData with ray parameter indices
+    TraceData *td = new TraceData();
+    td->shadow = shadow != 0;
+    td->indices.reserve(n_args);
+    for (uint32_t i = 0; i < n_args; ++i) {
+        td->indices.push_back(args[i]);
+        jitc_var_inc_ref(args[i]);
+    }
+
+    // Build acceleration-structure and intersection-function-table handles.
+    // The scene reference in dep[1] keeps VulkanScene alive.
+    VulkanScene *scene_obj = jitc_vulkan_get_scene(scene);
+    Ref accel_h = steal(jitc_vulkan_scene_resource_handle(scene_obj,
+                                                          ResourceKind::Accel));
+    Ref ift_h = steal(jitc_vulkan_scene_resource_handle(
+        scene_obj->isect_count ? scene_obj : nullptr, ResourceKind::IFT));
+
+    // dep[0]=valid, dep[1]=scene, dep[2]=accel handle, dep[3]=IFT.
+    Ref trace;
+    if (ift_h)
+        trace = steal(jitc_var_new_node_4(
+            JitBackend::Vulkan, VarKind::TraceRay, VarType::Void, size, symbolic,
+            valid, jitc_var(valid), scene, jitc_var(scene),
+            accel_h, jitc_var(accel_h), ift_h, jitc_var(ift_h),
+            (uintptr_t) td));
+    else
+        trace = steal(jitc_var_new_node_3(
+            JitBackend::Vulkan, VarKind::TraceRay, VarType::Void, size, symbolic,
+            valid, jitc_var(valid), scene, jitc_var(scene),
+            accel_h, jitc_var(accel_h), (uintptr_t) td));
+
+    // Register cleanup callback
+    jitc_var_set_callback(
+        trace,
+        [](uint32_t, int free, void *ptr) {
+            if (free)
+                delete (TraceData *) ptr;
+        },
+        td, true);
+
+    // Create Extract children for each output
+    VarType out_types[8] = {
+        VarType::Bool,   // valid
+        vt,              // distance
+        vt,              // bary_u
+        vt,              // bary_v
+        VarType::UInt32, // instance_id (raw TLAS instance index)
+        VarType::UInt32, // primitive_id
+        VarType::UInt32, // geometry_id
+        VarType::UInt32  // user-provided instance ID
+    };
+
+    for (uint32_t i = 0; i < 8; ++i)
+        out[i] = jitc_var_new_node_1(
+            JitBackend::Vulkan, VarKind::Extract, out_types[i],
+            size, symbolic, trace, jitc_var(trace), (uint64_t) i);
+}
+

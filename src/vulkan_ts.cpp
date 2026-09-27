@@ -394,6 +394,27 @@ Task *VulkanThreadState::launch(Kernel kernel, KernelKey & /*key*/,
 
     VulkanDevice &dev = vulkan_device(this);
     size_t n_params = kernel_params.size();
+    const KernelParamInfo *info = kernel.param_info;
+    if (info) {
+        for (size_t i = 1; i < n_params; ++i) {
+            void *owner = kernel_params[i];
+            if (!owner)
+                continue;
+            switch ((ResourceKind) info[i].kind) {
+                case ResourceKind::Accel:
+                    kernel_params[i] =
+                        (void *) (uintptr_t) ((VulkanScene *) owner)->tlas_address;
+                    break;
+                case ResourceKind::IFT:
+                    kernel_params[i] =
+                        (void *) (uintptr_t) ((VulkanScene *) owner)->isect_table_address;
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
     size_t params_bytes = n_params * sizeof(void *);
     bool params_in_pc = params_bytes <= dev.max_push_constants_size;
 
@@ -1194,11 +1215,23 @@ void VulkanThreadState::aggregate(void *dst, AggregationEntry *agg,
             if (e.size <= 0)
                 continue;
             uintptr_t val = (uintptr_t) e.src;
-            if (e.size == 8 &&
-                (ResourceKind) e.resource_kind == ResourceKind::Buffer && val) {
-                size_t off = 0;
-                if (VulkanBuffer *b = jitc_vulkan_find_buffer(e.src, &off))
-                    val = (uintptr_t) (b->address + off);
+            if (e.size == 8 && val) {
+                switch ((ResourceKind) e.resource_kind) {
+                    case ResourceKind::Buffer: {
+                        size_t off = 0;
+                        if (VulkanBuffer *b = jitc_vulkan_find_buffer(e.src, &off))
+                            val = (uintptr_t) (b->address + off);
+                        break;
+                    }
+                    case ResourceKind::Accel:
+                        val = (uintptr_t) ((VulkanScene *) e.src)->tlas_address;
+                        break;
+                    case ResourceKind::IFT:
+                        val = (uintptr_t) ((VulkanScene *) e.src)->isect_table_address;
+                        break;
+                    default:
+                        break;
+                }
             }
             switch (e.size) {
                 case 1: {

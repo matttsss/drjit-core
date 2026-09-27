@@ -27,6 +27,10 @@
 #if defined(DRJIT_ENABLE_METAL)
 #  include "metal.h"
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+#  include "vulkan.h"
+#  include "vulkan_eval.h"
+#endif
 
 std::vector<JitIsectBindingExt *> isect_bindings;
 bool isect_motion = false;
@@ -137,6 +141,10 @@ static XXH128_hash_t jitc_isect_hash(IsectFunc *f, bool motion) {
     ScopedAllocaBackup alloca_backup;
     jitc_unit_reset();
     buffer.clear();
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (f->call->backend == JitBackend::Vulkan)
+        jitc_vulkan_assemble_reset();
+#endif
 
     struct ScopedOptixFlag {
         bool backup = uses_optix;
@@ -313,7 +321,7 @@ JitIsectBinding *jitc_isect_bind(uint32_t func, uintptr_t scene,
     JitBackend backend = f->call->backend;
 
     // On the GPU backends, the key is the variable that the trace operations
-    // reference (the shader binding table on CUDA, the scene on Metal)
+    // reference (the shader binding table on CUDA, the scene on Metal/Vulkan)
     uint32_t scene_var = 0;
     bool motion = false;
     if (backend == JitBackend::CUDA) {
@@ -338,6 +346,16 @@ JitIsectBinding *jitc_isect_bind(uint32_t func, uintptr_t scene,
         motion = (s->geometry_types_mask & 0x10u) != 0;
         if (motion && !f->hash[1].low64 && !f->hash[1].high64)
             f->hash[1] = jitc_isect_hash(f, true);
+    }
+#endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    else if (backend == JitBackend::Vulkan) {
+        VulkanScene *s = jitc_vulkan_get_scene((uint32_t) scene);
+        if (record_index >= s->isect_count)
+            jitc_raise("jit_isect_bind(): table entry %u is out of bounds "
+                       "(the scene has %u entries)!", record_index,
+                       s->isect_count);
+        scene = (uintptr_t) s;
     }
 #endif
 
@@ -368,6 +386,13 @@ JitIsectBinding *jitc_isect_bind(uint32_t func, uintptr_t scene,
         MetalScene *s = (MetalScene *) scene;
         s->isect_table[record_index] = (uint64_t) (uintptr_t) b->record.data;
         jitc_metal_scene_release_ifts(s);
+    }
+#endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (backend == JitBackend::Vulkan) {
+        VulkanScene *s = (VulkanScene *) scene;
+        ((uint64_t *) s->isect_table)[record_index] =
+            (uint64_t) (uintptr_t) b->record.data;
     }
 #endif
 

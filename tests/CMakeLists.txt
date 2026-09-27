@@ -132,6 +132,23 @@ if (DRJIT_ENABLE_METAL)
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
+if (DRJIT_ENABLE_VULKAN)
+  # Vulkan analog of the OptiX/Metal `triangle` test (VK_KHR_acceleration_structure & VK_KHR_ray_query).
+  add_executable(vulkan_triangle vulkan_triangle.cpp)
+  set_property(TARGET vulkan_triangle PROPERTY CXX_STANDARD 17)
+  target_link_libraries(vulkan_triangle PRIVATE drjit-core)
+  target_include_directories(vulkan_triangle PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+  target_compile_definitions(vulkan_triangle PRIVATE -DDRJIT_ENABLE_VULKAN=1)
+  if (DRJIT_DYNAMIC_VULKAN)
+    target_compile_definitions(vulkan_triangle PRIVATE -DDRJIT_DYNAMIC_VULKAN=1)
+  else()
+    target_include_directories(vulkan_triangle PRIVATE ${DRJIT_VULKAN_INCLUDE_DIR})
+  endif()
+  add_test(NAME vulkan_triangle COMMAND vulkan_triangle
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
+
 add_executable(microbenchmark microbenchmark.cpp)
 set_property(TARGET microbenchmark PROPERTY CXX_STANDARD 17)
 target_link_libraries(microbenchmark PRIVATE drjit-core)
