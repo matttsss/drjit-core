@@ -230,6 +230,8 @@ if (DRJIT_ENABLE_VULKAN)
     src/vulkan_eval.cpp
     src/vulkan_ts.h
     src/vulkan_ts.cpp
+    src/vulkan_tex.h
+    src/vulkan_tex.cpp
     resources/vulkan_kernels.h
     ${CMAKE_CURRENT_BINARY_DIR}/resources/vulkan_kernels.c)
 endif()

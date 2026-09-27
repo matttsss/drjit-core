@@ -314,6 +314,20 @@ static void pack_vulkan(void) {
     add_vulkan_kernel(&specs, &count, &cap, "reduce_dot_f64",
                       "-DKERNEL_REDUCE_DOT -DTYPE_F64");
 
+    // Texture channel deinterleave & interleave
+    add_vulkan_kernel(&specs, &count, &cap, "deinterleave_u8",
+                      "-DKERNEL_DEINTERLEAVE -DTYPE_U8");
+    add_vulkan_kernel(&specs, &count, &cap, "deinterleave_u16",
+                      "-DKERNEL_DEINTERLEAVE -DTYPE_U16");
+    add_vulkan_kernel(&specs, &count, &cap, "deinterleave_u32",
+                      "-DKERNEL_DEINTERLEAVE -DTYPE_U32");
+    add_vulkan_kernel(&specs, &count, &cap, "interleave_u8",
+                      "-DKERNEL_INTERLEAVE -DTYPE_U8");
+    add_vulkan_kernel(&specs, &count, &cap, "interleave_u16",
+                      "-DKERNEL_INTERLEAVE -DTYPE_U16");
+    add_vulkan_kernel(&specs, &count, &cap, "interleave_u32",
+                      "-DKERNEL_INTERLEAVE -DTYPE_U32");
+
     size_t blob_cap = 512 * 1024, blob_pos = 0;
     char *blob = malloc(blob_cap);
     size_t *offsets = malloc(count * sizeof(size_t));

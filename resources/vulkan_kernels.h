@@ -14,8 +14,8 @@ extern "C" {
 #endif
 
 extern const char vulkan_kernels[];
-static const size_t vulkan_kernels_size_uncompressed = 823416;
-static const size_t vulkan_kernels_size_compressed = 123898;
+static const size_t vulkan_kernels_size_uncompressed = 842356;
+static const size_t vulkan_kernels_size_compressed = 125449;
 
 static const unsigned int vulkan_kernels_offsets[] = {
     0, 2916, 5300, 8104, 11920, 21564, 31828, 36260,
@@ -34,7 +34,7 @@ static const unsigned int vulkan_kernels_offsets[] = {
     656216, 660436, 666996, 671048, 681224, 685580, 692276, 696464,
     706808, 711216, 717964, 722200, 728776, 732844, 743036, 747392,
     754088, 758276, 768620, 775392, 782164, 788896, 793056, 803340,
-    810124, 816764,
+    810124, 816764, 823416, 826676, 829936, 833096, 836208, 839320,
 };
 
 static const unsigned int vulkan_kernels_sizes[] = {
@@ -54,7 +54,7 @@ static const unsigned int vulkan_kernels_sizes[] = {
     4220, 6560, 4052, 10176, 4356, 6696, 4188, 10344,
     4408, 6748, 4236, 6576, 4068, 10192, 4356, 6696,
     4188, 10344, 6772, 6772, 6732, 4160, 10284, 6784,
-    6640, 6652,
+    6640, 6652, 3260, 3260, 3160, 3112, 3112, 3036,
 };
 
 static const char *vulkan_kernels_list =
@@ -187,7 +187,13 @@ static const char *vulkan_kernels_list =
     "block_prefix_reduce_add_u8,"
     "reduce_dot_f16,"
     "reduce_dot_f32,"
-    "reduce_dot_f64,";
+    "reduce_dot_f64,"
+    "deinterleave_u8,"
+    "deinterleave_u16,"
+    "deinterleave_u32,"
+    "interleave_u8,"
+    "interleave_u16,"
+    "interleave_u32,";
 
 #ifdef __cplusplus
 }

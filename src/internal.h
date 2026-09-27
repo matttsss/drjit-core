@@ -793,6 +793,12 @@ enum class VulkanKernel : uint32_t {
     MkpermDetectOffsets,
     MkpermPhase1Tiny,
     MkpermPhase4Tiny,
+    DeinterleaveU8,
+    DeinterleaveU16,
+    DeinterleaveU32,
+    InterleaveU8,
+    InterleaveU16,
+    InterleaveU32,
     Count
 };
 
@@ -814,9 +820,22 @@ struct VulkanDevice {
     /// Timeline semaphore (VkSemaphore) signaled by every submission to 'queue'
     void *timeline = nullptr;
 
-    /// Shared compute pipeline layout (VkPipelineLayout) with a push constant
-    /// range covering [0, max_push_constants_size)
+    /// Shared compute pipeline layout (VkPipelineLayout) with descriptor set 0
+    /// and a push constant range covering [0, max_push_constants_size)
     void *pipeline_layout = nullptr;
+
+    /// Bindless texture/sampler descriptor set layout, pool, and set (set = 0)
+    void *descriptor_set_layout = nullptr;
+    void *descriptor_pool = nullptr;
+    void *descriptor_set = nullptr;
+
+    /// Cached hardware samplers: pairs of (sampler_key, VkSampler)
+    std::vector<std::pair<uint32_t, void *>> samplers;
+
+    /// Bindless texture descriptor slot allocator
+    uint32_t max_tex_descriptors = 0;
+    uint32_t next_tex_slot = 0;
+    std::vector<uint32_t> free_tex_slots;
 
     /// Driver pipeline cache (VkPipelineCache), loaded from and saved to disk
     void *pipeline_cache = nullptr;
@@ -866,6 +885,7 @@ struct VulkanDevice {
     uint32_t max_storage_buffer_range = 0;
     uint64_t max_memory_allocation_size = 0;
     uint64_t max_buffer_size = 0;
+    float max_sampler_anisotropy = 1.0f;
 
     /// Memory type indices for device-local and host-visible ("shared")
     /// allocations, in order of decreasing preference
@@ -882,6 +902,11 @@ struct VulkanDevice {
     bool shader_float32_atomic_add = false, shader_float64_atomic_add = false;
     bool vulkan_memory_model = false;
     bool sparse_binding = false;
+    bool storage_image_write_without_format = false;
+    bool sampler_mirror_clamp_to_edge = false;
+    bool sampler_anisotropy = false;
+    bool srgb_r8_supported = false;
+    bool srgb_rg8_supported = false;
 
     /// Ray tracing support (only detected for now, enabled in the future)
     bool supports_ray_query = false, supports_accel = false;

@@ -56,6 +56,15 @@ struct VulkanCallback {
 /// List of allocations to be released via \ref jitc_malloc_release()
 using VulkanFreeList = std::vector<std::pair<AllocInfo, void *>>;
 
+/// Texture resources to be destroyed and slot to be recycled once GPU work finishes
+struct VulkanTexDestroy {
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkImageView storage_view = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    uint32_t slot = UINT32_MAX;
+};
+
 /// A command buffer that was submitted to the queue and may still execute
 struct VulkanSubmission {
     VkCommandBuffer cmd;
@@ -65,6 +74,9 @@ struct VulkanSubmission {
 
     /// Allocations to release when the work has finished
     VulkanFreeList frees;
+
+    /// Texture images/views/memory/slots to release when the work has finished
+    std::vector<VulkanTexDestroy> tex_frees;
 
     /// Host callbacks to run when the work has finished
     std::vector<VulkanCallback> callbacks;
@@ -103,8 +115,9 @@ struct VulkanStream {
     /// Submitted work in submission order
     std::deque<VulkanSubmission> in_flight;
 
-    /// Allocations and callbacks waiting for the completion of 'cmd'
+    /// Allocations, textures, and callbacks waiting for the completion of 'cmd'
     VulkanFreeList pending_frees;
+    std::vector<VulkanTexDestroy> pending_tex_frees;
     std::vector<VulkanCallback> pending_callbacks;
 
     /// Host callbacks of finished work that have not run yet
@@ -214,6 +227,23 @@ extern void jitc_vulkan_enqueue_host_func(VulkanDevice &dev,
  * issued work (including work that has not been submitted yet) has finished.
  */
 extern void jitc_vulkan_free_later(AllocInfo info, void *ptr);
+
+/// Allocate a bindless descriptor slot for a sub-texture on \c dev
+extern uint32_t jitc_vulkan_tex_slot_alloc(VulkanDevice &dev);
+
+/// Destroy a texture image/view/memory and recycle its descriptor slot once
+/// all previously issued GPU work has finished
+extern void jitc_vulkan_tex_free_later(VulkanDevice &dev, VkImage image,
+                                       VkImageView view,
+                                       VkImageView storage_view,
+                                       VkDeviceMemory memory, uint32_t slot);
+
+/// Return the bindless sampler descriptor slot for the requested sampler
+/// parameters, creating the VkSampler on first use
+extern uint32_t jitc_vulkan_sampler_slot(VulkanDevice &dev, int filter_mode,
+                                         int wrap_mode, int mip_filter = 1,
+                                         size_t max_aniso = 1,
+                                         bool mipmapped = false);
 
 /**
  * \brief Reserve \c size bytes (<= 16 KiB) of shared staging memory

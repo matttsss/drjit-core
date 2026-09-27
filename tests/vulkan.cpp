@@ -15,6 +15,7 @@
 */
 
 #include "test.h"
+#include <drjit-core/texture.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1461,3 +1462,484 @@ TEST_VULKAN(19_kernel_cache_and_history) {
 
     jit_set_flag(JitFlag::KernelHistory, prev_kh);
 }
+
+TEST_VULKAN(20_textures) {
+    constexpr int FilterNearest = 0, FilterLinear = 1;
+    constexpr int WrapRepeat = 0, WrapClamp = 1, WrapMirror = 2;
+
+    auto f32_var = [](const float *data, uint32_t size) {
+        return jit_var_mem_copy(Backend, VarType::Float32, data, size, 0);
+    };
+    auto u32_var = [](const uint32_t *data, uint32_t size) {
+        return jit_var_mem_copy(Backend, VarType::UInt32, data, size, 0);
+    };
+    auto bool_var = [](const uint8_t *data, uint32_t size) {
+        return jit_var_mem_copy(Backend, VarType::Bool, data, size, 0);
+    };
+    auto f32_scalar = [](float v) {
+        return jit_var_literal(Backend, VarType::Float32, &v, 1, 0);
+    };
+    auto true_mask = []() {
+        uint8_t t = 1;
+        return jit_var_literal(Backend, VarType::Bool, &t, 1, 0);
+    };
+
+    // -----------------------------------------------------------------------
+    // 1. Creation, metadata queries, and d2t / t2d round-trip across 1D/2D/3D
+    //    and 1, 2, 3, 4, 5, 8 channels (Float32, Float16, UInt8)
+    // -----------------------------------------------------------------------
+    for (size_t ch : { (size_t) 1, (size_t) 2, (size_t) 3, (size_t) 4,
+                       (size_t) 5, (size_t) 8 }) {
+        size_t shape2d[2] = { 7, 5 };
+        void *tex = jit_tex_create(Backend, 2, shape2d, ch,
+                                   (int) VarType::Float32,
+                                   FilterLinear, WrapClamp, 0, 0);
+        jit_assert(tex != nullptr);
+        jit_assert(jit_tex_native_handle(tex, 0) != 0);
+        if (ch > 4)
+            jit_assert(jit_tex_native_handle(tex, 1) != 0);
+
+        size_t queried_shape[3] = { 0, 0, 0 };
+        jit_tex_get_shape(tex, queried_shape);
+        jit_assert(queried_shape[0] == 7 && queried_shape[1] == 5 &&
+                   queried_shape[2] == ch);
+
+        uint32_t indices[3] = { 0, 0, 0 };
+        jit_tex_get_indices(tex, indices);
+        jit_assert(indices[0] != 0);
+
+        // No-op map/unmap
+        jit_tex_map(tex);
+        jit_tex_unmap(tex);
+
+        size_t n_elems = shape2d[0] * shape2d[1] * ch;
+        std::vector<float> host_in(n_elems), host_out(n_elems, -1.f);
+        for (size_t i = 0; i < n_elems; ++i)
+            host_in[i] = (float) (i + 1) * 0.25f;
+
+        Alloc d_in(Kind::Device, n_elems * sizeof(float));
+        Alloc d_out(Kind::Device, n_elems * sizeof(float));
+        jit_memcpy(Backend, d_in.ptr, host_in.data(), n_elems * sizeof(float));
+        uint8_t zero_byte = 0;
+        jit_memset_async(Backend, d_out.ptr,
+                         (uint32_t) (n_elems * sizeof(float)), 1, &zero_byte);
+
+        jit_tex_memcpy_d2t(d_in.ptr, tex);
+        jit_tex_memcpy_t2d(tex, d_out.ptr);
+        jit_memcpy(Backend, host_out.data(), d_out.ptr, n_elems * sizeof(float));
+
+        for (size_t i = 0; i < n_elems; ++i)
+            jit_assert(host_out[i] == host_in[i]);
+
+        jit_tex_destroy(tex);
+    }
+
+    // Also test UInt8 and UInt16 (Float16) 3-channel and 5-channel d2t/t2d
+    for (VarType vt : { VarType::UInt8, VarType::Float16 }) {
+        size_t elem_sz = (vt == VarType::UInt8) ? 1 : 2;
+        for (size_t ch : { (size_t) 3, (size_t) 5 }) {
+            size_t shape3d[3] = { 4, 3, 2 };
+            void *tex = jit_tex_create(Backend, 3, shape3d, ch, (int) vt,
+                                       FilterNearest, WrapClamp, 0, 0);
+            size_t n_elems = shape3d[0] * shape3d[1] * shape3d[2] * ch;
+            std::vector<uint8_t> host_in(n_elems * elem_sz),
+                                 host_out(n_elems * elem_sz, 0);
+            for (size_t i = 0; i < host_in.size(); ++i)
+                host_in[i] = (uint8_t) ((i * 37 + 11) & 0x7f);
+
+            Alloc d_in(Kind::Device, host_in.size());
+            Alloc d_out(Kind::Device, host_out.size());
+            jit_memcpy(Backend, d_in.ptr, host_in.data(), host_in.size());
+            jit_tex_memcpy_d2t(d_in.ptr, tex);
+            jit_tex_memcpy_t2d(tex, d_out.ptr);
+            jit_memcpy(Backend, host_out.data(), d_out.ptr, host_out.size());
+
+            for (size_t i = 0; i < host_in.size(); ++i)
+                jit_assert(host_out[i] == host_in[i]);
+
+            jit_tex_destroy(tex);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. 1D, 2D, and 3D sampling (Nearest & Linear, Clamp/Repeat/Mirror,
+    //    masked & unmasked, sRGB 1/2/3/4 channels)
+    // -----------------------------------------------------------------------
+    {
+        // 1D texture (4 texels, 2 channels, Linear, Clamp)
+        size_t shape1d[1] = { 4 };
+        float data1d[8] = {
+            1.f, 10.f,
+            2.f, 20.f,
+            3.f, 30.f,
+            4.f, 40.f
+        };
+        Alloc d1(Kind::Device, sizeof(data1d));
+        jit_memcpy(Backend, d1.ptr, data1d, sizeof(data1d));
+        void *tex1d = jit_tex_create(Backend, 1, shape1d, 2,
+                                     (int) VarType::Float32,
+                                     FilterLinear, WrapClamp, 0, 0);
+        jit_tex_memcpy_d2t(d1.ptr, tex1d);
+
+        // Sample at texel centers (0.125, 0.375, 0.625, 0.875) and midpoint 0.5
+        float u_coords[5] = { 0.125f, 0.375f, 0.5f, 0.875f, 0.5f };
+        uint8_t mask_vals[5] = { 1, 1, 1, 1, 0 };
+        uint32_t u_v = f32_var(u_coords, 5);
+        uint32_t m_v = bool_var(mask_vals, 5);
+        uint32_t out[2] = { 0, 0 };
+        jit_tex_lookup(tex1d, &u_v, m_v, out);
+        jit_var_eval(out[0]);
+        jit_var_eval(out[1]);
+
+        float exp0[5] = { 1.f, 2.f, 2.5f, 4.f, 0.f };
+        float exp1[5] = { 10.f, 20.f, 25.f, 40.f, 0.f };
+        for (uint32_t i = 0; i < 5; ++i) {
+            float g0 = -1.f, g1 = -1.f;
+            jit_var_read(out[0], i, &g0);
+            jit_var_read(out[1], i, &g1);
+            jit_assert(std::abs(g0 - exp0[i]) < 1e-4f);
+            jit_assert(std::abs(g1 - exp1[i]) < 1e-4f);
+        }
+        jit_var_dec_ref(out[0]);
+        jit_var_dec_ref(out[1]);
+        jit_var_dec_ref(m_v);
+        jit_var_dec_ref(u_v);
+        jit_tex_destroy(tex1d);
+    }
+
+    // Wrap modes: Repeat and Mirror on 1D Nearest texture (2 texels: [10, 20])
+    for (int wm : { WrapRepeat, WrapMirror }) {
+        size_t shape1d[1] = { 2 };
+        float data1d[2] = { 10.f, 20.f };
+        Alloc d1(Kind::Device, sizeof(data1d));
+        jit_memcpy(Backend, d1.ptr, data1d, sizeof(data1d));
+        void *tex = jit_tex_create(Backend, 1, shape1d, 1,
+                                   (int) VarType::Float32,
+                                   FilterNearest, wm, 0, 0);
+        jit_tex_memcpy_d2t(d1.ptr, tex);
+
+        // u = 1.25f -> in Repeat this wraps to 0.25f (texel 0 = 10.f);
+        // in Mirror [1, 2] mirrors so 1.25f maps to 0.75f (texel 1 = 20.f).
+        float u_coord = 1.25f;
+        uint32_t u_v = f32_var(&u_coord, 1);
+        uint32_t m_v = true_mask();
+        uint32_t out = 0;
+        jit_tex_lookup(tex, &u_v, m_v, &out);
+        jit_var_eval(out);
+        float got = 0.f;
+        jit_var_read(out, 0, &got);
+        float expected = (wm == WrapRepeat) ? 10.f : 20.f;
+        jit_assert(std::abs(got - expected) < 1e-4f);
+
+        jit_var_dec_ref(out);
+        jit_var_dec_ref(m_v);
+        jit_var_dec_ref(u_v);
+        jit_tex_destroy(tex);
+    }
+
+    // sRGB UInt8 sampling (1, 2, 3, and 4 channels)
+    for (size_t ch : { (size_t) 1, (size_t) 2, (size_t) 3, (size_t) 4 }) {
+        size_t shape2d[2] = { 2, 2 };
+        std::vector<uint8_t> srgb_in(4 * ch, 128);
+        if (ch == 4) {
+            // Alpha channel (channel 3) in sRGB must remain linear!
+            for (size_t p = 0; p < 4; ++p)
+                srgb_in[p * 4 + 3] = 128;
+        }
+        Alloc d_in(Kind::Device, srgb_in.size());
+        jit_memcpy(Backend, d_in.ptr, srgb_in.data(), srgb_in.size());
+        void *tex = jit_tex_create(Backend, 2, shape2d, ch,
+                                   (int) VarType::UInt8,
+                                   FilterNearest, WrapClamp,
+                                   /*writable=*/0, /*srgb=*/1);
+        jit_tex_memcpy_d2t(d_in.ptr, tex);
+
+        // Verify t2d round-trip preserves exact bytes even when 1/2/3-ch sRGB
+        // is padded to 4 storage channels on the GPU
+        std::vector<uint8_t> srgb_rt(srgb_in.size(), 0);
+        Alloc d_out(Kind::Device, srgb_rt.size());
+        jit_tex_memcpy_t2d(tex, d_out.ptr);
+        jit_memcpy(Backend, srgb_rt.data(), d_out.ptr, srgb_rt.size());
+        for (size_t i = 0; i < srgb_in.size(); ++i)
+            jit_assert(srgb_rt[i] == srgb_in[i]);
+
+        uint32_t pos[2] = { f32_scalar(0.25f), f32_scalar(0.25f) };
+        uint32_t m_v = true_mask();
+        uint32_t out[4] = { 0, 0, 0, 0 };
+        jit_tex_lookup(tex, pos, m_v, out);
+
+        // 128 / 255 in sRGB decodes to ~0.21586f; in linear alpha it is 128/255 ~ 0.50196f
+        for (size_t c = 0; c < ch; ++c) {
+            jit_var_eval(out[c]);
+            float got = 0.f;
+            jit_var_read(out[c], 0, &got);
+            float exp = (c < 3) ? 0.21586f : (128.f / 255.f);
+            jit_assert(std::abs(got - exp) < 2e-2f);
+            jit_var_dec_ref(out[c]);
+        }
+        jit_var_dec_ref(m_v);
+        jit_var_dec_ref(pos[0]);
+        jit_var_dec_ref(pos[1]);
+        jit_tex_destroy(tex);
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. Explicit LOD (jit_tex_lookup_lod) & Gradients (jit_tex_lookup_grad)
+    // -----------------------------------------------------------------------
+    {
+        size_t shape0[2] = { 4, 4 };
+        void *tex = jit_tex_create(Backend, 2, shape0, 1,
+                                   (int) VarType::Float32,
+                                   FilterLinear, WrapClamp,
+                                   /*writable=*/0, /*srgb=*/0,
+                                   /*n_levels=*/3,
+                                   /*mip_filter=*/FilterLinear);
+
+        std::vector<float> l0(16, 10.f), l1(4, 20.f), l2(1, 30.f);
+        Alloc d0(Kind::Device, 16 * sizeof(float));
+        Alloc d1(Kind::Device, 4 * sizeof(float));
+        Alloc d2(Kind::Device, 1 * sizeof(float));
+        jit_memcpy(Backend, d0.ptr, l0.data(), 16 * sizeof(float));
+        jit_memcpy(Backend, d1.ptr, l1.data(), 4 * sizeof(float));
+        jit_memcpy(Backend, d2.ptr, l2.data(), 1 * sizeof(float));
+
+        jit_tex_memcpy_d2t(d0.ptr, tex, 0);
+        jit_tex_memcpy_d2t(d1.ptr, tex, 1);
+        jit_tex_memcpy_d2t(d2.ptr, tex, 2);
+
+        float uvs[4]  = { 0.5f, 0.5f, 0.5f, 0.5f };
+        float lods[4] = { 0.f, 0.5f, 1.f, 2.f };
+        uint32_t pos[2] = { f32_var(uvs, 4), f32_var(uvs, 4) };
+        uint32_t lod_v  = f32_var(lods, 4);
+        uint32_t m_v    = true_mask();
+        uint32_t out    = 0;
+        jit_tex_lookup_lod(tex, pos, lod_v, m_v, &out);
+        jit_var_eval(out);
+
+        float exp_lod[4] = { 10.f, 15.f, 20.f, 30.f };
+        for (uint32_t i = 0; i < 4; ++i) {
+            float got = 0.f;
+            jit_var_read(out, i, &got);
+            jit_assert(std::abs(got - exp_lod[i]) < 0.5f);
+        }
+
+        // Also test jit_tex_lookup_grad on the same MIP pyramid:
+        // ddx = (0.5, 0), ddy = (0, 0.5) on a 4x4 texture corresponds to step=2 texels -> LOD 1 (20.f)
+        uint32_t ddx[2] = { f32_scalar(0.5f), f32_scalar(0.f) };
+        uint32_t ddy[2] = { f32_scalar(0.f), f32_scalar(0.5f) };
+        uint32_t out_g  = 0;
+        jit_tex_lookup_grad(tex, pos, ddx, ddy, m_v, &out_g);
+        jit_var_eval(out_g);
+        float got_g = 0.f;
+        jit_var_read(out_g, 0, &got_g);
+        jit_assert(std::abs(got_g - 20.f) < 1.f);
+
+        for (uint32_t r : { out_g, ddx[0], ddx[1], ddy[0], ddy[1],
+                            out, m_v, lod_v, pos[0], pos[1] })
+            jit_var_dec_ref(r);
+        jit_tex_destroy(tex);
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. Bilinear texel gather (jit_tex_bilerp_fetch / OpImageGather)
+    // -----------------------------------------------------------------------
+    {
+        // 2x2 2-channel texture:
+        // (0,0): [1, 10], (1,0): [2, 20]
+        // (0,1): [3, 30], (1,1): [4, 40]
+        size_t shape2d[2] = { 2, 2 };
+        float data2d[8] = {
+            1.f, 10.f,  2.f, 20.f,
+            3.f, 30.f,  4.f, 40.f
+        };
+        Alloc d(Kind::Device, sizeof(data2d));
+        jit_memcpy(Backend, d.ptr, data2d, sizeof(data2d));
+        void *tex = jit_tex_create(Backend, 2, shape2d, 2,
+                                   (int) VarType::Float32,
+                                   FilterLinear, WrapClamp, 0, 0);
+        jit_tex_memcpy_d2t(d.ptr, tex);
+
+        uint32_t pos[2] = { f32_scalar(0.5f), f32_scalar(0.5f) };
+        uint32_t m_v    = true_mask();
+        uint32_t out[8] = { 0 };
+        jit_tex_bilerp_fetch(tex, pos, m_v, out);
+
+        // Counter-clockwise from lower-left: (0,1), (1,1), (1,0), (0,0)
+        // Channel 0: [3, 4, 2, 1], Channel 1: [30, 40, 20, 10]
+        float exp_gather[8] = { 3.f, 4.f, 2.f, 1.f, 30.f, 40.f, 20.f, 10.f };
+        for (int i = 0; i < 8; ++i) {
+            jit_var_eval(out[i]);
+            float got = 0.f;
+            jit_var_read(out[i], 0, &got);
+            jit_assert(got == exp_gather[i]);
+            jit_var_dec_ref(out[i]);
+        }
+        jit_var_dec_ref(m_v);
+        jit_var_dec_ref(pos[0]);
+        jit_var_dec_ref(pos[1]);
+        jit_tex_destroy(tex);
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. Storage image writes (jit_tex_write) including writable UInt8 sRGB
+    // -----------------------------------------------------------------------
+    {
+        // 5a. 2D 5-channel Float32 writable texture (masked & unmasked writes)
+        size_t shape2d[2] = { 4, 4 };
+        void *tex = jit_tex_create(Backend, 2, shape2d, 5,
+                                   (int) VarType::Float32,
+                                   FilterNearest, WrapClamp,
+                                   /*writable=*/1, /*srgb=*/0);
+        size_t n_elems = 4 * 4 * 5;
+        Alloc d_zero(Kind::Device, n_elems * sizeof(float));
+        uint8_t zero_byte = 0;
+        jit_memset_async(Backend, d_zero.ptr,
+                         (uint32_t) (n_elems * sizeof(float)), 1, &zero_byte);
+        jit_tex_memcpy_d2t(d_zero.ptr, tex);
+
+        // Write 4 pixels at (0,0), (1,1), (2,2), (3,3), with lane 2 masked off
+        uint32_t coords[4] = { 0, 1, 2, 3 };
+        uint8_t  masks[4]  = { 1, 1, 0, 1 };
+        uint32_t pos[2] = { u32_var(coords, 4), u32_var(coords, 4) };
+        uint32_t m_v    = bool_var(masks, 4);
+        uint32_t vals[5];
+        for (uint32_t c = 0; c < 5; ++c) {
+            float v_arr[4] = {
+                (float) (c + 1) * 1.f,
+                (float) (c + 1) * 2.f,
+                (float) (c + 1) * 3.f,
+                (float) (c + 1) * 4.f
+            };
+            vals[c] = f32_var(v_arr, 4);
+        }
+        jit_tex_write(tex, pos, vals, m_v);
+        jit_eval();
+
+        std::vector<float> host_out(n_elems, -1.f);
+        jit_tex_memcpy_t2d(tex, d_zero.ptr);
+        jit_memcpy(Backend, host_out.data(), d_zero.ptr, n_elems * sizeof(float));
+
+        for (uint32_t i = 0; i < 4; ++i) {
+            size_t base = (i * 4 + i) * 5;
+            for (uint32_t c = 0; c < 5; ++c) {
+                float expected = (i == 2) ? 0.f : (float) (c + 1) * (float) (i + 1);
+                jit_assert(host_out[base + c] == expected);
+            }
+        }
+
+        for (uint32_t c = 0; c < 5; ++c)
+            jit_var_dec_ref(vals[c]);
+        jit_var_dec_ref(m_v);
+        jit_var_dec_ref(pos[0]);
+        jit_var_dec_ref(pos[1]);
+        jit_tex_destroy(tex);
+    }
+
+    {
+        // 5b. Writable UInt8 sRGB texture (4 channels): write linear values,
+        // then sample back via jit_tex_lookup (hardware sRGB decode) AND read
+        // raw sRGB bytes via jit_tex_memcpy_t2d!
+        size_t shape2d[2] = { 2, 1 };
+        void *tex = jit_tex_create(Backend, 2, shape2d, 4,
+                                   (int) VarType::UInt8,
+                                   FilterNearest, WrapClamp,
+                                   /*writable=*/1, /*srgb=*/1);
+        uint32_t x_c[2] = { 0, 1 }, y_c[2] = { 0, 0 };
+        uint32_t pos_w[2] = { u32_var(x_c, 2), u32_var(y_c, 2) };
+        // Pixel 0: linear 0.21586f (encodes to ~128 in sRGB), alpha 0.5f
+        // Pixel 1: linear 0.001f (linear toe branch <= 0.0031308), alpha 1.0f
+        float r_in[2] = { 0.21586f, 0.001f };
+        float g_in[2] = { 0.5f,     0.21586f };
+        float b_in[2] = { 1.0f,     0.0f };
+        float a_in[2] = { 0.5f,     1.0f };
+        uint32_t vals[4] = {
+            f32_var(r_in, 2), f32_var(g_in, 2),
+            f32_var(b_in, 2), f32_var(a_in, 2)
+        };
+        uint32_t m_v = true_mask();
+        jit_tex_write(tex, pos_w, vals, m_v);
+        jit_eval();
+
+        // Sample back via jit_tex_lookup: hardware sRGB-to-linear should recover linear inputs!
+        float u_s[2] = { 0.25f, 0.75f }, v_s[2] = { 0.5f, 0.5f };
+        uint32_t pos_s[2] = { f32_var(u_s, 2), f32_var(v_s, 2) };
+        uint32_t out_s[4] = { 0, 0, 0, 0 };
+        jit_tex_lookup(tex, pos_s, m_v, out_s);
+        for (int c = 0; c < 4; ++c)
+            jit_var_eval(out_s[c]);
+
+        const float *exp_ch[4] = { r_in, g_in, b_in, a_in };
+        for (int c = 0; c < 4; ++c) {
+            for (uint32_t i = 0; i < 2; ++i) {
+                float got = 0.f;
+                jit_var_read(out_s[c], i, &got);
+                jit_assert(std::abs(got - exp_ch[c][i]) < 2e-2f);
+            }
+            jit_var_dec_ref(out_s[c]);
+        }
+
+        for (int c = 0; c < 4; ++c)
+            jit_var_dec_ref(vals[c]);
+        jit_var_dec_ref(pos_s[0]);
+        jit_var_dec_ref(pos_s[1]);
+        jit_var_dec_ref(pos_w[0]);
+        jit_var_dec_ref(pos_w[1]);
+        jit_var_dec_ref(m_v);
+        jit_tex_destroy(tex);
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. Texture lookup inside polymorphic jit_var_call
+    // -----------------------------------------------------------------------
+    {
+        size_t shape1d[1] = { 2 };
+        float data1d[2] = { 42.f, 84.f };
+        Alloc d1(Kind::Device, sizeof(data1d));
+        jit_memcpy(Backend, d1.ptr, data1d, sizeof(data1d));
+        void *tex = jit_tex_create(Backend, 1, shape1d, 1,
+                                   (int) VarType::Float32,
+                                   FilterNearest, WrapClamp, 0, 0);
+        jit_tex_memcpy_d2t(d1.ptr, tex);
+
+        float u_in[2] = { 0.25f, 0.75f };
+        uint32_t u_outer = f32_var(u_in, 2);
+        uint32_t m_true  = true_mask();
+        uint32_t inst_id = 1;
+        uint32_t self_v = jit_var_literal(Backend, VarType::UInt32, &inst_id, 2, 0);
+        uint32_t call_out = 0;
+
+        jit_new_scope(Backend);
+        uint32_t ckpt = jit_record_begin(Backend, "tex_call_test");
+        uint32_t scope = jit_new_scope(Backend);
+        uint32_t u_inner = jit_var_call_input(u_outer);
+        uint32_t call_m  = jit_var_call_mask(Backend);
+        jit_var_mask_push(Backend, call_m);
+        jit_var_dec_ref(call_m);
+
+        uint32_t se_offset[2] = { 0, 0 };
+        jit_set_scope(Backend, scope);
+        se_offset[0] = jit_record_checkpoint(Backend);
+        uint32_t sampled = 0;
+        jit_tex_lookup(tex, &u_inner, m_true, &sampled);
+        jit_set_scope(Backend, scope);
+        se_offset[1] = jit_record_checkpoint(Backend);
+        jit_var_mask_pop(Backend);
+
+        jit_new_scope(Backend);
+        jit_var_call("tex_call_test", 0, self_v, m_true, 1, 1, &inst_id,
+                     1, &u_inner, 1, &sampled, se_offset, &call_out);
+        jit_record_end(Backend, ckpt, 0);
+
+        jit_var_eval(call_out);
+
+        float g0 = 0.f, g1 = 0.f;
+        jit_var_read(call_out, 0, &g0);
+        jit_var_read(call_out, 1, &g1);
+        jit_assert(g0 == 42.f && g1 == 84.f);
+
+        for (uint32_t r : { call_out, self_v, sampled, m_true, u_inner, u_outer })
+            jit_var_dec_ref(r);
+        jit_tex_destroy(tex);
+    }
+}
+

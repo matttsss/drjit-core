@@ -22,6 +22,10 @@
 #  extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #endif
 
+#if defined(TYPE_U16)
+#  extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#endif
+
 #if defined(TYPE_F16)
 #  extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
@@ -277,6 +281,11 @@ void main() {
 
 #if defined(TYPE_U8)
 #  define T        uint8_t
+#  define ACC_T    uint
+#  define LIMIT_LO 0u
+#  define LIMIT_HI 0xFFFFFFFFu
+#elif defined(TYPE_U16)
+#  define T        uint16_t
 #  define ACC_T    uint
 #  define LIMIT_LO 0u
 #  define LIMIT_HI 0xFFFFFFFFu
@@ -676,3 +685,48 @@ void main() {
 }
 
 #endif // KERNEL_REDUCE_DOT
+
+// ============================================================================
+//  9. deinterleave & interleave -- multi-channel texture packing/unpacking
+// ============================================================================
+
+#if defined(KERNEL_DEINTERLEAVE) || defined(KERNEL_INTERLEAVE)
+
+layout(buffer_reference, scalar) readonly buffer  SrcBuf { T d[]; };
+layout(buffer_reference, scalar) writeonly buffer DstBuf { T d[]; };
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t src_addr;
+    uint64_t dst_addr;
+    uint     size;
+    uint     n_channels;
+    uint     ci;
+    uint     tex_base;
+    uint     c_valid;
+} p;
+
+void main() {
+    uint wg_id = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint tid   = wg_id * 256u + gl_LocalInvocationID.x;
+    if (tid >= p.size)
+        return;
+
+    SrcBuf src = SrcBuf(p.src_addr);
+    DstBuf dst = DstBuf(p.dst_addr);
+
+#if defined(KERNEL_DEINTERLEAVE)
+    uint pix = tid / p.ci;
+    uint c   = tid - pix * p.ci;
+    if (c < p.c_valid)
+        dst.d[tid] = src.d[pix * p.n_channels + p.tex_base + c];
+    else
+        dst.d[tid] = T(0);
+#else
+    uint pix = tid / p.c_valid;
+    uint c   = tid - pix * p.c_valid;
+    dst.d[pix * p.n_channels + p.tex_base + c] = src.d[pix * p.ci + c];
+#endif
+}
+
+#endif // KERNEL_DEINTERLEAVE || KERNEL_INTERLEAVE
+

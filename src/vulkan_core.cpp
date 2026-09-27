@@ -346,6 +346,21 @@ void vulkan_buffer_free(VulkanBuffer *buffer) {
 //                    Command submission & synchronization
 // ====================================================================
 
+static void vulkan_destroy_tex_item(VulkanDevice &dev,
+                                    const VulkanTexDestroy &td) {
+    VkDevice device = (VkDevice) dev.device;
+    if (td.storage_view && td.storage_view != td.view)
+        vkDestroyImageView(device, td.storage_view, nullptr);
+    if (td.view)
+        vkDestroyImageView(device, td.view, nullptr);
+    if (td.image)
+        vkDestroyImage(device, td.image, nullptr);
+    if (td.memory)
+        vkFreeMemory(device, td.memory, nullptr);
+    if (td.slot != UINT32_MAX)
+        dev.free_tex_slots.push_back(td.slot);
+}
+
 /// Retire the submissions whose timeline value is <= 'value'
 static void vulkan_retire_until(VulkanDevice &dev, uint64_t value) {
     VulkanStream &s = *dev.stream;
@@ -358,6 +373,8 @@ static void vulkan_retire_until(VulkanDevice &dev, uint64_t value) {
         s.cmd_free.push_back(sub.cmd);
         for (auto [info, ptr] : sub.frees)
             jitc_malloc_release(info, ptr);
+        for (const VulkanTexDestroy &td : sub.tex_frees)
+            vulkan_destroy_tex_item(dev, td);
         s.ready_callbacks.insert(s.ready_callbacks.end(),
                                  sub.callbacks.begin(), sub.callbacks.end());
         s.in_flight.pop_front();
@@ -405,6 +422,13 @@ VkCommandBuffer jitc_vulkan_cmd(VulkanDevice &dev) {
     if (rv != VK_SUCCESS) {
         s.cmd_free.push_back(cmd);
         jitc_vulkan_raise(rv, __FILE__, __LINE__);
+    }
+
+    if (dev.descriptor_set) {
+        VkDescriptorSet ds = (VkDescriptorSet) dev.descriptor_set;
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                (VkPipelineLayout) dev.pipeline_layout,
+                                0, 1, &ds, 0, nullptr);
     }
 
     s.cmd = cmd;
@@ -500,17 +524,23 @@ void jitc_vulkan_submit(VulkanDevice &dev) {
             VulkanSubmission &last = s.in_flight.back();
             last.frees.insert(last.frees.end(), s.pending_frees.begin(),
                               s.pending_frees.end());
+            last.tex_frees.insert(last.tex_frees.end(),
+                                  s.pending_tex_frees.begin(),
+                                  s.pending_tex_frees.end());
             last.callbacks.insert(last.callbacks.end(),
                                   s.pending_callbacks.begin(),
                                   s.pending_callbacks.end());
         } else {
             for (auto [info, ptr] : s.pending_frees)
                 jitc_malloc_release(info, ptr);
+            for (const VulkanTexDestroy &td : s.pending_tex_frees)
+                vulkan_destroy_tex_item(dev, td);
             s.ready_callbacks.insert(s.ready_callbacks.end(),
                                      s.pending_callbacks.begin(),
                                      s.pending_callbacks.end());
         }
         s.pending_frees.clear();
+        s.pending_tex_frees.clear();
         s.pending_callbacks.clear();
         jitc_vulkan_raise(rv, __FILE__, __LINE__);
     }
@@ -519,6 +549,7 @@ void jitc_vulkan_submit(VulkanDevice &dev) {
     sub.cmd = cmd;
     sub.value = value;
     sub.frees.swap(s.pending_frees);
+    sub.tex_frees.swap(s.pending_tex_frees);
     sub.callbacks.swap(s.pending_callbacks);
     s.in_flight.push_back(std::move(sub));
     dev.timeline_value = value;
@@ -611,6 +642,117 @@ void jitc_vulkan_free_later(AllocInfo info, void *ptr) {
         s.in_flight.back().frees.emplace_back(info, ptr);
     else
         jitc_malloc_release(info, ptr);
+}
+
+uint32_t jitc_vulkan_tex_slot_alloc(VulkanDevice &dev) {
+    jitc_vulkan_retire(dev);
+    if (!dev.free_tex_slots.empty()) {
+        uint32_t slot = dev.free_tex_slots.back();
+        dev.free_tex_slots.pop_back();
+        return slot;
+    }
+    if (dev.next_tex_slot >= dev.max_tex_descriptors)
+        jitc_raise("jitc_vulkan_tex_slot_alloc(): exhausted bindless texture "
+                   "descriptor slots (limit = %u)!", dev.max_tex_descriptors);
+    return dev.next_tex_slot++;
+}
+
+void jitc_vulkan_tex_free_later(VulkanDevice &dev, VkImage image,
+                                VkImageView view, VkImageView storage_view,
+                                VkDeviceMemory memory, uint32_t slot) {
+    jitc_vulkan_retire(dev);
+    VulkanStream &s = *dev.stream;
+    VulkanTexDestroy td { image, view, storage_view, memory, slot };
+    if (s.cmd)
+        s.pending_tex_frees.push_back(td);
+    else if (!s.in_flight.empty())
+        s.in_flight.back().tex_frees.push_back(td);
+    else
+        vulkan_destroy_tex_item(dev, td);
+}
+
+uint32_t jitc_vulkan_sampler_slot(VulkanDevice &dev, int filter_mode,
+                                  int wrap_mode, int mip_filter,
+                                  size_t max_aniso, bool mipmapped) {
+    if (filter_mode != 0 && filter_mode != 1)
+        jitc_raise("jit_vulkan_tex(): invalid filter mode!");
+    if (wrap_mode < 0 || wrap_mode > 2)
+        jitc_raise("jit_vulkan_tex(): invalid wrap mode!");
+
+    size_t clamped_aniso = std::min(std::max(max_aniso, (size_t) 1), (size_t) 16);
+    if (!mipmapped || !dev.sampler_anisotropy)
+        clamped_aniso = 1;
+
+    uint32_t key = ((uint32_t) (filter_mode & 1)) |
+                   ((uint32_t) (wrap_mode & 3) << 1) |
+                   ((uint32_t) (mipmapped ? (mip_filter & 1) : 0) << 3) |
+                   ((uint32_t) (mipmapped ? 1 : 0) << 4) |
+                   ((uint32_t) clamped_aniso << 5);
+
+    for (size_t i = 0; i < dev.samplers.size(); ++i) {
+        if (dev.samplers[i].first == key)
+            return (uint32_t) i;
+    }
+
+    uint32_t slot = (uint32_t) dev.samplers.size();
+    if (slot >= 128)
+        jitc_raise("jitc_vulkan_sampler_slot(): exhausted bindless sampler "
+                   "descriptor slots!");
+
+    VkFilter vk_filter = (filter_mode == 0) ? VK_FILTER_NEAREST
+                                            : VK_FILTER_LINEAR;
+    VkSamplerAddressMode vk_wrap = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (wrap_mode == 0)
+        vk_wrap = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    else if (wrap_mode == 1)
+        vk_wrap = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    else if (wrap_mode == 2)
+        vk_wrap = VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+
+    VkSamplerCreateInfo sampler_info {};
+    sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sampler_info.magFilter = vk_filter;
+    sampler_info.minFilter = vk_filter;
+    if (mipmapped) {
+        sampler_info.mipmapMode = (mip_filter == 0)
+            ? VK_SAMPLER_MIPMAP_MODE_NEAREST
+            : VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        sampler_info.maxLod = 1000.0f;
+    } else {
+        sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sampler_info.maxLod = 0.0f;
+    }
+    if (clamped_aniso > 1) {
+        sampler_info.anisotropyEnable = VK_TRUE;
+        sampler_info.maxAnisotropy =
+            std::min((float) clamped_aniso, dev.max_sampler_anisotropy);
+    }
+    sampler_info.addressModeU = vk_wrap;
+    sampler_info.addressModeV = vk_wrap;
+    sampler_info.addressModeW = vk_wrap;
+    sampler_info.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    sampler_info.unnormalizedCoordinates = VK_FALSE;
+
+    VkSampler sampler = VK_NULL_HANDLE;
+    vk_check(vkCreateSampler((VkDevice) dev.device, &sampler_info,
+                             nullptr, &sampler));
+    dev.samplers.emplace_back(key, (void *) sampler);
+
+    if (dev.descriptor_set) {
+        VkDescriptorImageInfo img_info {};
+        img_info.sampler = sampler;
+
+        VkWriteDescriptorSet write {};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = (VkDescriptorSet) dev.descriptor_set;
+        write.dstBinding = 2;
+        write.dstArrayElement = slot;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        write.pImageInfo = &img_info;
+        vkUpdateDescriptorSets((VkDevice) dev.device, 1, &write, 0, nullptr);
+    }
+    return slot;
 }
 
 uint8_t *jitc_vulkan_stage(VulkanDevice &dev, size_t size) {
@@ -993,6 +1135,13 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
     features.features.shaderInt64 = VK_TRUE;
     features.features.shaderInt16 = f.shaderInt16;
     features.features.shaderFloat64 = f.shaderFloat64;
+    features.features.samplerAnisotropy = f.samplerAnisotropy;
+    features.features.textureCompressionBC = f.textureCompressionBC;
+    features.features.shaderImageGatherExtended = f.shaderImageGatherExtended;
+    features.features.shaderStorageImageExtendedFormats =
+        f.shaderStorageImageExtendedFormats;
+    features.features.shaderStorageImageWriteWithoutFormat =
+        f.shaderStorageImageWriteWithoutFormat;
     bool sparse_binding = f.sparseBinding && f.sparseResidencyBuffer &&
                           (info.queue_flags & VK_QUEUE_SPARSE_BINDING_BIT);
     if (sparse_binding) {
@@ -1010,6 +1159,21 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
     features12.shaderSubgroupExtendedTypes = f12.shaderSubgroupExtendedTypes;
     features12.vulkanMemoryModel = f12.vulkanMemoryModel;
     features12.vulkanMemoryModelDeviceScope = f12.vulkanMemoryModelDeviceScope;
+    features12.samplerMirrorClampToEdge = f12.samplerMirrorClampToEdge;
+    features12.descriptorIndexing = f12.descriptorIndexing;
+    features12.shaderSampledImageArrayNonUniformIndexing =
+        f12.shaderSampledImageArrayNonUniformIndexing;
+    features12.shaderStorageImageArrayNonUniformIndexing =
+        f12.shaderStorageImageArrayNonUniformIndexing;
+    features12.descriptorBindingSampledImageUpdateAfterBind =
+        f12.descriptorBindingSampledImageUpdateAfterBind;
+    features12.descriptorBindingStorageImageUpdateAfterBind =
+        f12.descriptorBindingStorageImageUpdateAfterBind;
+    features12.descriptorBindingUpdateUnusedWhilePending =
+        f12.descriptorBindingUpdateUnusedWhilePending;
+    features12.descriptorBindingPartiallyBound =
+        f12.descriptorBindingPartiallyBound;
+    features12.runtimeDescriptorArray = f12.runtimeDescriptorArray;
     features13.maintenance4 = VK_TRUE;
     features13.synchronization2 = info.features13.synchronization2;
 
@@ -1109,8 +1273,141 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
 
     const VkPhysicalDeviceLimits &limits = info.props.limits;
 
-    // Shared compute pipeline layout with push constant range covering the
-    // device's maximum push constant size
+    // Bindless texture/sampler descriptor set (set = 0):
+    //   binding 0: SAMPLED_IMAGE[max_tex_descriptors]
+    //   binding 1: STORAGE_IMAGE[max_tex_descriptors]
+    //   binding 2: SAMPLER[16]
+    bool use_uab = f12.descriptorBindingSampledImageUpdateAfterBind &&
+                   f12.descriptorBindingStorageImageUpdateAfterBind;
+    uint32_t max_tex_descriptors = 16384u;
+    if (use_uab) {
+        max_tex_descriptors = std::min({
+            max_tex_descriptors,
+            info.props12.maxDescriptorSetUpdateAfterBindSampledImages,
+            info.props12.maxDescriptorSetUpdateAfterBindStorageImages,
+            info.props12.maxPerStageDescriptorUpdateAfterBindSampledImages,
+            info.props12.maxPerStageDescriptorUpdateAfterBindStorageImages
+        });
+    } else {
+        max_tex_descriptors = std::min({
+            max_tex_descriptors,
+            limits.maxPerStageDescriptorSampledImages,
+            limits.maxPerStageDescriptorStorageImages,
+            limits.maxDescriptorSetSampledImages,
+            limits.maxDescriptorSetStorageImages
+        });
+    }
+    if (max_tex_descriptors == 0)
+        max_tex_descriptors = 128;
+
+    VkDescriptorSetLayoutBinding dsl_bindings[3] {};
+    dsl_bindings[0].binding = 0;
+    dsl_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    dsl_bindings[0].descriptorCount = max_tex_descriptors;
+    dsl_bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    dsl_bindings[1].binding = 1;
+    dsl_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    dsl_bindings[1].descriptorCount = max_tex_descriptors;
+    dsl_bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    dsl_bindings[2].binding = 2;
+    dsl_bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    dsl_bindings[2].descriptorCount = 128;
+    dsl_bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorBindingFlags bind_flags[3] {};
+    VkDescriptorSetLayoutBindingFlagsCreateInfo bind_flags_info {};
+    bind_flags_info.sType =
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+    bind_flags_info.bindingCount = 3;
+    bind_flags_info.pBindingFlags = bind_flags;
+
+    VkDescriptorSetLayoutCreateInfo dsl_info {};
+    dsl_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dsl_info.bindingCount = 3;
+    dsl_info.pBindings = dsl_bindings;
+
+    if (use_uab) {
+        VkDescriptorBindingFlags uab_flags =
+            VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+        if (f12.descriptorBindingUpdateUnusedWhilePending)
+            uab_flags |= VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
+        if (f12.descriptorBindingPartiallyBound)
+            uab_flags |= VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+        bind_flags[0] = uab_flags;
+        bind_flags[1] = uab_flags;
+        bind_flags[2] = uab_flags;
+        dsl_info.pNext = &bind_flags_info;
+        dsl_info.flags =
+            VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+    } else if (f12.descriptorBindingPartiallyBound) {
+        bind_flags[0] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+        bind_flags[1] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+        bind_flags[2] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+        dsl_info.pNext = &bind_flags_info;
+    }
+
+    VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
+    rv = vkCreateDescriptorSetLayout(device, &dsl_info, nullptr,
+                                     &descriptor_set_layout);
+    if (rv != VK_SUCCESS) {
+        vkDestroyCommandPool(device, pool, nullptr);
+        vkDestroySemaphore(device, timeline, nullptr);
+        vkDestroyDevice(device, nullptr);
+        return vulkan_init_fail("vkCreateDescriptorSetLayout() failed: %s",
+                                jitc_vulkan_error_name(rv));
+    }
+
+    VkDescriptorPoolSize pool_sizes[3] {};
+    pool_sizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    pool_sizes[0].descriptorCount = max_tex_descriptors;
+    pool_sizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    pool_sizes[1].descriptorCount = max_tex_descriptors;
+    pool_sizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+    pool_sizes[2].descriptorCount = 128;
+
+    VkDescriptorPoolCreateInfo desc_pool_info {};
+    desc_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    desc_pool_info.flags = use_uab
+        ? VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT
+        : 0;
+    desc_pool_info.maxSets = 1;
+    desc_pool_info.poolSizeCount = 3;
+    desc_pool_info.pPoolSizes = pool_sizes;
+
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    rv = vkCreateDescriptorPool(device, &desc_pool_info, nullptr,
+                                &descriptor_pool);
+    if (rv != VK_SUCCESS) {
+        vkDestroyDescriptorSetLayout(device, descriptor_set_layout, nullptr);
+        vkDestroyCommandPool(device, pool, nullptr);
+        vkDestroySemaphore(device, timeline, nullptr);
+        vkDestroyDevice(device, nullptr);
+        return vulkan_init_fail("vkCreateDescriptorPool() failed: %s",
+                                jitc_vulkan_error_name(rv));
+    }
+
+    VkDescriptorSetAllocateInfo ds_alloc_info {};
+    ds_alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ds_alloc_info.descriptorPool = descriptor_pool;
+    ds_alloc_info.descriptorSetCount = 1;
+    ds_alloc_info.pSetLayouts = &descriptor_set_layout;
+
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    rv = vkAllocateDescriptorSets(device, &ds_alloc_info, &descriptor_set);
+    if (rv != VK_SUCCESS) {
+        vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
+        vkDestroyDescriptorSetLayout(device, descriptor_set_layout, nullptr);
+        vkDestroyCommandPool(device, pool, nullptr);
+        vkDestroySemaphore(device, timeline, nullptr);
+        vkDestroyDevice(device, nullptr);
+        return vulkan_init_fail("vkAllocateDescriptorSets() failed: %s",
+                                jitc_vulkan_error_name(rv));
+    }
+
+    // Shared compute pipeline layout with descriptor set 0 and push constant
+    // range covering the device's maximum push constant size
     VkPushConstantRange pc_range {};
     pc_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pc_range.offset = 0;
@@ -1118,6 +1415,8 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
 
     VkPipelineLayoutCreateInfo layout_info {};
     layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.setLayoutCount = 1;
+    layout_info.pSetLayouts = &descriptor_set_layout;
     layout_info.pushConstantRangeCount = 1;
     layout_info.pPushConstantRanges = &pc_range;
 
@@ -1125,6 +1424,8 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
     rv = vkCreatePipelineLayout(device, &layout_info, nullptr,
                                 &pipeline_layout);
     if (rv != VK_SUCCESS) {
+        vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
+        vkDestroyDescriptorSetLayout(device, descriptor_set_layout, nullptr);
         vkDestroyCommandPool(device, pool, nullptr);
         vkDestroySemaphore(device, timeline, nullptr);
         vkDestroyDevice(device, nullptr);
@@ -1177,6 +1478,10 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
     dev.queue = queue;
     dev.timeline = timeline;
     dev.pipeline_layout = pipeline_layout;
+    dev.descriptor_set_layout = descriptor_set_layout;
+    dev.descriptor_pool = descriptor_pool;
+    dev.descriptor_set = descriptor_set;
+    dev.max_tex_descriptors = max_tex_descriptors;
     dev.pipeline_cache = pipeline_cache;
     dev.timeline_value = 0;
     dev.stream = new VulkanStream();
@@ -1203,6 +1508,7 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
     dev.max_storage_buffer_range = limits.maxStorageBufferRange;
     dev.max_memory_allocation_size = info.props11.maxMemoryAllocationSize;
     dev.max_buffer_size = info.props13.maxBufferSize;
+    dev.max_sampler_anisotropy = limits.maxSamplerAnisotropy;
     dev.sparse_binding = sparse_binding;
     memcpy(dev.device_mem_types, info.device_mem_types,
            sizeof(dev.device_mem_types));
@@ -1223,6 +1529,28 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
     dev.shader_float64_atomic_add =
         atomic_float_add && faf.shaderBufferFloat64AtomicAdd;
     dev.vulkan_memory_model = f12.vulkanMemoryModel;
+    dev.storage_image_write_without_format =
+        f.shaderStorageImageWriteWithoutFormat;
+    dev.sampler_mirror_clamp_to_edge = f12.samplerMirrorClampToEdge;
+    dev.sampler_anisotropy = f.samplerAnisotropy;
+
+    VkFormatFeatureFlags req_srgb_features =
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    VkFormatProperties fmt_props {};
+    vkGetPhysicalDeviceFormatProperties(info.handle, VK_FORMAT_R8_SRGB,
+                                        &fmt_props);
+    dev.srgb_r8_supported =
+        (fmt_props.optimalTilingFeatures & req_srgb_features) ==
+        req_srgb_features;
+    vkGetPhysicalDeviceFormatProperties(info.handle, VK_FORMAT_R8G8_SRGB,
+                                        &fmt_props);
+    dev.srgb_rg8_supported =
+        (fmt_props.optimalTilingFeatures & req_srgb_features) ==
+        req_srgb_features;
+
     dev.supports_accel = supports_accel;
     dev.supports_ray_query = supports_ray_query;
     dev.name = strdup(info.props.deviceName);
@@ -1262,7 +1590,13 @@ static const char *vulkan_kernel_names[(uint32_t) VulkanKernel::Count] = {
     "mkperm_phase_3",
     "mkperm_detect_offsets",
     "mkperm_phase_1_tiny",
-    "mkperm_phase_4_tiny"
+    "mkperm_phase_4_tiny",
+    "deinterleave_u8",
+    "deinterleave_u16",
+    "deinterleave_u32",
+    "interleave_u8",
+    "interleave_u16",
+    "interleave_u32"
 };
 
 static VkPipeline vulkan_create_utility_pipeline(VulkanDevice &dev,
@@ -1353,8 +1687,8 @@ static const char *vulkan_reduce_type_name(VarType vt) {
 }
 
 VkPipeline jitc_vulkan_reduce_pipeline(VulkanDevice &dev,
-                                       VulkanReduceKind kind,
-                                       ReduceOp op, VarType vt) {
+                                        VulkanReduceKind kind,
+                                        ReduceOp op, VarType vt) {
     void *&slot = dev.reduce_pipelines[(uint32_t) kind]
                                       [(uint32_t) op]
                                       [(uint32_t) vt];
@@ -1537,6 +1871,10 @@ void jitc_vulkan_shutdown() {
     for (VulkanDevice &dev : state.vulkan_devices) {
         VkDevice device = (VkDevice) dev.device;
 
+        for (const VulkanTexDestroy &td : dev.stream->pending_tex_frees)
+            vulkan_destroy_tex_item(dev, td);
+        dev.stream->pending_tex_frees.clear();
+
         for (uint32_t i = 0; i < (uint32_t) VulkanKernel::Count; ++i) {
             if (dev.pipelines[i])
                 vkDestroyPipeline(device, (VkPipeline) dev.pipelines[i],
@@ -1550,6 +1888,12 @@ void jitc_vulkan_shutdown() {
                         vkDestroyPipeline(
                             device, (VkPipeline) dev.reduce_pipelines[i][j][k],
                             nullptr);
+
+        for (auto &kv : dev.samplers) {
+            if (kv.second)
+                vkDestroySampler(device, (VkSampler) kv.second, nullptr);
+        }
+        dev.samplers.clear();
 
         if (dev.pipeline_cache) {
             VkPipelineCache cache = (VkPipelineCache) dev.pipeline_cache;
@@ -1609,6 +1953,16 @@ void jitc_vulkan_shutdown() {
             vkDestroyPipelineLayout(device,
                                     (VkPipelineLayout) dev.pipeline_layout,
                                     nullptr);
+
+        if (dev.descriptor_pool)
+            vkDestroyDescriptorPool(device,
+                                    (VkDescriptorPool) dev.descriptor_pool,
+                                    nullptr);
+
+        if (dev.descriptor_set_layout)
+            vkDestroyDescriptorSetLayout(
+                device, (VkDescriptorSetLayout) dev.descriptor_set_layout,
+                nullptr);
 
         vkDestroyCommandPool(device, dev.stream->pool, nullptr);
         delete dev.stream;

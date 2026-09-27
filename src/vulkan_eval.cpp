@@ -33,6 +33,7 @@
 #include "array.h"
 #include "isect.h"
 #include "trace.h"
+#include "tex.h"
 #include <tsl/robin_set.h>
 #include <algorithm>
 
@@ -42,10 +43,18 @@ StringBuffer spv_annotations  { 512 };
 StringBuffer spv_types_consts { 1024 };
 StringBuffer spv_func_locals  { 256 };
 static StringBuffer spv_body  { 1024 };
+static StringBuffer spv_funcs { 1024 };
+
+#define fmt_var_annot(f, ...)                                                  \
+    (callable_depth ? buffer : spv_annotations)                                \
+        .fmt_vulkan(count_args(__VA_ARGS__), fmt_strlen(f), f, ##__VA_ARGS__)
 
 // Forward declarations
 static void jitc_vulkan_render(Variable *v);
 static void jitc_vulkan_render_trace(Variable *v);
+static void jitc_vulkan_render_tex_read(Variable *v);
+static void jitc_vulkan_render_tex_write(Variable *v);
+static void jitc_vulkan_append_unit_funcs(const StringBuffer &unit_src);
 
 // ----------------------------------------------------------------------------
 //  Per-kernel SPIR-V type, constant, and capability tracking
@@ -73,20 +82,31 @@ enum EmittedFlag : uint16_t {
 };
 
 enum SpvFlag : uint32_t {
-    SpvCapInt8           = 1u << 0,
-    SpvCapStorage8Bit    = 1u << 1,
-    SpvCapInt16          = 1u << 2,
-    SpvCapStorage16Bit   = 1u << 3,
-    SpvCapFloat16        = 1u << 4,
-    SpvCapFloat64        = 1u << 5,
-    SpvCapInt64Atomics   = 1u << 6,
-    SpvCapAtomicF32Add   = 1u << 7,
-    SpvCapAtomicF64Add   = 1u << 8,
-    SpvCapSubgroup       = 1u << 9,
-    SpvNeedGlsl450       = 1u << 10,
-    SpvBoolStorageConsts = 1u << 11,
-    SpvCapRayQuery       = 1u << 12,
-    SpvIsectTypes        = 1u << 13,
+    SpvCapInt8                   = 1u << 0,
+    SpvCapStorage8Bit            = 1u << 1,
+    SpvCapInt16                  = 1u << 2,
+    SpvCapStorage16Bit           = 1u << 3,
+    SpvCapFloat16                = 1u << 4,
+    SpvCapFloat64                = 1u << 5,
+    SpvCapInt64Atomics           = 1u << 6,
+    SpvCapAtomicF32Add           = 1u << 7,
+    SpvCapAtomicF64Add           = 1u << 8,
+    SpvCapSubgroup               = 1u << 9,
+    SpvNeedGlsl450               = 1u << 10,
+    SpvBoolStorageConsts         = 1u << 11,
+    SpvCapRayQuery               = 1u << 12,
+    SpvIsectTypes                = 1u << 13,
+    SpvVec3F32                   = 1u << 14,
+    SpvTexHalfConst              = 1u << 15,
+    SpvTexSrgbConsts             = 1u << 16,
+    SpvCapSampledImageNonUniform = 1u << 17,
+    SpvCapStorageImageNonUniform = 1u << 18,
+    SpvCapStorageImageWriteNoFmt = 1u << 19,
+    SpvTexSampled2D              = 1u << 20,
+    SpvTexSampled3D              = 1u << 21,
+    SpvTexSampler                = 1u << 22,
+    SpvTexStorage2D              = 1u << 23,
+    SpvTexStorage3D              = 1u << 24,
 };
 
 static uint16_t emitted_flags[(size_t) VarType::Count];
@@ -124,6 +144,7 @@ void jitc_vulkan_assemble_reset() {
     spv_types_consts.clear();
     spv_func_locals.clear();
     spv_body.clear();
+    spv_funcs.clear();
 
     memset(emitted_flags, 0, sizeof(emitted_flags));
     spv_flags = 0;
@@ -552,6 +573,116 @@ static const char *jitc_vulkan_require_inf(VarType vt) {
     return name;
 }
 
+static const char *jitc_vulkan_require_v3_f32() {
+    if (!(spv_flags & SpvVec3F32)) {
+        jitc_vulkan_require_type(VarType::Float32);
+        put_tc("%v3_f32 = OpTypeVector %f32 3\n");
+        spv_flags |= SpvVec3F32;
+    }
+    return "%v3_f32";
+}
+
+static void jitc_vulkan_require_f32_half() {
+    if (!(spv_flags & SpvTexHalfConst)) {
+        jitc_vulkan_require_type(VarType::Float32);
+        put_tc("%c_f32_half = OpConstant %f32 !0x3f000000\n");
+        spv_flags |= SpvTexHalfConst;
+    }
+}
+
+static void jitc_vulkan_require_tex_srgb_consts() {
+    if (!(spv_flags & SpvTexSrgbConsts)) {
+        jitc_vulkan_require_type(VarType::Float32);
+        put_tc("%c_srgb_thresh = OpConstant %f32 !0x3b4d2e1c\n"
+               "%c_srgb_scale = OpConstant %f32 !0x414eb852\n"
+               "%c_srgb_exp = OpConstant %f32 !0x3ed55555\n"
+               "%c_srgb_a = OpConstant %f32 !0x3f870a3d\n"
+               "%c_srgb_b = OpConstant %f32 !0x3d6147ae\n");
+        spv_flags |= SpvTexSrgbConsts | SpvNeedGlsl450;
+    }
+}
+
+static void jitc_vulkan_require_tex_sampled(uint32_t spv_dim) {
+    uint32_t flag = (spv_dim == 3) ? SpvTexSampled3D : SpvTexSampled2D;
+    if (spv_flags & flag)
+        return;
+    spv_flags |= flag | SpvCapSampledImageNonUniform;
+    jitc_vulkan_require_type(VarType::Float32);
+    jitc_vulkan_require_type(VarType::UInt32);
+    jitc_vulkan_require_vec_type(VarType::Float32, 4);
+    if (spv_dim == 3) {
+        jitc_vulkan_require_v3_f32();
+        put_annot("OpDecorate %drjit_textures_3d DescriptorSet 0\n"
+                  "OpDecorate %drjit_textures_3d Binding 0\n");
+        put_tc("%img_3d = OpTypeImage %f32 3D 0 0 0 1 Unknown\n"
+               "%arr_img_3d = OpTypeRuntimeArray %img_3d\n"
+               "%ptr_uc_arr_img_3d = OpTypePointer UniformConstant %arr_img_3d\n"
+               "%ptr_uc_img_3d = OpTypePointer UniformConstant %img_3d\n"
+               "%simg_3d = OpTypeSampledImage %img_3d\n"
+               "%drjit_textures_3d = OpVariable %ptr_uc_arr_img_3d UniformConstant\n");
+    } else {
+        jitc_vulkan_require_vec_type(VarType::Float32, 2);
+        put_annot("OpDecorate %drjit_textures_2d DescriptorSet 0\n"
+                  "OpDecorate %drjit_textures_2d Binding 0\n");
+        put_tc("%img_2d = OpTypeImage %f32 2D 0 0 0 1 Unknown\n"
+               "%arr_img_2d = OpTypeRuntimeArray %img_2d\n"
+               "%ptr_uc_arr_img_2d = OpTypePointer UniformConstant %arr_img_2d\n"
+               "%ptr_uc_img_2d = OpTypePointer UniformConstant %img_2d\n"
+               "%simg_2d = OpTypeSampledImage %img_2d\n"
+               "%drjit_textures_2d = OpVariable %ptr_uc_arr_img_2d UniformConstant\n");
+    }
+}
+
+static void jitc_vulkan_require_tex_sampler() {
+    if (spv_flags & SpvTexSampler)
+        return;
+    spv_flags |= SpvTexSampler | SpvCapSampledImageNonUniform;
+    jitc_vulkan_require_type(VarType::UInt32);
+    put_annot("OpDecorate %drjit_samplers DescriptorSet 0\n"
+              "OpDecorate %drjit_samplers Binding 2\n");
+    put_tc("%sampler_t = OpTypeSampler\n"
+           "%arr_sampler = OpTypeRuntimeArray %sampler_t\n"
+           "%ptr_uc_arr_sampler = OpTypePointer UniformConstant %arr_sampler\n"
+           "%ptr_uc_sampler = OpTypePointer UniformConstant %sampler_t\n"
+           "%drjit_samplers = OpVariable %ptr_uc_arr_sampler UniformConstant\n");
+}
+
+static void jitc_vulkan_require_tex_storage(uint32_t spv_dim) {
+    uint32_t flag = (spv_dim == 3) ? SpvTexStorage3D : SpvTexStorage2D;
+    if (spv_flags & flag)
+        return;
+    const VulkanDevice &dev = *active_vulkan_dev;
+    if (unlikely(!dev.storage_image_write_without_format))
+        jitc_raise("jit_eval(): the Vulkan device \"%s\" does not support "
+                   "unformatted storage image writes "
+                   "(shaderStorageImageWriteWithoutFormat)!", dev.name);
+    spv_flags |= flag | SpvCapStorageImageNonUniform | SpvCapStorageImageWriteNoFmt;
+    jitc_vulkan_require_type(VarType::Float32);
+    jitc_vulkan_require_type(VarType::UInt32);
+    jitc_vulkan_require_vec_type(VarType::Float32, 4);
+    if (spv_dim == 3) {
+        put_annot("OpDecorate %drjit_images_3d DescriptorSet 0\n"
+                  "OpDecorate %drjit_images_3d Binding 1\n"
+                  "OpDecorate %drjit_images_3d NonReadable\n");
+        put_tc("%v3_u32 = OpTypeVector %u32 3\n"
+               "%st_img_3d = OpTypeImage %f32 3D 0 0 0 2 Unknown\n"
+               "%arr_st_img_3d = OpTypeRuntimeArray %st_img_3d\n"
+               "%ptr_uc_arr_st_img_3d = OpTypePointer UniformConstant %arr_st_img_3d\n"
+               "%ptr_uc_st_img_3d = OpTypePointer UniformConstant %st_img_3d\n"
+               "%drjit_images_3d = OpVariable %ptr_uc_arr_st_img_3d UniformConstant\n");
+    } else {
+        jitc_vulkan_require_vec_type(VarType::UInt32, 2);
+        put_annot("OpDecorate %drjit_images_2d DescriptorSet 0\n"
+                  "OpDecorate %drjit_images_2d Binding 1\n"
+                  "OpDecorate %drjit_images_2d NonReadable\n");
+        put_tc("%st_img_2d = OpTypeImage %f32 2D 0 0 0 2 Unknown\n"
+               "%arr_st_img_2d = OpTypeRuntimeArray %st_img_2d\n"
+               "%ptr_uc_arr_st_img_2d = OpTypePointer UniformConstant %arr_st_img_2d\n"
+               "%ptr_uc_st_img_2d = OpTypePointer UniformConstant %st_img_2d\n"
+               "%drjit_images_2d = OpVariable %ptr_uc_arr_st_img_2d UniformConstant\n");
+    }
+}
+
 static void jitc_vulkan_require_ray_query() {
     if (spv_flags & SpvCapRayQuery)
         return;
@@ -565,8 +696,8 @@ static void jitc_vulkan_require_ray_query() {
     jitc_vulkan_require_type(VarType::UInt64);
     jitc_vulkan_require_type(VarType::Float32);
     jitc_vulkan_require_vec_type(VarType::Float32, 2);
-    put_tc("%v3_f32 = OpTypeVector %f32 3\n"
-           "%AccelStruct = OpTypeAccelerationStructureKHR\n"
+    jitc_vulkan_require_v3_f32();
+    put_tc("%AccelStruct = OpTypeAccelerationStructureKHR\n"
            "%RayQuery = OpTypeRayQueryKHR\n"
            "%ptr_fn_RayQuery = OpTypePointer Function %RayQuery\n");
 }
@@ -1132,7 +1263,9 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
                     ResourceKind rk = v->resource_kind();
                     if (rk != ResourceKind::Buffer &&
                         rk != ResourceKind::Accel &&
-                        rk != ResourceKind::IFT)
+                        rk != ResourceKind::IFT &&
+                        rk != ResourceKind::Texture &&
+                        rk != ResourceKind::Sampler)
                         jitc_raise("jitc_vulkan_assemble(): resource handles "
                                    "are not supported yet (the Vulkan backend "
                                    "cannot compile kernels with this operation "
@@ -1239,21 +1372,27 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
     // 4. Emit the SPIR-V module header with all required capabilities
     struct CapEntry { uint32_t flag; const char *str; };
     static const CapEntry optional_caps[] = {
-        { SpvCapInt8,         "OpCapability Int8\n" },
-        { SpvCapStorage8Bit,  "OpCapability StorageBuffer8BitAccess\n" },
-        { SpvCapInt16,        "OpCapability Int16\n" },
-        { SpvCapStorage16Bit, "OpCapability StorageBuffer16BitAccess\n" },
-        { SpvCapFloat16,      "OpCapability Float16\n" },
-        { SpvCapFloat64,      "OpCapability Float64\n" },
-        { SpvCapInt64Atomics, "OpCapability Int64Atomics\n" },
-        { SpvCapAtomicF32Add, "OpCapability AtomicFloat32AddEXT\n" },
-        { SpvCapAtomicF64Add, "OpCapability AtomicFloat64AddEXT\n" },
-        { SpvCapSubgroup,     "OpCapability GroupNonUniform\n"
-                              "OpCapability GroupNonUniformVote\n"
-                              "OpCapability GroupNonUniformBallot\n"
-                              "OpCapability GroupNonUniformArithmetic\n" },
-        { SpvCapRayQuery,     "OpCapability RayQueryKHR\n"
-                              "OpCapability RayTraversalPrimitiveCullingKHR\n" },
+        { SpvCapInt8,                   "OpCapability Int8\n" },
+        { SpvCapStorage8Bit,            "OpCapability StorageBuffer8BitAccess\n" },
+        { SpvCapInt16,                  "OpCapability Int16\n" },
+        { SpvCapStorage16Bit,           "OpCapability StorageBuffer16BitAccess\n" },
+        { SpvCapFloat16,                "OpCapability Float16\n" },
+        { SpvCapFloat64,                "OpCapability Float64\n" },
+        { SpvCapInt64Atomics,           "OpCapability Int64Atomics\n" },
+        { SpvCapAtomicF32Add,           "OpCapability AtomicFloat32AddEXT\n" },
+        { SpvCapAtomicF64Add,           "OpCapability AtomicFloat64AddEXT\n" },
+        { SpvCapSubgroup,               "OpCapability GroupNonUniform\n"
+                                        "OpCapability GroupNonUniformVote\n"
+                                        "OpCapability GroupNonUniformBallot\n"
+                                        "OpCapability GroupNonUniformArithmetic\n" },
+        { SpvCapRayQuery,               "OpCapability RayQueryKHR\n"
+                                        "OpCapability RayTraversalPrimitiveCullingKHR\n" },
+        { SpvCapSampledImageNonUniform |
+          SpvCapStorageImageNonUniform, "OpCapability ShaderNonUniform\n"
+                                        "OpCapability RuntimeDescriptorArray\n" },
+        { SpvCapSampledImageNonUniform, "OpCapability SampledImageArrayNonUniformIndexing\n" },
+        { SpvCapStorageImageNonUniform, "OpCapability StorageImageArrayNonUniformIndexing\n" },
+        { SpvCapStorageImageWriteNoFmt, "OpCapability StorageImageWriteWithoutFormat\n" },
     };
 
     put_header("OpCapability Shader\n"
@@ -1276,16 +1415,33 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
     put_header("OpMemoryModel PhysicalStorageBuffer64 GLSL450\n");
     fmt_header("OpEntryPoint GLCompute %main "
                "\"drjit_^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\" "
-               "%gl_GlobalInvocationID %gl_NumWorkGroups$s $s\n"
+               "%gl_GlobalInvocationID %gl_NumWorkGroups$s $s$s$s$s$s$s\n"
                "OpExecutionMode %main LocalSize $u 1 1\n",
                (spv_flags & SpvCapSubgroup) ? " %gl_SubgroupLocalInvocationId"
                                             : "",
-               params_in_pc ? "%params" : "%pc", wg_size);
+               params_in_pc ? "%params" : "%pc",
+               (spv_flags & SpvTexSampled2D) ? " %drjit_textures_2d" : "",
+               (spv_flags & SpvTexSampled3D) ? " %drjit_textures_3d" : "",
+               (spv_flags & SpvTexSampler)   ? " %drjit_samplers"    : "",
+               (spv_flags & SpvTexStorage2D) ? " %drjit_images_2d"   : "",
+               (spv_flags & SpvTexStorage3D) ? " %drjit_images_3d"   : "",
+               wg_size);
 
-    // 5. Concatenate all SPIR-V sections in order into 'buffer'
+    // 5. Merge direct callables (captured in unit_entry->src) and indirect
+    //    callable units into spv_funcs (routing any per-variable OpDecorate
+    //    lines into spv_annotations before concatenating sections).
     spv_body.swap(buffer);
     buffer.clear();
 
+    jitc_unit_finalize(JitBackend::Vulkan);
+    jitc_vulkan_append_unit_funcs(unit_entry->src);
+    for (const CallableUnit &cu : callable_units)
+        jitc_vulkan_append_unit_funcs(cu.unit->src);
+
+    unit_entry->src.clear();
+    callable_units.clear();
+
+    // 6. Concatenate all SPIR-V sections in order into 'buffer'
     put(spv_header.get(), spv_header.size());
     put(spv_annotations.get(), spv_annotations.size());
     put(spv_types_consts.get(), spv_types_consts.size());
@@ -1331,15 +1487,8 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
         "OpReturn\n"
         "OpFunctionEnd\n");
 
-    // 6. Merge direct callables (captured in unit_entry->src) and indirect
-    //    callable units into this single SPIR-V module.
-    jitc_unit_finalize(JitBackend::Vulkan);
-    jitc_vulkan_append_unit_funcs(unit_entry->src);
-    for (const CallableUnit &cu : callable_units)
-        jitc_vulkan_append_unit_funcs(cu.unit->src);
-
-    unit_entry->src.clear();
-    callable_units.clear();
+    if (spv_funcs.size() > 0)
+        put(spv_funcs.get(), spv_funcs.size());
 }
 
 static void jitc_vulkan_render_round(Variable *v, Variable *a0, const char *op) {
@@ -1528,7 +1677,7 @@ static void jitc_vulkan_render(Variable *v) {
         case VarKind::Fma:
             if (jitc_is_float(v)) {
                 jitc_vulkan_require_glsl450();
-                fmt_annot("OpDecorate $v NoContraction\n", v);
+                fmt_var_annot("OpDecorate $v NoContraction\n", v);
                 fmt("$v = OpExtInst $t %glsl450 Fma $v $v $v\n",
                     v, v, a0, a1, a2);
             } else {
@@ -3038,10 +3187,21 @@ static void jitc_vulkan_render(Variable *v) {
             jitc_vulkan_render_array_select(v, a0, a1, a2);
             break;
 
-        // ================ Polymorphic Calls & Ray Tracing ================
+        // ================ Polymorphic Calls, Ray Tracing & Textures ================
 
         case VarKind::TraceRay:
             jitc_vulkan_render_trace(v);
+            break;
+
+        case VarKind::TexLookup:
+        case VarKind::TexLookupLod:
+        case VarKind::TexLookupGrad:
+        case VarKind::TexFetchBilerp:
+            jitc_vulkan_render_tex_read(v);
+            break;
+
+        case VarKind::TexWrite:
+            jitc_vulkan_render_tex_write(v);
             break;
 
         case VarKind::Call:
@@ -3094,17 +3254,28 @@ static void jitc_vulkan_append_unit_funcs(const StringBuffer &unit_src) {
         }
 
         uint32_t fn_id = ++spv_func_id;
-        buffer.put('\n');
+        spv_funcs.put('\n');
+        bool in_annot = false;
+        bool at_bol = true;
         for (const char *p = src; p < fn_end; ) {
+            if (at_bol) {
+                in_annot = (fn_end - p >= 11 &&
+                            strncmp(p, "OpDecorate ", 11) == 0);
+                at_bol = false;
+            }
+            StringBuffer &dst = in_annot ? spv_annotations : spv_funcs;
             if (p + 2 < fn_end && (p[0] == '%' || p[0] == '_') &&
                 p[1] == 'r' && p[2] >= '0' && p[2] <= '9') {
-                buffer.put(p[0]);
-                buffer.put('f');
-                buffer.put_u32(fn_id);
-                buffer.put("_r", 2);
+                dst.put(p[0]);
+                dst.put('f');
+                dst.put_u32(fn_id);
+                dst.put("_r", 2);
                 p += 2;
             } else {
-                buffer.put(*p++);
+                char c = *p++;
+                dst.put(c);
+                if (c == '\n')
+                    at_bol = true;
             }
         }
         src = fn_end;
@@ -3314,7 +3485,7 @@ static void jitc_vulkan_render_func_body(const CallData *call, uint32_t inst) {
                     fmt("$v = OpUConvert %u16 $v_sh\n", v, v);
                 else
                     fmt("$v_u16 = OpUConvert %u16 $v_sh\n"
-                        "$v = OpBitcast $t $v_u16\n",
+                         "$v = OpBitcast $t $v_u16\n",
                         v, v,
                         v, v, v);
             } else {
@@ -3396,7 +3567,9 @@ static void jitc_vulkan_render_func_body(const CallData *call, uint32_t inst) {
             if (vt == VarType::Pointer &&
                 rk != ResourceKind::Buffer &&
                 rk != ResourceKind::Accel &&
-                rk != ResourceKind::IFT)
+                rk != ResourceKind::IFT &&
+                rk != ResourceKind::Texture &&
+                rk != ResourceKind::Sampler)
                 jitc_raise("jitc_vulkan_assemble_func(): resource handles "
                            "are not supported yet!");
 
@@ -4302,6 +4475,233 @@ void jitc_var_call_assemble_vulkan(CallData *call, uint32_t call_reg,
             fmt("$v = OpCompositeExtract $t %call_ret_r$u $u\n",
                 v_out, v_out, call_reg, field);
         }
+    }
+}
+
+// ----------------------------------------------------------------------------
+//  Texture read & write code generation
+// ----------------------------------------------------------------------------
+
+static void jitc_vulkan_render_tex_read(Variable *v) {
+    const TexData *td = (const TexData *) v->data;
+    uint32_t ndim = td->ndim;
+    uint32_t spv_dim = (ndim == 3) ? 3 : 2;
+
+    jitc_vulkan_require_tex_sampled(spv_dim);
+    jitc_vulkan_require_tex_sampler();
+
+    Variable *tex_h  = jitc_var(v->dep[0]);
+    Variable *smp_h  = jitc_var(v->dep[1]);
+    Variable *mask_v = v->dep[2] ? jitc_var(v->dep[2]) : nullptr;
+
+    if (mask_v) {
+        jitc_vulkan_require_type(VarType::Bool);
+        fmt("OpSelectionMerge %tex_done_r$u None\n"
+            "OpBranchConditional $v %tex_then_r$u %tex_done_r$u\n"
+            "%tex_then_r$u = OpLabel\n",
+            v->reg_index, mask_v, v->reg_index, v->reg_index, v->reg_index);
+    }
+
+    fmt_var_annot("OpDecorate $v_tslot NonUniform\n"
+                  "OpDecorate $v_tptr NonUniform\n"
+                  "OpDecorate $v_img NonUniform\n"
+                  "OpDecorate $v_sslot NonUniform\n"
+                  "OpDecorate $v_sptr NonUniform\n"
+                  "OpDecorate $v_smp NonUniform\n"
+                  "OpDecorate $v_simg NonUniform\n",
+                  v, v, v, v, v, v, v);
+
+    const char *ptr_img = (spv_dim == 3) ? "%ptr_uc_img_3d"    : "%ptr_uc_img_2d";
+    const char *arr_img = (spv_dim == 3) ? "%drjit_textures_3d" : "%drjit_textures_2d";
+    const char *img_t   = (spv_dim == 3) ? "%img_3d"           : "%img_2d";
+    const char *simg_t  = (spv_dim == 3) ? "%simg_3d"          : "%simg_2d";
+
+    fmt("$v_tslot = OpUConvert %u32 $v\n"
+        "$v_sslot = OpUConvert %u32 $v\n"
+        "$v_tptr = OpAccessChain $s $s $v_tslot\n"
+        "$v_img = OpLoad $s $v_tptr\n"
+        "$v_sptr = OpAccessChain %ptr_uc_sampler %drjit_samplers $v_sslot\n"
+        "$v_smp = OpLoad %sampler_t $v_sptr\n"
+        "$v_simg = OpSampledImage $s $v_img $v_smp\n",
+        v, tex_h,
+        v, smp_h,
+        v, ptr_img, arr_img, v,
+        v, img_t, v,
+        v, v,
+        v, v,
+        v, simg_t, v, v);
+
+    if (ndim == 1) {
+        jitc_vulkan_require_f32_half();
+        fmt("$v_uv = OpCompositeConstruct %v2_f32 $v %c_f32_half\n",
+            v, jitc_var(td->indices[0]));
+    } else if (ndim == 2) {
+        fmt("$v_uv = OpCompositeConstruct %v2_f32 $v $v\n",
+            v, jitc_var(td->indices[0]), jitc_var(td->indices[1]));
+    } else {
+        fmt("$v_uv = OpCompositeConstruct %v3_f32 $v $v $v\n",
+            v, jitc_var(td->indices[0]), jitc_var(td->indices[1]),
+            jitc_var(td->indices[2]));
+    }
+
+    const char *vec_suffix = mask_v ? "_raw" : "_vec";
+
+    switch ((VarKind) v->kind) {
+        case VarKind::TexLookup: {
+            const char *zero_f32 = jitc_vulkan_require_zero(VarType::Float32);
+            fmt("$v$s = OpImageSampleExplicitLod %v4_f32 $v_simg $v_uv Lod $s\n",
+                v, vec_suffix, v, v, zero_f32);
+            break;
+        }
+        case VarKind::TexLookupLod: {
+            fmt("$v$s = OpImageSampleExplicitLod %v4_f32 $v_simg $v_uv Lod $v\n",
+                v, vec_suffix, v, v, jitc_var(td->values[0]));
+            break;
+        }
+        case VarKind::TexLookupGrad: {
+            if (ndim == 1) {
+                const char *zero_f32 = jitc_vulkan_require_zero(VarType::Float32);
+                fmt("$v_ddx = OpCompositeConstruct %v2_f32 $v $s\n"
+                    "$v_ddy = OpCompositeConstruct %v2_f32 $v $s\n",
+                    v, jitc_var(td->values[0]), zero_f32,
+                    v, jitc_var(td->values[1]), zero_f32);
+            } else if (ndim == 2) {
+                fmt("$v_ddx = OpCompositeConstruct %v2_f32 $v $v\n"
+                    "$v_ddy = OpCompositeConstruct %v2_f32 $v $v\n",
+                    v, jitc_var(td->values[0]), jitc_var(td->values[1]),
+                    v, jitc_var(td->values[2]), jitc_var(td->values[3]));
+            } else {
+                fmt("$v_ddx = OpCompositeConstruct %v3_f32 $v $v $v\n"
+                    "$v_ddy = OpCompositeConstruct %v3_f32 $v $v $v\n",
+                    v, jitc_var(td->values[0]), jitc_var(td->values[1]),
+                    jitc_var(td->values[2]),
+                    v, jitc_var(td->values[3]), jitc_var(td->values[4]),
+                    jitc_var(td->values[5]));
+            }
+            fmt("$v$s = OpImageSampleExplicitLod %v4_f32 $v_simg $v_uv Grad $v_ddx $v_ddy\n",
+                v, vec_suffix, v, v, v, v);
+            break;
+        }
+        case VarKind::TexFetchBilerp: {
+            uint32_t comp = td->component & 3u;
+            jitc_vulkan_require_u32_const(comp);
+            fmt("$v$s = OpImageGather %v4_f32 $v_simg $v_uv %c_u32_$u\n",
+                v, vec_suffix, v, v, comp);
+            break;
+        }
+        default:
+            jitc_fail("jitc_vulkan_render_tex_read(): unexpected VarKind!");
+    }
+
+    if (mask_v) {
+        const char *zero_v4 = jitc_vulkan_require_vec_zero(VarType::Float32, 4);
+        fmt("OpBranch %tex_done_r$u\n"
+            "%tex_done_r$u = OpLabel\n"
+            "$v_vec = OpPhi %v4_f32 $v_raw %tex_then_r$u $s $s\n",
+            v->reg_index, v->reg_index,
+            v, v, v->reg_index, zero_v4, current_block_label);
+        jitc_vulkan_set_label("tex_done", v->reg_index);
+    }
+
+    fmt("$v_out_0 = OpCompositeExtract %f32 $v_vec 0\n"
+        "$v_out_1 = OpCompositeExtract %f32 $v_vec 1\n"
+        "$v_out_2 = OpCompositeExtract %f32 $v_vec 2\n"
+        "$v_out_3 = OpCompositeExtract %f32 $v_vec 3\n",
+        v, v, v, v, v, v, v, v);
+}
+
+static void jitc_vulkan_render_tex_write(Variable *v) {
+    const TexData *td = (const TexData *) v->data;
+    uint32_t ndim = td->ndim;
+    uint32_t spv_dim = (ndim == 3) ? 3 : 2;
+    bool is_srgb = ((td->comp_bytes >> 16) & 1u) != 0;
+
+    jitc_vulkan_require_tex_storage(spv_dim);
+
+    Variable *tex_h  = jitc_var(v->dep[0]);
+    Variable *mask_v = v->dep[1] ? jitc_var(v->dep[1]) : nullptr;
+
+    if (mask_v) {
+        jitc_vulkan_require_type(VarType::Bool);
+        fmt("OpSelectionMerge %texw_done_r$u None\n"
+            "OpBranchConditional $v %texw_then_r$u %texw_done_r$u\n"
+            "%texw_then_r$u = OpLabel\n",
+            v->reg_index, mask_v, v->reg_index, v->reg_index, v->reg_index);
+    }
+
+    fmt_var_annot("OpDecorate $v_tslot NonUniform\n"
+                  "OpDecorate $v_tptr NonUniform\n"
+                  "OpDecorate $v_img NonUniform\n",
+                  v, v, v);
+
+    const char *ptr_st = (spv_dim == 3) ? "%ptr_uc_st_img_3d" : "%ptr_uc_st_img_2d";
+    const char *arr_st = (spv_dim == 3) ? "%drjit_images_3d"  : "%drjit_images_2d";
+    const char *img_st = (spv_dim == 3) ? "%st_img_3d"        : "%st_img_2d";
+
+    fmt("$v_tslot = OpUConvert %u32 $v\n"
+        "$v_tptr = OpAccessChain $s $s $v_tslot\n"
+        "$v_img = OpLoad $s $v_tptr\n",
+        v, tex_h,
+        v, ptr_st, arr_st, v,
+        v, img_st, v);
+
+    if (ndim == 1) {
+        const char *zero_u32 = jitc_vulkan_require_zero(VarType::UInt32);
+        fmt("$v_coord = OpCompositeConstruct %v2_u32 $v $s\n",
+            v, jitc_var(td->indices[0]), zero_u32);
+    } else if (ndim == 2) {
+        fmt("$v_coord = OpCompositeConstruct %v2_u32 $v $v\n",
+            v, jitc_var(td->indices[0]), jitc_var(td->indices[1]));
+    } else {
+        fmt("$v_coord = OpCompositeConstruct %v3_u32 $v $v $v\n",
+            v, jitc_var(td->indices[0]), jitc_var(td->indices[1]),
+            jitc_var(td->indices[2]));
+    }
+
+    const char *zero_f32 = jitc_vulkan_require_zero(VarType::Float32);
+    if (is_srgb) {
+        jitc_vulkan_require_type(VarType::Bool);
+        jitc_vulkan_require_tex_srgb_consts();
+    }
+
+    for (uint32_t c = 0; c < td->n_values; ++c) {
+        Variable *val_c = jitc_var(td->values[c]);
+        if (is_srgb && c < 3) {
+            fmt("$v_cl_$u = OpExtInst %f32 %glsl450 FMax $v $s\n"
+                "$v_lo_$u = OpFMul %f32 $v_cl_$u %c_srgb_scale\n"
+                "$v_pw_$u = OpExtInst %f32 %glsl450 Pow $v_cl_$u %c_srgb_exp\n"
+                "$v_hi0_$u = OpFMul %f32 $v_pw_$u %c_srgb_a\n"
+                "$v_hi_$u = OpFSub %f32 $v_hi0_$u %c_srgb_b\n"
+                "$v_le_$u = OpFOrdLessThanEqual %bool $v_cl_$u %c_srgb_thresh\n"
+                "$v_val_$u = OpSelect %f32 $v_le_$u $v_lo_$u $v_hi_$u\n",
+                v, c, val_c, zero_f32,
+                v, c, v, c,
+                v, c, v, c,
+                v, c, v, c,
+                v, c, v, c,
+                v, c, v, c,
+                v, c, v, c, v, c, v, c);
+        } else {
+            fmt("$v_val_$u = OpCopyObject %f32 $v\n", v, c, val_c);
+        }
+    }
+
+    fmt("$v_val = OpCompositeConstruct %v4_f32", v);
+    for (uint32_t c = 0; c < 4; ++c) {
+        if (c < td->n_values)
+            fmt(" $v_val_$u", v, c);
+        else
+            fmt(" $s", zero_f32);
+    }
+    put("\n");
+
+    fmt("OpImageWrite $v_img $v_coord $v_val\n", v, v, v);
+
+    if (mask_v) {
+        fmt("OpBranch %texw_done_r$u\n"
+            "%texw_done_r$u = OpLabel\n",
+            v->reg_index, v->reg_index);
+        jitc_vulkan_set_label("texw_done", v->reg_index);
     }
 }
 

@@ -9,6 +9,7 @@
 
 #include "vulkan_ts.h"
 #include "vulkan.h"
+#include "vulkan_tex.h"
 #include "var.h"
 #include "util.h"
 #include "log.h"
@@ -408,6 +409,11 @@ Task *VulkanThreadState::launch(Kernel kernel, KernelKey & /*key*/,
                 case ResourceKind::IFT:
                     kernel_params[i] =
                         (void *) (uintptr_t) ((VulkanScene *) owner)->isect_table_address;
+                    break;
+                case ResourceKind::Texture:
+                case ResourceKind::Sampler:
+                    kernel_params[i] =
+                        (void *) (uintptr_t) ((VulkanTexResource *) owner)->slot;
                     break;
                 default:
                     break;
@@ -1228,6 +1234,10 @@ void VulkanThreadState::aggregate(void *dst, AggregationEntry *agg,
                         break;
                     case ResourceKind::IFT:
                         val = (uintptr_t) ((VulkanScene *) e.src)->isect_table_address;
+                        break;
+                    case ResourceKind::Texture:
+                    case ResourceKind::Sampler:
+                        val = (uintptr_t) ((VulkanTexResource *) e.src)->slot;
                         break;
                     default:
                         break;

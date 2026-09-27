@@ -23,6 +23,7 @@
 #  include <drjit-core/vulkan.h>
 #  include "vulkan_api.h"
 #  include "vulkan.h"
+#  include "vulkan_tex.h"
 #endif
 #include "op.h"
 #include "call.h"
@@ -1785,6 +1786,13 @@ void *jit_tex_create(JitBackend backend, size_t ndim, const size_t *shape,
                                      n_levels, mip_filter, max_aniso,
                                      compression);
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (jitc_is_vulkan(backend))
+        return jitc_vulkan_tex_create(ndim, shape, n_channels, format,
+                                      filter_mode, wrap_mode, writable, srgb,
+                                      n_levels, mip_filter, max_aniso,
+                                      compression);
+#endif
     jit_tex_unavailable(backend);
     return nullptr;
 }
@@ -1799,6 +1807,10 @@ void jit_tex_get_shape(const void *handle, size_t *shape) {
 #if defined(DRJIT_ENABLE_METAL)
     if (jitc_is_metal(backend))
         return jitc_metal_tex_get_shape(handle, shape);
+#endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (jitc_is_vulkan(backend))
+        return jitc_vulkan_tex_get_shape(handle, shape);
 #endif
     jit_tex_unavailable(backend);
 }
@@ -1816,6 +1828,10 @@ void jit_tex_get_indices(const void *handle, uint32_t *indices) {
     if (jitc_is_metal(backend))
         return jitc_metal_tex_get_indices(handle, indices);
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (jitc_is_vulkan(backend))
+        return jitc_vulkan_tex_get_indices(handle, indices);
+#endif
     jit_tex_unavailable(backend);
 }
 
@@ -1830,6 +1846,10 @@ void jit_tex_memcpy_d2t(const void *src_ptr, void *dst_handle, size_t level) {
     if (jitc_is_metal(backend))
         return jitc_metal_tex_memcpy_d2t(src_ptr, dst_handle, level);
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (jitc_is_vulkan(backend))
+        return jitc_vulkan_tex_memcpy_d2t(src_ptr, dst_handle, level);
+#endif
     jit_tex_unavailable(backend);
 }
 
@@ -1843,6 +1863,10 @@ void jit_tex_memcpy_t2d(const void *src_handle, void *dst_ptr) {
 #if defined(DRJIT_ENABLE_METAL)
     if (jitc_is_metal(backend))
         return jitc_metal_tex_memcpy_t2d(src_handle, dst_ptr);
+#endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (jitc_is_vulkan(backend))
+        return jitc_vulkan_tex_memcpy_t2d(src_handle, dst_ptr);
 #endif
     jit_tex_unavailable(backend);
 }
@@ -1859,6 +1883,10 @@ void jit_tex_lookup(const void *handle, const uint32_t *pos, uint32_t active,
     if (jitc_is_metal(backend))
         return jitc_metal_tex_lookup(handle, pos, active, out);
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (jitc_is_vulkan(backend))
+        return jitc_vulkan_tex_lookup(handle, pos, active, out);
+#endif
     jit_tex_unavailable(backend);
 }
 
@@ -1873,6 +1901,10 @@ void jit_tex_lookup_lod(const void *handle, const uint32_t *pos, uint32_t lod,
 #if defined(DRJIT_ENABLE_METAL)
     if (jitc_is_metal(backend))
         return jitc_metal_tex_lookup_lod(handle, pos, lod, active, out);
+#endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (jitc_is_vulkan(backend))
+        return jitc_vulkan_tex_lookup_lod(handle, pos, lod, active, out);
 #endif
     jit_tex_unavailable(backend);
 }
@@ -1890,6 +1922,10 @@ void jit_tex_lookup_grad(const void *handle, const uint32_t *pos,
     if (jitc_is_metal(backend))
         return jitc_metal_tex_lookup_grad(handle, pos, ddx, ddy, active, out);
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (jitc_is_vulkan(backend))
+        return jitc_vulkan_tex_lookup_grad(handle, pos, ddx, ddy, active, out);
+#endif
     jit_tex_unavailable(backend);
 }
 
@@ -1905,6 +1941,10 @@ void jit_tex_bilerp_fetch(const void *handle, const uint32_t *pos,
     if (jitc_is_metal(backend))
         return jitc_metal_tex_bilerp_fetch(handle, pos, active, out);
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (jitc_is_vulkan(backend))
+        return jitc_vulkan_tex_bilerp_fetch(handle, pos, active, out);
+#endif
     jit_tex_unavailable(backend);
 }
 
@@ -1919,6 +1959,10 @@ void jit_tex_write(void *handle, const uint32_t *pos, const uint32_t *value,
 #if defined(DRJIT_ENABLE_METAL)
     if (jitc_is_metal(backend))
         return jitc_metal_tex_write(handle, pos, value, active);
+#endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (jitc_is_vulkan(backend))
+        return jitc_vulkan_tex_write(handle, pos, value, active);
 #endif
     jit_tex_unavailable(backend);
 }
@@ -1937,6 +1981,11 @@ void *jit_tex_wrap(JitBackend backend, uintptr_t handle, size_t ndim,
         return jitc_metal_tex_wrap(handle, ndim, format, writable, filter_mode,
                                    wrap_mode, srgb);
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (jitc_is_vulkan(backend))
+        return jitc_vulkan_tex_wrap(handle, ndim, format, writable, filter_mode,
+                                    wrap_mode, srgb);
+#endif
     jit_tex_unavailable(backend);
     return nullptr;
 }
@@ -1947,7 +1996,7 @@ void jit_tex_map(void *handle) {
     if (jitc_is_cuda(((const TextureBase *) handle)->backend))
         return jitc_cuda_tex_map(handle);
 #endif
-    // The native MTLTexture / Dr.Jit-owned array is always usable -> no-op.
+    // The native MTLTexture / VkImage / Dr.Jit-owned array is always usable -> no-op.
     (void) handle;
 }
 
@@ -1971,6 +2020,10 @@ uintptr_t jit_tex_native_handle(const void *handle, size_t sub_index) {
     if (jitc_is_metal(backend))
         return jitc_metal_tex_native_handle(handle, sub_index);
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (jitc_is_vulkan(backend))
+        return jitc_vulkan_tex_native_handle(handle, sub_index);
+#endif
     jit_tex_unavailable(backend);
     return 0;
 }
@@ -1987,6 +2040,10 @@ void jit_tex_destroy(void *handle) {
 #if defined(DRJIT_ENABLE_METAL)
     if (jitc_is_metal(backend))
         return jitc_metal_tex_destroy(handle);
+#endif
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (jitc_is_vulkan(backend))
+        return jitc_vulkan_tex_destroy(handle);
 #endif
     jit_tex_unavailable(backend);
 }
