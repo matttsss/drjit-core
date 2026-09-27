@@ -2892,16 +2892,21 @@ bool jitc_can_scatter_reduce(JitBackend backend, VarType vt, ReduceOp op) {
 
 #if defined(DRJIT_ENABLE_VULKAN)
     bool is_vulkan = jitc_is_vulkan(backend);
+    bool vk_int16 = false, vk_float16 = false;
     bool vk_int64_atomics = false, vk_f64_atomic_add = false;
     if (is_vulkan) {
         const VulkanDevice &dev =
             state.vulkan_devices[thread_state(backend)->device];
+        vk_int16 = dev.shader_int16;
+        vk_float16 = dev.shader_float16;
         vk_int64_atomics = dev.shader_int64_atomics;
         vk_f64_atomic_add = dev.shader_float64_atomic_add;
     }
 #else
-    bool is_vulkan = false, vk_int64_atomics = false, vk_f64_atomic_add = false;
-    (void) is_vulkan; (void) vk_int64_atomics; (void) vk_f64_atomic_add;
+    bool is_vulkan = false, vk_int16 = false, vk_float16 = false;
+    bool vk_int64_atomics = false, vk_f64_atomic_add = false;
+    (void) is_vulkan; (void) vk_int16; (void) vk_float16;
+    (void) vk_int64_atomics; (void) vk_f64_atomic_add;
 #endif
 
     // Metal does not support 64-bit atomics
@@ -2909,9 +2914,11 @@ bool jitc_can_scatter_reduce(JitBackend backend, VarType vt, ReduceOp op) {
                      vt == VarType::Float64))
         return false;
 
-    // Vulkan does not support 16-bit atomics
-    if (is_vulkan && (vt == VarType::Int16 || vt == VarType::UInt16 ||
-                      vt == VarType::Float16))
+    if (is_vulkan && (vt == VarType::Int16 || vt == VarType::UInt16) &&
+        !vk_int16)
+        return false;
+
+    if (is_vulkan && vt == VarType::Float16 && (!vk_int16 || !vk_float16))
         return false;
 
     if (is_vulkan && (vt == VarType::Int64 || vt == VarType::UInt64) &&
