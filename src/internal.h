@@ -840,6 +840,12 @@ struct VulkanDevice {
     /// Driver pipeline cache (VkPipelineCache), loaded from and saved to disk
     void *pipeline_cache = nullptr;
 
+    /// Timestamp query pool blocks (VkQueryPool) and free (pool, query_index) pairs
+    std::vector<void *> query_pools;
+    std::vector<std::pair<void *, uint32_t>> free_queries;
+    float timestamp_period = 0.0f;
+    bool timestamp_supported = false;
+
     /// Lazily created non-reduction utility compute pipelines (VkPipeline)
     void *pipelines[(uint32_t) VulkanKernel::Count] { };
 

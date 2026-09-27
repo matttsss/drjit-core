@@ -68,9 +68,10 @@ struct KernelHistoryEntry {
  *
  * The expensive parts of an entry resolve lazily on first access: \ref
  * jitc_kernel_history_query() converts the backend-specific timing state
- * (CUDA events, a Metal command buffer, a nanothread task handle) into a
- * millisecond value, and \ref jitc_kernel_history_source() fetches the source
- * of JIT-compiled kernels from the in-memory kernel cache.
+ * (CUDA events, a Metal command buffer, a Vulkan timestamp query, or a
+ * nanothread task handle) into a millisecond value, and \ref
+ * jitc_kernel_history_source() fetches the source of JIT-compiled kernels from
+ * the in-memory kernel cache.
  */
 struct KernelHistoryEntryImpl {
     /// Metadata captured at launch time
@@ -81,6 +82,11 @@ struct KernelHistoryEntryImpl {
 
     /// Metal: retained id<MTLCommandBuffer> executing the operation
     void *command_buffer = nullptr;
+
+    /// Vulkan: query pool and base query index (2 queries: start, end)
+    void *vulkan_query_pool = nullptr;
+    uint32_t vulkan_query_index = 0;
+    int vulkan_device = 0;
 
     /// LLVM: retained nanothread task handle
     void *task = nullptr;

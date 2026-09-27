@@ -78,6 +78,9 @@ struct VulkanSubmission {
     /// Texture images/views/memory/slots to release when the work has finished
     std::vector<VulkanTexDestroy> tex_frees;
 
+    /// Timestamp query ranges to recycle when the work has finished
+    std::vector<std::pair<void *, uint32_t>> queries;
+
     /// Host callbacks to run when the work has finished
     std::vector<VulkanCallback> callbacks;
 };
@@ -115,9 +118,10 @@ struct VulkanStream {
     /// Submitted work in submission order
     std::deque<VulkanSubmission> in_flight;
 
-    /// Allocations, textures, and callbacks waiting for the completion of 'cmd'
+    /// Allocations, textures, queries, and callbacks waiting for the completion of 'cmd'
     VulkanFreeList pending_frees;
     std::vector<VulkanTexDestroy> pending_tex_frees;
+    std::vector<std::pair<void *, uint32_t>> pending_queries;
     std::vector<VulkanCallback> pending_callbacks;
 
     /// Host callbacks of finished work that have not run yet
@@ -244,6 +248,25 @@ extern uint32_t jitc_vulkan_sampler_slot(VulkanDevice &dev, int filter_mode,
                                          int wrap_mode, int mip_filter = 1,
                                          size_t max_aniso = 1,
                                          bool mipmapped = false);
+
+struct KernelHistoryEntryImpl;
+
+/// Allocate a 2-query timestamp range on \c dev and record the start timestamp on \c cmd
+extern std::pair<void *, uint32_t>
+jitc_vulkan_history_begin(VulkanDevice &dev, VkCommandBuffer cmd);
+
+/// Record the end timestamp on \c cmd and attach the query range to \c entry
+extern void jitc_vulkan_history_end(VulkanDevice &dev, VkCommandBuffer cmd,
+                                    void *query_pool, uint32_t query_index,
+                                    KernelHistoryEntryImpl *entry);
+
+/// Wait for the command buffer containing the query range to complete and return elapsed time (ms)
+extern float jitc_vulkan_history_wait(int device_id, void *query_pool,
+                                      uint32_t query_index);
+
+/// Recycle a timestamp query range back to \c dev (immediately if \c timed, or once in-flight work finishes)
+extern void jitc_vulkan_history_free(int device_id, void *query_pool,
+                                     uint32_t query_index, bool timed);
 
 /**
  * \brief Reserve \c size bytes (<= 16 KiB) of shared staging memory

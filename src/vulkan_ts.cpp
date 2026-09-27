@@ -10,12 +10,14 @@
 #include "vulkan_ts.h"
 #include "vulkan.h"
 #include "vulkan_tex.h"
+#include "history.h"
 #include "var.h"
 #include "util.h"
 #include "log.h"
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <tuple>
 
 /// Maximum size of a vkCmdUpdateBuffer() command
 static constexpr size_t VulkanMaxUpdateSize = 65536;
@@ -37,45 +39,6 @@ static constexpr uint32_t VulkanChunkSize = 4096;
 static VulkanDevice &vulkan_device(const ThreadState *ts) {
     return state.vulkan_devices[ts->device];
 }
-
-/// RAII guard for recording outermost utility operations in the kernel history
-struct VulkanHistoryScope {
-    VulkanThreadState *ts;
-    KernelType type;
-    uint32_t size;
-    bool enabled, outermost, recorded = false;
-
-    VulkanHistoryScope(VulkanThreadState *ts, KernelType type, uint32_t size)
-        : ts(ts), type(type), size(size),
-          enabled(jit_flags() & (uint32_t) JitFlag::KernelHistory),
-          outermost(false) {
-        if (enabled)
-            outermost = (ts->vulkan_history_depth++ == 0);
-    }
-
-    void record() {
-        if (!enabled || !outermost || recorded)
-            return;
-        recorded = true;
-
-        KernelHistoryEntry meta = {};
-        meta.backend = JitBackend::Vulkan;
-        meta.type = type;
-        meta.recording_mode = ts->recording_mode;
-        meta.size = size;
-        meta.input_count = 1;
-        meta.output_count = 1;
-        jitc_kernel_history_append(meta);
-    }
-
-    ~VulkanHistoryScope() {
-        if (!enabled)
-            return;
-        ts->vulkan_history_depth--;
-        if (outermost)
-            record();
-    }
-};
 
 [[noreturn]] static void vulkan_unsupported(const char *func) {
     jitc_raise("%s(): this operation is not supported by the Vulkan backend "
@@ -111,7 +74,10 @@ static VulkanBuffer *vulkan_lookup(const void *ptr, size_t size,
  * vkCmdUpdateBuffer() or by replicating a staged copy of the pattern.
  */
 static void vulkan_fill(VulkanDevice &dev, void *ptr, size_t size,
-                        uint32_t isize, const void *src, const char *func) {
+                        uint32_t isize, const void *src, const char *func,
+                        VulkanThreadState *ts = nullptr,
+                        KernelType hist_type = KernelType::Memset,
+                        uint32_t hist_width = 0) {
     uint8_t pattern[8];
     memcpy(pattern, src, isize);
 
@@ -127,6 +93,10 @@ static void vulkan_fill(VulkanDevice &dev, void *ptr, size_t size,
     uint8_t *staging = nullptr;
     void *staging_alloc = nullptr;
     size_t staging_size = 0;
+    bool record_hist = ts && (jit_flags() & (uint32_t) JitFlag::KernelHistory);
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    void *qp = nullptr;
+    uint32_t qi = 0;
 
     if (period <= 4) {
         // 4-byte aligned part ("body") of the range
@@ -160,8 +130,10 @@ static void vulkan_fill(VulkanDevice &dev, void *ptr, size_t size,
         if (staging)
             staging_buf = jitc_vulkan_find_buffer(staging, &staging_offset);
 
-        VkCommandBuffer cmd = jitc_vulkan_cmd(dev);
+        cmd = jitc_vulkan_cmd(dev);
         jitc_vulkan_access(dev, true);
+        if (unlikely(record_hist))
+            std::tie(qp, qi) = jitc_vulkan_history_begin(dev, cmd);
 
         if (body_start < body_end) {
             // The 4-byte word covering an aligned position of the body
@@ -196,8 +168,10 @@ static void vulkan_fill(VulkanDevice &dev, void *ptr, size_t size,
             data[i] = pattern[i % 8];
 
         VulkanBuffer *buf = jitc_vulkan_find_buffer(ptr);
-        VkCommandBuffer cmd = jitc_vulkan_cmd(dev);
+        cmd = jitc_vulkan_cmd(dev);
         jitc_vulkan_access(dev, true);
+        if (unlikely(record_hist))
+            std::tie(qp, qi) = jitc_vulkan_history_begin(dev, cmd);
         vkCmdUpdateBuffer(cmd, buf->buffer, offset, size, data.get());
     } else {
         /* Non-repeating 8-byte pattern: stage a chunk containing multiple
@@ -232,10 +206,24 @@ static void vulkan_fill(VulkanDevice &dev, void *ptr, size_t size,
                            std::min(chunk, size - start) };
         }
 
-        VkCommandBuffer cmd = jitc_vulkan_cmd(dev);
+        cmd = jitc_vulkan_cmd(dev);
         jitc_vulkan_access(dev, true);
+        if (unlikely(record_hist))
+            std::tie(qp, qi) = jitc_vulkan_history_begin(dev, cmd);
         vkCmdCopyBuffer(cmd, staging_buf->buffer, buf->buffer,
                         (uint32_t) n_regions, regions.get());
+    }
+
+    if (unlikely(record_hist)) {
+        KernelHistoryEntry meta = {};
+        meta.backend = JitBackend::Vulkan;
+        meta.type = hist_type;
+        meta.recording_mode = ts->recording_mode;
+        meta.size = hist_width;
+        meta.input_count = 1;
+        meta.output_count = 1;
+        KernelHistoryEntryImpl *e = jitc_kernel_history_append(meta);
+        jitc_vulkan_history_end(dev, cmd, qp, qi, e);
     }
 
     if (staging_alloc) {
@@ -244,7 +232,10 @@ static void vulkan_fill(VulkanDevice &dev, void *ptr, size_t size,
         dev.stream->cmd_staging += staging_size;
     }
 
-    jitc_vulkan_maybe_submit(dev);
+    if (unlikely(jit_flag(JitFlag::LaunchBlocking)))
+        jitc_vulkan_sync(false);
+    else
+        jitc_vulkan_maybe_submit(dev);
 }
 
 /// Record a copy of \c size bytes from host memory to a Vulkan allocation.
@@ -458,6 +449,11 @@ Task *VulkanThreadState::launch(Kernel kernel, KernelKey & /*key*/,
     VkCommandBuffer cmd = jitc_vulkan_cmd(dev);
     jitc_vulkan_access(dev, true);
 
+    void *qp = nullptr;
+    uint32_t qi = 0;
+    if (unlikely(kernel_history_entry))
+        std::tie(qp, qi) = jitc_vulkan_history_begin(dev, cmd);
+
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                       (VkPipeline) kernel.vulkan.pipeline);
 
@@ -479,6 +475,13 @@ Task *VulkanThreadState::launch(Kernel kernel, KernelKey & /*key*/,
 
     vkCmdDispatch(cmd, group_count, 1, 1);
 
+    if (unlikely(kernel_history_entry)) {
+        kernel_history_entry->size = size;
+        KernelHistoryEntryImpl *e =
+            jitc_kernel_history_append(*kernel_history_entry);
+        jitc_vulkan_history_end(dev, cmd, qp, qi, e);
+    }
+
     if (unlikely(large_staging))
         jitc_free(large_staging);
 
@@ -486,11 +489,6 @@ Task *VulkanThreadState::launch(Kernel kernel, KernelKey & /*key*/,
         jitc_vulkan_sync(false);
     else
         jitc_vulkan_maybe_submit(dev);
-
-    if (unlikely(kernel_history_entry)) {
-        kernel_history_entry->size = size;
-        jitc_kernel_history_append(*kernel_history_entry);
-    }
 
     return nullptr;
 }
@@ -507,9 +505,11 @@ void VulkanThreadState::memset_async(void *ptr, uint32_t size, uint32_t isize,
     if (size == 0)
         return;
 
-    VulkanHistoryScope hist(this, KernelType::Memset, size);
+    uint64_t zero = 0;
+    bool is_64bit_pattern = (isize == 8 && memcmp(src, &zero, 8) != 0);
     vulkan_fill(vulkan_device(this), ptr, (size_t) size * isize, isize, src,
-                "jit_memset_async");
+                "jit_memset_async", is_64bit_pattern ? this : nullptr,
+                KernelType::Memset, size);
 }
 
 // ====================================================================
@@ -538,14 +538,21 @@ static uint64_t vulkan_resolve(const void *ptr, size_t size, const char *func) {
 }
 
 template <typename Params>
-static void vulkan_dispatch_groups(VulkanDevice &dev, VkPipeline pipeline,
-                                   const Params &params,
-                                   uint32_t total_groups) {
+static void vulkan_dispatch_groups(VulkanDevice &dev, KernelType type,
+                                   KernelRecordingMode recording_mode,
+                                   VkPipeline pipeline, const Params &params,
+                                   uint32_t total_groups, uint32_t width) {
     if (total_groups == 0)
         return;
 
+    uint32_t flags = jit_flags();
     VkCommandBuffer cmd = jitc_vulkan_cmd(dev);
     jitc_vulkan_access(dev, true);
+
+    void *qp = nullptr;
+    uint32_t qi = 0;
+    if (unlikely(flags & (uint32_t) JitFlag::KernelHistory))
+        std::tie(qp, qi) = jitc_vulkan_history_begin(dev, cmd);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdPushConstants(cmd, (VkPipelineLayout) dev.pipeline_layout,
@@ -560,18 +567,32 @@ static void vulkan_dispatch_groups(VulkanDevice &dev, VkPipeline pipeline,
 
     vkCmdDispatch(cmd, gx, gy, 1);
 
-    if (unlikely(jit_flag(JitFlag::LaunchBlocking)))
+    if (unlikely(flags & (uint32_t) JitFlag::KernelHistory)) {
+        KernelHistoryEntry meta = {};
+        meta.backend = JitBackend::Vulkan;
+        meta.type = type;
+        meta.recording_mode = recording_mode;
+        meta.size = width;
+        meta.input_count = 1;
+        meta.output_count = 1;
+
+        KernelHistoryEntryImpl *e = jitc_kernel_history_append(meta);
+        jitc_vulkan_history_end(dev, cmd, qp, qi, e);
+    }
+
+    if (unlikely(flags & (uint32_t) JitFlag::LaunchBlocking))
         jitc_vulkan_sync(false);
     else
         jitc_vulkan_maybe_submit(dev);
 }
 
 template <typename Params>
-static void vulkan_dispatch_threads(VulkanDevice &dev, VkPipeline pipeline,
-                                    const Params &params,
-                                    uint32_t thread_count) {
-    vulkan_dispatch_groups(dev, pipeline, params,
-                           ceil_div(thread_count, VulkanWorkgroupSize));
+static void vulkan_dispatch_threads(VulkanDevice &dev, KernelType type,
+                                    KernelRecordingMode recording_mode,
+                                    VkPipeline pipeline, const Params &params,
+                                    uint32_t thread_count, uint32_t width) {
+    vulkan_dispatch_groups(dev, type, recording_mode, pipeline, params,
+                           ceil_div(thread_count, VulkanWorkgroupSize), width);
 }
 
 // Host-side mirrors of the push constant structs in resources/vulkan_kernels.glsl
@@ -633,7 +654,6 @@ void VulkanThreadState::block_reduce(VarType vt, ReduceOp op, uint32_t size,
         op == ReduceOp::Or || op == ReduceOp::And)
         vt = vulkan_make_int_unsigned(vt);
 
-    VulkanHistoryScope hist(this, KernelType::BlockReduce, size);
     VulkanDevice &dev = vulkan_device(this);
 
     uint32_t block_count = ceil_div(size, block_size);
@@ -678,9 +698,13 @@ void VulkanThreadState::block_reduce(VarType vt, ReduceOp op, uint32_t size,
              chunks_per_block);
 
     if (small)
-        vulkan_dispatch_threads(dev, pipe, params, block_count);
+        vulkan_dispatch_threads(dev, KernelType::BlockReduce,
+                                this->recording_mode, pipe, params,
+                                block_count, size);
     else
-        vulkan_dispatch_groups(dev, pipe, params, chunk_count);
+        vulkan_dispatch_groups(dev, KernelType::BlockReduce,
+                               this->recording_mode, pipe, params,
+                               chunk_count, size);
 
     if (chunks_per_block > 1) {
         block_reduce(vt, op, chunk_count, chunks_per_block, dst, out);
@@ -692,7 +716,8 @@ static void vulkan_block_prefix_reduce(VulkanThreadState *ts, VarType vt,
                                        VarType vta, ReduceOp op, uint32_t size,
                                        uint32_t block_size, bool exclusive,
                                        bool reverse, const void *in,
-                                       void *out) {
+                                       void *out,
+                                       KernelType ktype = KernelType::BlockPrefixReduce) {
     VulkanDevice &dev = vulkan_device(ts);
     uint32_t tsize_in = type_size[(int) vt];
     uint32_t tsize_out = (vt == VarType::UInt8 && vta == VarType::UInt32)
@@ -748,10 +773,12 @@ static void vulkan_block_prefix_reduce(VulkanThreadState *ts, VarType vt,
         rparams.chunk_size = chunk_size;
         rparams.chunks_per_block = chunks_per_block;
 
-        vulkan_dispatch_groups(dev, red_pipe, rparams, chunk_count);
+        vulkan_dispatch_groups(dev, ktype, ts->recording_mode, red_pipe,
+                               rparams, chunk_count, size);
 
-        ts->block_prefix_reduce(vta, op, chunk_count, chunks_per_block,
-                                /* exclusive = */ true, reverse, temp, temp);
+        vulkan_block_prefix_reduce(ts, vta, vta, op, chunk_count,
+                                   chunks_per_block, /* exclusive = */ true,
+                                   reverse, temp, temp, ktype);
     }
 
     // Handle in-place reverse scan over multiple elements in a single workgroup
@@ -775,9 +802,11 @@ static void vulkan_block_prefix_reduce(VulkanThreadState *ts, VarType vt,
     params.reverse = reverse ? 1u : 0u;
 
     if (small)
-        vulkan_dispatch_threads(dev, scan_pipe, params, block_count);
+        vulkan_dispatch_threads(dev, ktype, ts->recording_mode, scan_pipe,
+                                params, block_count, size);
     else
-        vulkan_dispatch_groups(dev, scan_pipe, params, chunk_count);
+        vulkan_dispatch_groups(dev, ktype, ts->recording_mode, scan_pipe,
+                               params, chunk_count, size);
 
     if (temp)
         jitc_free(temp);
@@ -808,15 +837,14 @@ void VulkanThreadState::block_prefix_reduce(VarType vt, ReduceOp op,
         op == ReduceOp::Or || op == ReduceOp::And)
         vt = vulkan_make_int_unsigned(vt);
 
-    VulkanHistoryScope hist(this, KernelType::BlockPrefixReduce, size);
-
     VarType vta = vt;
     if (vt == VarType::Float16 &&
         (op == ReduceOp::Add || op == ReduceOp::Mul))
         vta = VarType::Float32;
 
     vulkan_block_prefix_reduce(this, vt, vta, op, size, block_size,
-                               exclusive, reverse, in, out);
+                               exclusive, reverse, in, out,
+                               KernelType::BlockPrefixReduce);
 }
 
 void VulkanThreadState::reduce_dot(VarType vt, const void *ptr_1,
@@ -831,8 +859,6 @@ void VulkanThreadState::reduce_dot(VarType vt, const void *ptr_1,
     if (!pipe)
         jitc_raise("jit_reduce_dot(): unsupported type %s on the Vulkan backend.",
                    type_name[(int) vt]);
-
-    VulkanHistoryScope hist(this, KernelType::Dot, size);
 
     uint32_t tsize = type_size[(int) vt];
     uint32_t chunk_size = std::min(size, VulkanChunkSize),
@@ -859,7 +885,8 @@ void VulkanThreadState::reduce_dot(VarType vt, const void *ptr_1,
     params.chunk_size = chunk_size;
     params.chunk_count = chunk_count;
 
-    vulkan_dispatch_groups(dev, pipe, params, chunk_count);
+    vulkan_dispatch_groups(dev, KernelType::Dot, this->recording_mode, pipe,
+                           params, chunk_count, size);
 
     if (chunk_count > 1) {
         block_reduce(vt, ReduceOp::Add, chunk_count, chunk_count, dst, out);
@@ -878,7 +905,6 @@ uint32_t VulkanThreadState::compress(const uint8_t *in, uint32_t size,
     if (size == 0)
         return 0;
 
-    VulkanHistoryScope hist(this, KernelType::Compress, size);
     VulkanDevice &dev = vulkan_device(this);
 
     jitc_log(Debug, "jit_compress(" DRJIT_PTR " -> " DRJIT_PTR ", size=%u)",
@@ -892,7 +918,8 @@ uint32_t VulkanThreadState::compress(const uint8_t *in, uint32_t size,
     vulkan_block_prefix_reduce(this, VarType::UInt8, VarType::UInt32,
                                ReduceOp::Add, size, /* block_size = */ size,
                                /* exclusive = */ false,
-                               /* reverse = */ false, in, prefix);
+                               /* reverse = */ false, in, prefix,
+                               KernelType::Compress);
 
     VkPipeline scatter_pipe =
         jitc_vulkan_pipeline(dev, VulkanKernel::CompressScatter);
@@ -907,11 +934,11 @@ uint32_t VulkanThreadState::compress(const uint8_t *in, uint32_t size,
         vulkan_resolve(out, (size_t) size * sizeof(uint32_t), "jit_compress");
     params.size = size;
 
-    vulkan_dispatch_threads(dev, scatter_pipe, params, size);
+    vulkan_dispatch_threads(dev, KernelType::Compress, this->recording_mode,
+                            scatter_pipe, params, size, size);
 
     memcpy_async(count, (const uint8_t *) prefix + (size_t) (size - 1) * 4, 4);
 
-    hist.record();
     jitc_vulkan_sync(false);
     uint32_t result = *(const uint32_t *) count;
     jitc_free(prefix);
@@ -919,7 +946,8 @@ uint32_t VulkanThreadState::compress(const uint8_t *in, uint32_t size,
     return result;
 }
 
-static void vulkan_mkperm_detect_offsets(VulkanDevice &dev, void *buckets,
+static void vulkan_mkperm_detect_offsets(VulkanThreadState *ts,
+                                         VulkanDevice &dev, void *buckets,
                                          size_t buckets_bytes,
                                          uint32_t bucket_count, uint32_t size,
                                          uint32_t row_stride,
@@ -948,16 +976,15 @@ static void vulkan_mkperm_detect_offsets(VulkanDevice &dev, void *buckets,
     params.perm_size = size;
     params.row_stride = row_stride;
 
-    vulkan_dispatch_threads(dev, pipe, params, bucket_count);
+    vulkan_dispatch_threads(dev, KernelType::MkPerm, ts->recording_mode, pipe,
+                            params, bucket_count, size);
 }
 
-static uint32_t vulkan_mkperm_finish(VulkanThreadState *ts,
-                                     VulkanHistoryScope &hist, void *buckets,
+static uint32_t vulkan_mkperm_finish(VulkanThreadState *ts, void *buckets,
                                      uint32_t bucket_count, uint32_t *offsets,
                                      uint32_t *offsets_staging,
                                      VulkanBuffer *offsets_buf, void *counter) {
     jitc_free(buckets);
-    hist.record();
 
     uint32_t unique_count = 0;
     if (offsets) {
@@ -1045,8 +1072,6 @@ uint32_t VulkanThreadState::block_mkperm(const uint32_t *values, uint32_t size,
                  (uintptr_t) values, size, block_size, bucket_count, n_blocks,
                  gpu_blocks_per_group, warp_count, size_per_block);
 
-        VulkanHistoryScope hist(this, KernelType::MkPerm, size);
-
         size_t buckets_bytes = (size_t) total_cells * sizeof(uint32_t);
         void *buckets = jitc_malloc(JitBackend::Vulkan, buckets_bytes);
 
@@ -1074,7 +1099,8 @@ uint32_t VulkanThreadState::block_mkperm(const uint32_t *values, uint32_t size,
         tp.rows_per_group = rows_per_group;
 
         // Phase 1: per-subgroup histograms -> bucket-major global layout
-        vulkan_dispatch_groups(dev, p1_tiny, tp, total_groups);
+        vulkan_dispatch_groups(dev, KernelType::MkPerm, this->recording_mode,
+                               p1_tiny, tp, total_groups, size);
 
         // Phase 2: per-group exclusive prefix sum (segment length = seg)
         block_prefix_reduce(VarType::UInt32, ReduceOp::Add, total_cells, seg,
@@ -1084,16 +1110,17 @@ uint32_t VulkanThreadState::block_mkperm(const uint32_t *values, uint32_t size,
         // Phase 2.5 (optional, single block): detect non-empty buckets
         void *counter = nullptr;
         if (offsets)
-            vulkan_mkperm_detect_offsets(dev, buckets, buckets_bytes,
+            vulkan_mkperm_detect_offsets(this, dev, buckets, buckets_bytes,
                                          bucket_count, size, rows_per_group,
                                          offsets_dev, &counter);
 
         // Phase 4: scatter the permutation
         tp.perm_addr = vulkan_resolve(perm, (size_t) size * sizeof(uint32_t),
                                       "jit_block_mkperm");
-        vulkan_dispatch_groups(dev, p4_tiny, tp, total_groups);
+        vulkan_dispatch_groups(dev, KernelType::MkPerm, this->recording_mode,
+                               p4_tiny, tp, total_groups, size);
 
-        return vulkan_mkperm_finish(this, hist, buckets, bucket_count, offsets,
+        return vulkan_mkperm_finish(this, buckets, bucket_count, offsets,
                                     offsets_staging, offsets_buf, counter);
     }
 
@@ -1104,8 +1131,6 @@ uint32_t VulkanThreadState::block_mkperm(const uint32_t *values, uint32_t size,
                    "not support per-block permutations (block_size != size) "
                    "on Vulkan.",
                    bucket_count);
-
-    VulkanHistoryScope hist(this, KernelType::MkPerm, size);
 
     jitc_log(Debug,
              "jit_block_mkperm(" DRJIT_PTR ", size=%u, block_size=%u, "
@@ -1133,7 +1158,8 @@ uint32_t VulkanThreadState::block_mkperm(const uint32_t *values, uint32_t size,
     params.size = size;
 
     // Phase 1: Build histogram via global atomics
-    vulkan_dispatch_threads(dev, p1, params, size);
+    vulkan_dispatch_threads(dev, KernelType::MkPerm, this->recording_mode, p1,
+                            params, size, size);
 
     // Phase 2: Exclusive prefix sum over histogram
     block_prefix_reduce(VarType::UInt32, ReduceOp::Add, bucket_count,
@@ -1142,16 +1168,17 @@ uint32_t VulkanThreadState::block_mkperm(const uint32_t *values, uint32_t size,
     // Phase 2.5 (optional): Detect non-empty buckets
     void *counter = nullptr;
     if (offsets)
-        vulkan_mkperm_detect_offsets(dev, buckets, bucket_bytes, bucket_count,
-                                     size, /* row_stride = */ 1, offsets_dev,
-                                     &counter);
+        vulkan_mkperm_detect_offsets(this, dev, buckets, bucket_bytes,
+                                     bucket_count, size, /* row_stride = */ 1,
+                                     offsets_dev, &counter);
 
     // Phase 3: Scatter indices using atomics on the prefix-summed histogram
     params.perm_addr = vulkan_resolve(perm, (size_t) size * sizeof(uint32_t),
                                       "jit_block_mkperm");
-    vulkan_dispatch_threads(dev, p3, params, size);
+    vulkan_dispatch_threads(dev, KernelType::MkPerm, this->recording_mode, p3,
+                            params, size, size);
 
-    return vulkan_mkperm_finish(this, hist, buckets, bucket_count, offsets,
+    return vulkan_mkperm_finish(this, buckets, bucket_count, offsets,
                                 offsets_staging, offsets_buf, counter);
 }
 
@@ -1162,18 +1189,17 @@ void VulkanThreadState::memcpy(void *dst, const void *src, size_t size) {
 void VulkanThreadState::memcpy_async(void *dst, const void *src, size_t size) {
     if (size == 0)
         return;
-    VulkanHistoryScope hist(this, KernelType::Memcpy, (uint32_t) size);
     vulkan_copy(vulkan_device(this), dst, src, size, true);
 }
 
 void VulkanThreadState::poke(void *dst, const void *src, uint32_t size) {
-    VulkanHistoryScope hist(this, KernelType::Poke, size);
     jitc_log(Debug, "jit_poke(" DRJIT_PTR ", size=%u)", (uintptr_t) dst, size);
 
     if (size != 1 && size != 2 && size != 4 && size != 8)
         jitc_raise("jit_poke(): only size=1, 2, 4 or 8 are supported!");
 
-    vulkan_fill(vulkan_device(this), dst, size, size, src, "jit_poke");
+    vulkan_fill(vulkan_device(this), dst, size, size, src, "jit_poke",
+                this, KernelType::Poke, 1);
 }
 
 void VulkanThreadState::aggregate(void *dst, AggregationEntry *agg,
@@ -1181,7 +1207,6 @@ void VulkanThreadState::aggregate(void *dst, AggregationEntry *agg,
     if (size == 0)
         return;
 
-    VulkanHistoryScope hist(this, KernelType::Aggregate, size);
     VulkanDevice &dev = vulkan_device(this);
 
     jitc_log(InfoSym,
@@ -1282,8 +1307,14 @@ void VulkanThreadState::aggregate(void *dst, AggregationEntry *agg,
     if (staging)
         staging_buf = jitc_vulkan_find_buffer(staging, &staging_offset);
 
+    uint32_t flags = jit_flags();
     VkCommandBuffer cmd = jitc_vulkan_cmd(dev);
     jitc_vulkan_access(dev, true);
+
+    void *qp = nullptr;
+    uint32_t qi = 0;
+    if (unlikely(flags & (uint32_t) JitFlag::KernelHistory))
+        std::tie(qp, qi) = jitc_vulkan_history_begin(dev, cmd);
 
     if (staging) {
         std::vector<VkBufferCopy> regions;
@@ -1325,12 +1356,28 @@ void VulkanThreadState::aggregate(void *dst, AggregationEntry *agg,
         vkCmdCopyBuffer(cmd, src_buf->buffer, dst_buf->buffer, 1, &region);
     }
 
+    if (unlikely(flags & (uint32_t) JitFlag::KernelHistory)) {
+        KernelHistoryEntry meta = {};
+        meta.backend = JitBackend::Vulkan;
+        meta.type = KernelType::Aggregate;
+        meta.recording_mode = this->recording_mode;
+        meta.size = 1;
+        meta.input_count = 1;
+        meta.output_count = 1;
+
+        KernelHistoryEntryImpl *e = jitc_kernel_history_append(meta);
+        jitc_vulkan_history_end(dev, cmd, qp, qi, e);
+    }
+
     if (staging_alloc) {
         jitc_free(staging_alloc);
         dev.stream->cmd_staging += lit_bytes;
     }
 
-    jitc_vulkan_maybe_submit(dev);
+    if (unlikely(flags & (uint32_t) JitFlag::LaunchBlocking))
+        jitc_vulkan_sync(false);
+    else
+        jitc_vulkan_maybe_submit(dev);
 }
 
 void VulkanThreadState::enqueue_host_func(void (*callback)(void *),

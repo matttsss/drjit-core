@@ -156,6 +156,7 @@ static_assert(check::same_shape<ours::VkSampler, ::VkSampler>(), "typedef VkSamp
 static_assert(check::same_shape<ours::VkDescriptorPool, ::VkDescriptorPool>(), "typedef VkDescriptorPool");
 static_assert(check::same_shape<ours::VkDescriptorSet, ::VkDescriptorSet>(), "typedef VkDescriptorSet");
 static_assert(check::same_shape<ours::VkCommandPool, ::VkCommandPool>(), "typedef VkCommandPool");
+static_assert(check::same_shape<ours::VkQueryPool, ::VkQueryPool>(), "typedef VkQueryPool");
 static_assert(check::same_shape<ours::VkAccelerationStructureKHR, ::VkAccelerationStructureKHR>(), "typedef VkAccelerationStructureKHR");
 static_assert(check::same_shape<ours::VkFlags, ::VkFlags>(), "typedef VkFlags");
 static_assert(check::same_shape<ours::VkFlags64, ::VkFlags64>(), "typedef VkFlags64");
@@ -201,6 +202,9 @@ static_assert(check::same_shape<ours::VkSamplerCreateFlags, ::VkSamplerCreateFla
 static_assert(check::same_shape<ours::VkDescriptorSetLayoutCreateFlags, ::VkDescriptorSetLayoutCreateFlags>(), "typedef VkDescriptorSetLayoutCreateFlags");
 static_assert(check::same_shape<ours::VkDescriptorBindingFlags, ::VkDescriptorBindingFlags>(), "typedef VkDescriptorBindingFlags");
 static_assert(check::same_shape<ours::VkDescriptorPoolCreateFlags, ::VkDescriptorPoolCreateFlags>(), "typedef VkDescriptorPoolCreateFlags");
+static_assert(check::same_shape<ours::VkQueryResultFlags, ::VkQueryResultFlags>(), "typedef VkQueryResultFlags");
+static_assert(check::same_shape<ours::VkQueryPoolCreateFlags, ::VkQueryPoolCreateFlags>(), "typedef VkQueryPoolCreateFlags");
+static_assert(check::same_shape<ours::VkQueryPipelineStatisticFlags, ::VkQueryPipelineStatisticFlags>(), "typedef VkQueryPipelineStatisticFlags");
 static_assert(check::same_shape<ours::VkGeometryFlagsKHR, ::VkGeometryFlagsKHR>(), "typedef VkGeometryFlagsKHR");
 static_assert(check::same_shape<ours::VkGeometryInstanceFlagsKHR, ::VkGeometryInstanceFlagsKHR>(), "typedef VkGeometryInstanceFlagsKHR");
 static_assert(check::same_shape<ours::VkBuildAccelerationStructureFlagsKHR, ::VkBuildAccelerationStructureFlagsKHR>(), "typedef VkBuildAccelerationStructureFlagsKHR");
@@ -243,6 +247,7 @@ static_assert((long long) ours::VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE == (long l
 static_assert((long long) ours::VK_STRUCTURE_TYPE_BIND_SPARSE_INFO == (long long) ::VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, "VK_STRUCTURE_TYPE_BIND_SPARSE_INFO");
 static_assert((long long) ours::VK_STRUCTURE_TYPE_FENCE_CREATE_INFO == (long long) ::VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, "VK_STRUCTURE_TYPE_FENCE_CREATE_INFO");
 static_assert((long long) ours::VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO == (long long) ::VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, "VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO");
+static_assert((long long) ours::VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO == (long long) ::VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, "VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO");
 static_assert((long long) ours::VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO == (long long) ::VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, "VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO");
 static_assert((long long) ours::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO == (long long) ::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, "VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO");
 static_assert((long long) ours::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO == (long long) ::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, "VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO");
@@ -628,6 +633,17 @@ static_assert((long long) ours::VK_INDEX_TYPE_UINT16 == (long long) ::VK_INDEX_T
 static_assert((long long) ours::VK_INDEX_TYPE_UINT32 == (long long) ::VK_INDEX_TYPE_UINT32, "VK_INDEX_TYPE_UINT32");
 static_assert((long long) ours::VK_INDEX_TYPE_NONE_KHR == (long long) ::VK_INDEX_TYPE_NONE_KHR, "VK_INDEX_TYPE_NONE_KHR");
 static_assert((long long) ours::VK_INDEX_TYPE_MAX_ENUM == (long long) ::VK_INDEX_TYPE_MAX_ENUM, "VK_INDEX_TYPE_MAX_ENUM");
+static_assert(sizeof(ours::VkQueryType) == sizeof(::VkQueryType), "sizeof(VkQueryType)");
+static_assert((long long) ours::VK_QUERY_TYPE_OCCLUSION == (long long) ::VK_QUERY_TYPE_OCCLUSION, "VK_QUERY_TYPE_OCCLUSION");
+static_assert((long long) ours::VK_QUERY_TYPE_PIPELINE_STATISTICS == (long long) ::VK_QUERY_TYPE_PIPELINE_STATISTICS, "VK_QUERY_TYPE_PIPELINE_STATISTICS");
+static_assert((long long) ours::VK_QUERY_TYPE_TIMESTAMP == (long long) ::VK_QUERY_TYPE_TIMESTAMP, "VK_QUERY_TYPE_TIMESTAMP");
+static_assert((long long) ours::VK_QUERY_TYPE_MAX_ENUM == (long long) ::VK_QUERY_TYPE_MAX_ENUM, "VK_QUERY_TYPE_MAX_ENUM");
+static_assert(sizeof(ours::VkQueryResultFlagBits) == sizeof(::VkQueryResultFlagBits), "sizeof(VkQueryResultFlagBits)");
+static_assert((long long) ours::VK_QUERY_RESULT_64_BIT == (long long) ::VK_QUERY_RESULT_64_BIT, "VK_QUERY_RESULT_64_BIT");
+static_assert((long long) ours::VK_QUERY_RESULT_WAIT_BIT == (long long) ::VK_QUERY_RESULT_WAIT_BIT, "VK_QUERY_RESULT_WAIT_BIT");
+static_assert((long long) ours::VK_QUERY_RESULT_WITH_AVAILABILITY_BIT == (long long) ::VK_QUERY_RESULT_WITH_AVAILABILITY_BIT, "VK_QUERY_RESULT_WITH_AVAILABILITY_BIT");
+static_assert((long long) ours::VK_QUERY_RESULT_PARTIAL_BIT == (long long) ::VK_QUERY_RESULT_PARTIAL_BIT, "VK_QUERY_RESULT_PARTIAL_BIT");
+static_assert((long long) ours::VK_QUERY_RESULT_FLAG_BITS_MAX_ENUM == (long long) ::VK_QUERY_RESULT_FLAG_BITS_MAX_ENUM, "VK_QUERY_RESULT_FLAG_BITS_MAX_ENUM");
 static_assert(sizeof(ours::VkAccelerationStructureTypeKHR) == sizeof(::VkAccelerationStructureTypeKHR), "sizeof(VkAccelerationStructureTypeKHR)");
 static_assert((long long) ours::VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR == (long long) ::VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, "VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR");
 static_assert((long long) ours::VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR == (long long) ::VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, "VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR");
@@ -2518,6 +2534,20 @@ static_assert(offsetof(ours::VkPhysicalDeviceRayQueryFeaturesKHR, pNext) == offs
 static_assert(check::same_shape<decltype(ours::VkPhysicalDeviceRayQueryFeaturesKHR::pNext), decltype(::VkPhysicalDeviceRayQueryFeaturesKHR::pNext)>(), "VkPhysicalDeviceRayQueryFeaturesKHR::pNext: type");
 static_assert(offsetof(ours::VkPhysicalDeviceRayQueryFeaturesKHR, rayQuery) == offsetof(::VkPhysicalDeviceRayQueryFeaturesKHR, rayQuery), "VkPhysicalDeviceRayQueryFeaturesKHR::rayQuery: offset");
 static_assert(check::same_shape<decltype(ours::VkPhysicalDeviceRayQueryFeaturesKHR::rayQuery), decltype(::VkPhysicalDeviceRayQueryFeaturesKHR::rayQuery)>(), "VkPhysicalDeviceRayQueryFeaturesKHR::rayQuery: type");
+static_assert(sizeof(ours::VkQueryPoolCreateInfo) == sizeof(::VkQueryPoolCreateInfo), "sizeof(VkQueryPoolCreateInfo)");
+static_assert(alignof(ours::VkQueryPoolCreateInfo) == alignof(::VkQueryPoolCreateInfo), "alignof(VkQueryPoolCreateInfo)");
+static_assert(offsetof(ours::VkQueryPoolCreateInfo, sType) == offsetof(::VkQueryPoolCreateInfo, sType), "VkQueryPoolCreateInfo::sType: offset");
+static_assert(check::same_shape<decltype(ours::VkQueryPoolCreateInfo::sType), decltype(::VkQueryPoolCreateInfo::sType)>(), "VkQueryPoolCreateInfo::sType: type");
+static_assert(offsetof(ours::VkQueryPoolCreateInfo, pNext) == offsetof(::VkQueryPoolCreateInfo, pNext), "VkQueryPoolCreateInfo::pNext: offset");
+static_assert(check::same_shape<decltype(ours::VkQueryPoolCreateInfo::pNext), decltype(::VkQueryPoolCreateInfo::pNext)>(), "VkQueryPoolCreateInfo::pNext: type");
+static_assert(offsetof(ours::VkQueryPoolCreateInfo, flags) == offsetof(::VkQueryPoolCreateInfo, flags), "VkQueryPoolCreateInfo::flags: offset");
+static_assert(check::same_shape<decltype(ours::VkQueryPoolCreateInfo::flags), decltype(::VkQueryPoolCreateInfo::flags)>(), "VkQueryPoolCreateInfo::flags: type");
+static_assert(offsetof(ours::VkQueryPoolCreateInfo, queryType) == offsetof(::VkQueryPoolCreateInfo, queryType), "VkQueryPoolCreateInfo::queryType: offset");
+static_assert(check::same_shape<decltype(ours::VkQueryPoolCreateInfo::queryType), decltype(::VkQueryPoolCreateInfo::queryType)>(), "VkQueryPoolCreateInfo::queryType: type");
+static_assert(offsetof(ours::VkQueryPoolCreateInfo, queryCount) == offsetof(::VkQueryPoolCreateInfo, queryCount), "VkQueryPoolCreateInfo::queryCount: offset");
+static_assert(check::same_shape<decltype(ours::VkQueryPoolCreateInfo::queryCount), decltype(::VkQueryPoolCreateInfo::queryCount)>(), "VkQueryPoolCreateInfo::queryCount: type");
+static_assert(offsetof(ours::VkQueryPoolCreateInfo, pipelineStatistics) == offsetof(::VkQueryPoolCreateInfo, pipelineStatistics), "VkQueryPoolCreateInfo::pipelineStatistics: offset");
+static_assert(check::same_shape<decltype(ours::VkQueryPoolCreateInfo::pipelineStatistics), decltype(::VkQueryPoolCreateInfo::pipelineStatistics)>(), "VkQueryPoolCreateInfo::pipelineStatistics: type");
 static_assert(check::same_shape<ours::PFN_vkVoidFunction, ::PFN_vkVoidFunction>(), "PFN_vkVoidFunction");
 static_assert(check::same_shape<ours::PFN_vkGetInstanceProcAddr, ::PFN_vkGetInstanceProcAddr>(), "PFN_vkGetInstanceProcAddr");
 static_assert(check::same_shape<ours::PFN_vkGetDeviceProcAddr, ::PFN_vkGetDeviceProcAddr>(), "PFN_vkGetDeviceProcAddr");
@@ -2588,6 +2618,11 @@ static_assert(check::same_shape<ours::PFN_vkDestroyPipeline, ::PFN_vkDestroyPipe
 static_assert(check::same_shape<ours::PFN_vkCreatePipelineCache, ::PFN_vkCreatePipelineCache>(), "PFN_vkCreatePipelineCache");
 static_assert(check::same_shape<ours::PFN_vkDestroyPipelineCache, ::PFN_vkDestroyPipelineCache>(), "PFN_vkDestroyPipelineCache");
 static_assert(check::same_shape<ours::PFN_vkGetPipelineCacheData, ::PFN_vkGetPipelineCacheData>(), "PFN_vkGetPipelineCacheData");
+static_assert(check::same_shape<ours::PFN_vkCreateQueryPool, ::PFN_vkCreateQueryPool>(), "PFN_vkCreateQueryPool");
+static_assert(check::same_shape<ours::PFN_vkDestroyQueryPool, ::PFN_vkDestroyQueryPool>(), "PFN_vkDestroyQueryPool");
+static_assert(check::same_shape<ours::PFN_vkGetQueryPoolResults, ::PFN_vkGetQueryPoolResults>(), "PFN_vkGetQueryPoolResults");
+static_assert(check::same_shape<ours::PFN_vkCmdResetQueryPool, ::PFN_vkCmdResetQueryPool>(), "PFN_vkCmdResetQueryPool");
+static_assert(check::same_shape<ours::PFN_vkCmdWriteTimestamp, ::PFN_vkCmdWriteTimestamp>(), "PFN_vkCmdWriteTimestamp");
 static_assert(check::same_shape<ours::PFN_vkCmdBindPipeline, ::PFN_vkCmdBindPipeline>(), "PFN_vkCmdBindPipeline");
 static_assert(check::same_shape<ours::PFN_vkCmdBindDescriptorSets, ::PFN_vkCmdBindDescriptorSets>(), "PFN_vkCmdBindDescriptorSets");
 static_assert(check::same_shape<ours::PFN_vkCmdPushConstants, ::PFN_vkCmdPushConstants>(), "PFN_vkCmdPushConstants");
@@ -2784,10 +2819,10 @@ int main() {
     CHECK(strcmp(DRJIT_OURS_VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0, "VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME");
 
 #if defined(DRJIT_CHECK_SPIRV_TOOLS)
-    const int n_static = 2500 + 76;
+    const int n_static = 2535 + 76;
     const char *what = "Vulkan and SPIRV-Tools";
 #else
-    const int n_static = 2500;
+    const int n_static = 2535;
     const char *what = "Vulkan";
 #endif
 

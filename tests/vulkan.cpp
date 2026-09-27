@@ -1439,6 +1439,7 @@ TEST_VULKAN(19_kernel_cache_and_history) {
     jit_assert(jit_kernel_history_query(h1, 0, KernelHistoryField::CacheHit) == 0);
     jit_assert(jit_kernel_history_query(h1, 0, KernelHistoryField::CacheDisk) == 0);
     jit_assert(jit_kernel_history_query(h1, 0, KernelHistoryField::OperationCount) > 0);
+    jit_assert(jit_kernel_history_query(h1, 0, KernelHistoryField::ExecutionTime) > 0);
     std::string spv_src = jit_kernel_history_source(h1, 0);
     jit_assert(spv_src.find("OpCapability Shader") != std::string::npos);
     jit_kernel_history_free(h1);

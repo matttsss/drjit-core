@@ -19,6 +19,9 @@
 #if defined(DRJIT_ENABLE_METAL)
 #  include "metal.h"
 #endif
+#if defined(DRJIT_ENABLE_VULKAN)
+#  include "vulkan.h"
+#endif
 
 /// Doubly linked list of all live entries
 static KernelHistoryEntryImpl *registry_head = nullptr;
@@ -62,6 +65,18 @@ static void finalize_timing(KernelHistoryEntryImpl *e) {
             e->execution_time = time;
             jitc_metal_history_release(e->command_buffer);
             e->command_buffer = nullptr;
+            e->timed = true;
+        }
+        return;
+    }
+#endif
+
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (e->vulkan_query_pool) {
+        float time = jitc_vulkan_history_wait(
+            e->vulkan_device, e->vulkan_query_pool, e->vulkan_query_index);
+        if (!e->timed) {
+            e->execution_time = time;
             e->timed = true;
         }
         return;
@@ -113,6 +128,14 @@ static void release_timing(KernelHistoryEntryImpl *e) {
     if (e->command_buffer) {
         jitc_metal_history_release(e->command_buffer);
         e->command_buffer = nullptr;
+    }
+#endif
+
+#if defined(DRJIT_ENABLE_VULKAN)
+    if (e->vulkan_query_pool) {
+        jitc_vulkan_history_free(e->vulkan_device, e->vulkan_query_pool,
+                                 e->vulkan_query_index, e->timed);
+        e->vulkan_query_pool = nullptr;
     }
 #endif
 

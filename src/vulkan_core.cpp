@@ -10,6 +10,7 @@
 
 #include "vulkan.h"
 #include "vulkan_ts.h"
+#include "history.h"
 #include "var.h"
 #include "trace.h"
 #include "io.h"
@@ -34,6 +35,8 @@
 /// Size of the shared memory chunks used by jitc_vulkan_stage()
 static constexpr size_t VulkanArenaSize = 65536;
 
+/// Number of timestamp queries per VkQueryPool block (256 start/end pairs)
+static constexpr uint32_t VulkanQueryPoolSize = 512;
 
 /// Submit the command buffer being recorded once it contains this many
 /// commands or references this much staging memory (see
@@ -375,6 +378,8 @@ static void vulkan_retire_until(VulkanDevice &dev, uint64_t value) {
             jitc_malloc_release(info, ptr);
         for (const VulkanTexDestroy &td : sub.tex_frees)
             vulkan_destroy_tex_item(dev, td);
+        dev.free_queries.insert(dev.free_queries.end(),
+                                sub.queries.begin(), sub.queries.end());
         s.ready_callbacks.insert(s.ready_callbacks.end(),
                                  sub.callbacks.begin(), sub.callbacks.end());
         s.in_flight.pop_front();
@@ -527,6 +532,9 @@ void jitc_vulkan_submit(VulkanDevice &dev) {
             last.tex_frees.insert(last.tex_frees.end(),
                                   s.pending_tex_frees.begin(),
                                   s.pending_tex_frees.end());
+            last.queries.insert(last.queries.end(),
+                                s.pending_queries.begin(),
+                                s.pending_queries.end());
             last.callbacks.insert(last.callbacks.end(),
                                   s.pending_callbacks.begin(),
                                   s.pending_callbacks.end());
@@ -535,12 +543,16 @@ void jitc_vulkan_submit(VulkanDevice &dev) {
                 jitc_malloc_release(info, ptr);
             for (const VulkanTexDestroy &td : s.pending_tex_frees)
                 vulkan_destroy_tex_item(dev, td);
+            dev.free_queries.insert(dev.free_queries.end(),
+                                    s.pending_queries.begin(),
+                                    s.pending_queries.end());
             s.ready_callbacks.insert(s.ready_callbacks.end(),
                                      s.pending_callbacks.begin(),
                                      s.pending_callbacks.end());
         }
         s.pending_frees.clear();
         s.pending_tex_frees.clear();
+        s.pending_queries.clear();
         s.pending_callbacks.clear();
         jitc_vulkan_raise(rv, __FILE__, __LINE__);
     }
@@ -550,6 +562,7 @@ void jitc_vulkan_submit(VulkanDevice &dev) {
     sub.value = value;
     sub.frees.swap(s.pending_frees);
     sub.tex_frees.swap(s.pending_tex_frees);
+    sub.queries.swap(s.pending_queries);
     sub.callbacks.swap(s.pending_callbacks);
     s.in_flight.push_back(std::move(sub));
     dev.timeline_value = value;
@@ -753,6 +766,98 @@ uint32_t jitc_vulkan_sampler_slot(VulkanDevice &dev, int filter_mode,
         vkUpdateDescriptorSets((VkDevice) dev.device, 1, &write, 0, nullptr);
     }
     return slot;
+}
+
+std::pair<void *, uint32_t> jitc_vulkan_history_begin(VulkanDevice &dev,
+                                                      VkCommandBuffer cmd) {
+    if (!dev.timestamp_supported)
+        return { nullptr, 0 };
+
+    jitc_vulkan_retire(dev);
+
+    if (dev.free_queries.empty()) {
+        VkQueryPoolCreateInfo qp_info {};
+        qp_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        qp_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qp_info.queryCount = VulkanQueryPoolSize;
+
+        VkQueryPool qp = VK_NULL_HANDLE;
+        if (vkCreateQueryPool((VkDevice) dev.device, &qp_info, nullptr, &qp) !=
+            VK_SUCCESS)
+            return { nullptr, 0 };
+
+        dev.query_pools.push_back((void *) qp);
+        dev.free_queries.reserve(dev.free_queries.size() +
+                                 VulkanQueryPoolSize / 2);
+        for (uint32_t i = VulkanQueryPoolSize; i >= 2; i -= 2)
+            dev.free_queries.emplace_back((void *) qp, i - 2);
+    }
+
+    auto [qp, qi] = dev.free_queries.back();
+    dev.free_queries.pop_back();
+
+    vkCmdResetQueryPool(cmd, (VkQueryPool) qp, qi, 2);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        (VkQueryPool) qp, qi);
+    return { qp, qi };
+}
+
+void jitc_vulkan_history_end(VulkanDevice &dev, VkCommandBuffer cmd,
+                             void *query_pool, uint32_t query_index,
+                             KernelHistoryEntryImpl *entry) {
+    if (!query_pool)
+        return;
+
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                        (VkQueryPool) query_pool, query_index + 1);
+
+    entry->vulkan_query_pool = query_pool;
+    entry->vulkan_query_index = query_index;
+    entry->vulkan_device = (int) (&dev - state.vulkan_devices.data());
+}
+
+float jitc_vulkan_history_wait(int device_id, void *query_pool,
+                               uint32_t query_index) {
+    if (!query_pool || device_id < 0 ||
+        (size_t) device_id >= state.vulkan_devices.size())
+        return 0.f;
+
+    VulkanDevice &dev = state.vulkan_devices[device_id];
+    jitc_vulkan_submit(dev);
+    jitc_vulkan_wait(dev, dev.timeline_value, /*release_lock=*/true);
+
+    uint64_t timestamps[2] = { 0, 0 };
+    VkResult rv = vkGetQueryPoolResults(
+        (VkDevice) dev.device, (VkQueryPool) query_pool, query_index, 2,
+        sizeof(timestamps), timestamps, sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (rv == VK_SUCCESS && timestamps[1] >= timestamps[0]) {
+        return (float) ((double) (timestamps[1] - timestamps[0]) *
+                        (double) dev.timestamp_period * 1e-6);
+    }
+    return 0.f;
+}
+
+void jitc_vulkan_history_free(int device_id, void *query_pool,
+                              uint32_t query_index, bool timed) {
+    if (!query_pool || device_id < 0 ||
+        (size_t) device_id >= state.vulkan_devices.size())
+        return;
+
+    VulkanDevice &dev = state.vulkan_devices[device_id];
+    if (timed) {
+        dev.free_queries.emplace_back(query_pool, query_index);
+        return;
+    }
+
+    jitc_vulkan_retire(dev);
+    VulkanStream &s = *dev.stream;
+    if (s.cmd)
+        s.pending_queries.emplace_back(query_pool, query_index);
+    else if (!s.in_flight.empty())
+        s.in_flight.back().queries.emplace_back(query_pool, query_index);
+    else
+        dev.free_queries.emplace_back(query_pool, query_index);
 }
 
 uint8_t *jitc_vulkan_stage(VulkanDevice &dev, size_t size) {
@@ -1483,6 +1588,9 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
     dev.descriptor_set = descriptor_set;
     dev.max_tex_descriptors = max_tex_descriptors;
     dev.pipeline_cache = pipeline_cache;
+    dev.timestamp_period = limits.timestampPeriod;
+    dev.timestamp_supported =
+        limits.timestampComputeAndGraphics && limits.timestampPeriod > 0.0f;
     dev.timeline_value = 0;
     dev.stream = new VulkanStream();
     dev.stream->pool = pool;
@@ -1948,6 +2056,13 @@ void jitc_vulkan_shutdown() {
             }
             vkDestroyPipelineCache(device, cache, nullptr);
         }
+
+        for (void *qp : dev.query_pools) {
+            if (qp)
+                vkDestroyQueryPool(device, (VkQueryPool) qp, nullptr);
+        }
+        dev.query_pools.clear();
+        dev.free_queries.clear();
 
         if (dev.pipeline_layout)
             vkDestroyPipelineLayout(device,

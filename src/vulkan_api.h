@@ -121,6 +121,7 @@ DRJIT_VK_HANDLE(VkSampler)
 DRJIT_VK_HANDLE(VkDescriptorPool)
 DRJIT_VK_HANDLE(VkDescriptorSet)
 DRJIT_VK_HANDLE(VkCommandPool)
+DRJIT_VK_HANDLE(VkQueryPool)
 DRJIT_VK_HANDLE(VkAccelerationStructureKHR)
 
 #undef DRJIT_VK_HANDLE
@@ -179,6 +180,7 @@ typedef enum VkStructureType {
     VK_STRUCTURE_TYPE_BIND_SPARSE_INFO = 7,
     VK_STRUCTURE_TYPE_FENCE_CREATE_INFO = 8,
     VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO = 9,
+    VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO = 11,
     VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO = 12,
     VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO = 14,
     VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO = 15,
@@ -695,6 +697,24 @@ typedef enum VkIndexType {
     VK_INDEX_TYPE_NONE_KHR = 1000165000,
     VK_INDEX_TYPE_MAX_ENUM = 0x7FFFFFFF
 } VkIndexType;
+
+typedef enum VkQueryType {
+    VK_QUERY_TYPE_OCCLUSION = 0,
+    VK_QUERY_TYPE_PIPELINE_STATISTICS = 1,
+    VK_QUERY_TYPE_TIMESTAMP = 2,
+    VK_QUERY_TYPE_MAX_ENUM = 0x7FFFFFFF
+} VkQueryType;
+
+typedef enum VkQueryResultFlagBits {
+    VK_QUERY_RESULT_64_BIT = 0x00000001,
+    VK_QUERY_RESULT_WAIT_BIT = 0x00000002,
+    VK_QUERY_RESULT_WITH_AVAILABILITY_BIT = 0x00000004,
+    VK_QUERY_RESULT_PARTIAL_BIT = 0x00000008,
+    VK_QUERY_RESULT_FLAG_BITS_MAX_ENUM = 0x7FFFFFFF
+} VkQueryResultFlagBits;
+typedef VkFlags VkQueryResultFlags;
+typedef VkFlags VkQueryPoolCreateFlags;
+typedef VkFlags VkQueryPipelineStatisticFlags;
 
 // VK_KHR_acceleration_structure
 typedef enum VkAccelerationStructureTypeKHR {
@@ -1879,6 +1899,15 @@ typedef struct VkPhysicalDeviceRayQueryFeaturesKHR {
     VkBool32 rayQuery;
 } VkPhysicalDeviceRayQueryFeaturesKHR;
 
+typedef struct VkQueryPoolCreateInfo {
+    VkStructureType sType;
+    const void *pNext;
+    VkQueryPoolCreateFlags flags;
+    VkQueryType queryType;
+    uint32_t queryCount;
+    VkQueryPipelineStatisticFlags pipelineStatistics;
+} VkQueryPoolCreateInfo;
+
 // ------------------------- Function pointer types -------------------------
 
 typedef void (VKAPI_PTR *PFN_vkVoidFunction)(void);
@@ -1951,6 +1980,11 @@ typedef void (VKAPI_PTR *PFN_vkDestroyPipeline)(VkDevice device, VkPipeline pipe
 typedef VkResult (VKAPI_PTR *PFN_vkCreatePipelineCache)(VkDevice device, const VkPipelineCacheCreateInfo *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkPipelineCache *pPipelineCache);
 typedef void (VKAPI_PTR *PFN_vkDestroyPipelineCache)(VkDevice device, VkPipelineCache pipelineCache, const VkAllocationCallbacks *pAllocator);
 typedef VkResult (VKAPI_PTR *PFN_vkGetPipelineCacheData)(VkDevice device, VkPipelineCache pipelineCache, size_t *pDataSize, void *pData);
+typedef VkResult (VKAPI_PTR *PFN_vkCreateQueryPool)(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkQueryPool *pQueryPool);
+typedef void (VKAPI_PTR *PFN_vkDestroyQueryPool)(VkDevice device, VkQueryPool queryPool, const VkAllocationCallbacks *pAllocator);
+typedef VkResult (VKAPI_PTR *PFN_vkGetQueryPoolResults)(VkDevice device, VkQueryPool queryPool, uint32_t firstQuery, uint32_t queryCount, size_t dataSize, void *pData, VkDeviceSize stride, VkQueryResultFlags flags);
+typedef void (VKAPI_PTR *PFN_vkCmdResetQueryPool)(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t firstQuery, uint32_t queryCount);
+typedef void (VKAPI_PTR *PFN_vkCmdWriteTimestamp)(VkCommandBuffer commandBuffer, VkPipelineStageFlagBits pipelineStage, VkQueryPool queryPool, uint32_t query);
 typedef void (VKAPI_PTR *PFN_vkCmdBindPipeline)(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint, VkPipeline pipeline);
 typedef void (VKAPI_PTR *PFN_vkCmdBindDescriptorSets)(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint, VkPipelineLayout layout, uint32_t firstSet, uint32_t descriptorSetCount, const VkDescriptorSet *pDescriptorSets, uint32_t dynamicOffsetCount, const uint32_t *pDynamicOffsets);
 typedef void (VKAPI_PTR *PFN_vkCmdPushConstants)(VkCommandBuffer commandBuffer, VkPipelineLayout layout, VkShaderStageFlags stageFlags, uint32_t offset, uint32_t size, const void *pValues);
@@ -2151,6 +2185,11 @@ typedef const char *(*PFN_spvSoftwareVersionString)(void);
     X(vkCreatePipelineCache)                                                   \
     X(vkDestroyPipelineCache)                                                  \
     X(vkGetPipelineCacheData)                                                  \
+    X(vkCreateQueryPool)                                                       \
+    X(vkDestroyQueryPool)                                                      \
+    X(vkGetQueryPoolResults)                                                   \
+    X(vkCmdResetQueryPool)                                                     \
+    X(vkCmdWriteTimestamp)                                                     \
     X(vkCmdBindPipeline)                                                       \
     X(vkCmdBindDescriptorSets)                                                 \
     X(vkCmdPushConstants)                                                      \

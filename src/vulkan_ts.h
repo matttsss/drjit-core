@@ -73,9 +73,6 @@ struct VulkanThreadState final : ThreadState {
 
     void coop_vec_pack(uint32_t count, const void *in, const MatrixDescr *in_d,
                        void *out, const MatrixDescr *out_d) override;
-
-    /// Nesting depth of active VulkanHistoryScope guards
-    uint32_t vulkan_history_depth = 0;
 };
 
 #endif // defined(DRJIT_ENABLE_VULKAN)
