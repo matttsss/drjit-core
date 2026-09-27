@@ -119,6 +119,8 @@ using HalfV   = VulkanArray<drjit::half>;
     TEST_REGISTER_LLVM(name,    _llvm_fp32,     FloatL)                        \
     TEST_REGISTER_LLVM(name,    _llvm_fp16,     HalfL)                         \
     TEST_REGISTER_METAL(name,   _metal_fp32,    FloatM)                        \
+    TEST_REGISTER_VULKAN(name,  _vulkan_fp32,   FloatV)                        \
+    TEST_REGISTER_VULKAN(name,  _vulkan_fp16,   HalfV)                         \
     template <JitBackend Backend, typename Float, typename Int32,              \
               typename UInt32, typename Mask, template <class> class Array>    \
     void test##name()
@@ -133,6 +135,8 @@ using HalfV   = VulkanArray<drjit::half>;
     TEST_REGISTER_OPTIX(name,   _optix_fp16,    HalfC)                         \
     TEST_REGISTER_LLVM(name,    _llvm_fp32,     FloatL)                        \
     TEST_REGISTER_LLVM(name,    _llvm_fp16,     HalfL)                         \
+    TEST_REGISTER_VULKAN(name,  _vulkan_fp32,   FloatV)                        \
+    TEST_REGISTER_VULKAN(name,  _vulkan_fp16,   HalfV)                         \
     template <JitBackend Backend, typename Float, typename Int32,              \
               typename UInt32, typename Mask, template <class> class Array>    \
     void test##name()
@@ -145,6 +149,7 @@ using HalfV   = VulkanArray<drjit::half>;
     TEST_REGISTER_OPTIX(name,   _optix,    FloatC)                             \
     TEST_REGISTER_LLVM(name,    _llvm,     FloatL)                             \
     TEST_REGISTER_METAL(name,   _metal,    FloatM)                             \
+    TEST_REGISTER_VULKAN(name,  _vulkan,   FloatV)                             \
     template <JitBackend Backend, typename Float, typename Int32,              \
               typename UInt32, typename Mask, template <class> class Array>    \
     void test##name()

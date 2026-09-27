@@ -371,7 +371,8 @@ template <typename T> bool test_const_prop() {
                 if (memcmp(&value, &ref, sizeof(Value)) != 0) {
                     if (op == JitOp::Div && double(value - ref) < 1e-6)
                         continue;
-                    if constexpr (Backend == JitBackend::Metal) {
+                    if constexpr (Backend == JitBackend::Metal ||
+                                  Backend == JitBackend::Vulkan) {
                         if (double(value) == 0.0 && double(ref) == 0.0)
                             continue;
                         if (op == JitOp::Div && std::abs(double(value - ref)) < 1e-2)
@@ -468,7 +469,11 @@ template <typename T> bool test_const_prop() {
                     jit_var_read(ref_id, 0, &ref);
 
                     if (memcmp(&value, &ref, sizeof(Value)) != 0) {
-                        if (op == JitOp::Fma && value == ref)
+                        // Mesa llvmpipe folds constant operands in Fma (1-ULP diff)
+                        if (op == JitOp::Fma &&
+                            (value == ref ||
+                             (Backend == JitBackend::Vulkan &&
+                              std::abs(double(value - ref)) < 1e-6)))
                             continue;
                         char *v0 = strdup(jit_var_str(op == JitOp::Select ? in_b[ir] : in[ir]));
                         char *v1 = strdup(jit_var_str(in[jr]));

@@ -1461,6 +1461,7 @@ static void jitc_vulkan_render(Variable *v) {
         case VarKind::Fma:
             if (jitc_is_float(v)) {
                 jitc_vulkan_require_glsl450();
+                fmt_annot("OpDecorate $v NoContraction\n", v);
                 fmt("$v = OpExtInst $t %glsl450 Fma $v $v $v\n",
                     v, v, a0, a1, a2);
             } else {
