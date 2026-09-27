@@ -843,14 +843,16 @@ TEST_VULKAN(15_errors) {
     jit_assert(raises([&] { jit_freeze_start(Backend, nullptr, 0); },
                       "not supported by the Vulkan backend"));
 
-    // Operations that require kernels
+    // Operations that are not implemented yet or receive invalid arguments
     Alloc a(Kind::Device, 1024), b(Kind::Device, 1024);
-    jit_assert(raises([&] { jit_compress(Backend, a.ptr, 16, (uint32_t *) b.ptr); },
-                      "not supported by the Vulkan backend"));
-    jit_assert(raises([&] { jit_block_reduce(Backend, VarType::UInt32,
-                                             ReduceOp::Add, 16, 16, a.ptr,
+    jit_assert(raises([&] { jit_batched_gemm(Backend, VarType::Float32, 0, 0,
+                                             4, 4, 4, nullptr, a.ptr, a.ptr,
                                              b.ptr); },
                       "not supported by the Vulkan backend"));
+    jit_assert(raises([&] { jit_block_reduce(Backend, VarType::UInt32,
+                                             ReduceOp::Add, 16, 32, a.ptr,
+                                             b.ptr); },
+                      "invalid block size"));
 
     // Invalid memory operations
     uint8_t host[64] { };
@@ -3102,13 +3104,13 @@ TEST_VULKAN(23_kernel_cache_and_history) {
                             .time_since_epoch().count() | 1u;
 
     auto run_kernel = [&](uint32_t base_offset, KernelHistory **out_hist) {
-        uint64_t start = jit_kernel_history_begin();
         uint32_t host_in[16];
         for (uint32_t i = 0; i < 16; ++i)
             host_in[i] = base_offset + i;
         uint32_t x = jit_var_mem_copy(Backend, VarType::UInt32, host_in, 16, 0);
         uint32_t c = jit_var_literal(Backend, VarType::UInt32, &unique_c, 16, 0);
         uint32_t y = jit_var_add(x, c);
+        uint64_t start = jit_kernel_history_begin();
         jit_var_eval(y);
         *out_hist = jit_kernel_history_end(start);
 
@@ -4181,7 +4183,7 @@ TEST_VULKAN(27_polymorphic_calls) {
         uint32_t imm_u32 = 0xcafebabeu;
         uint64_t imm_u64 = 0x0102030405060708ull;
 
-        AggregationEntry entries[7] = { };
+        AggregationEntry entries[8] = { };
         memcpy(&entries[0].src, &imm_u8, 1);
         entries[0].offset = 0;
         entries[0].size   = 1;
@@ -4212,7 +4214,11 @@ TEST_VULKAN(27_polymorphic_calls) {
         entries[6].offset = 40;
         entries[6].size   = 8;
 
-        jit_aggregate(Backend, dst_dev.ptr, entries, 7);
+        entries[7].src    = src_sh.ptr + 4;
+        entries[7].offset = 48;
+        entries[7].size   = 8;
+
+        jit_aggregate(Backend, dst_dev.ptr, entries, 8);
 
         std::vector<uint8_t> out = download(dst_dev.ptr, 64);
         jit_assert(out[0] == 0x7fu);
@@ -4220,20 +4226,21 @@ TEST_VULKAN(27_polymorphic_calls) {
         uint32_t got_u32 = 0;
         uint64_t got_u64 = 0;
         uint32_t got_dev[4] = { };
-        uint64_t got_bda_dev = 0, got_bda_sh = 0;
-        memcpy(&got_u16,     out.data() + 2, 2);
-        memcpy(&got_u32,     out.data() + 4, 4);
-        memcpy(&got_u64,     out.data() + 8, 8);
-        memcpy(got_dev,      out.data() + 16, 16);
-        memcpy(&got_bda_dev, out.data() + 32, 8);
-        memcpy(&got_bda_sh,  out.data() + 40, 8);
+        uint64_t got_bda_dev = 0, got_bda_sh = 0, got_bda_sh_off = 0;
+        memcpy(&got_u16,        out.data() + 2, 2);
+        memcpy(&got_u32,        out.data() + 4, 4);
+        memcpy(&got_u64,        out.data() + 8, 8);
+        memcpy(got_dev,         out.data() + 16, 16);
+        memcpy(&got_bda_dev,    out.data() + 32, 8);
+        memcpy(&got_bda_sh,     out.data() + 40, 8);
+        memcpy(&got_bda_sh_off, out.data() + 48, 8);
         jit_assert(got_u16 == imm_u16);
         jit_assert(got_u32 == imm_u32);
         jit_assert(got_u64 == imm_u64);
         for (int i = 0; i < 4; ++i)
             jit_assert(got_dev[i] == src_vals[i]);
         jit_assert(got_bda_dev == (uint64_t) (uintptr_t) src_dev.ptr);
-        jit_assert(got_bda_sh != 0 && got_bda_sh != (uint64_t) (uintptr_t) src_sh.ptr);
+        jit_assert(got_bda_sh != 0 && got_bda_sh_off == got_bda_sh + 4);
     }
 
     // 2. Direct symbolic call (n_inst == 1) with SPIR-V validation
@@ -5046,6 +5053,431 @@ TEST_VULKAN(27_polymorphic_calls) {
     }
 
     jit_set_flag(JitFlag::OptimizeCalls, true);
+}
+
+TEST_VULKAN(28_utility_kernels) {
+    using Float64 = VulkanArray<double>;
+    using UInt64  = VulkanArray<uint64_t>;
+    using Int64   = VulkanArray<int64_t>;
+    using Half    = VulkanArray<drjit::half>;
+
+    // ------------------------------------------------------------------
+    // 1. Boolean reductions: all / any (sync & async, various sizes)
+    // ------------------------------------------------------------------
+    for (uint32_t n : { 1u, 3u, 4u, 17u, 256u, 257u, 5003u }) {
+        UInt32 idx = arange<UInt32>(n);
+        Mask all_true  = idx < n;
+        Mask all_false = idx >= n;
+        Mask one_true  = eq(idx, n / 2);
+        Mask one_false = neq(idx, n / 2);
+
+        jit_assert(jit_var_all(all_true.index())  == 1);
+        jit_assert(jit_var_any(all_true.index())  == 1);
+        jit_assert(jit_var_all(all_false.index()) == 0);
+        jit_assert(jit_var_any(all_false.index()) == 0);
+        jit_assert(jit_var_any(one_true.index())  == 1);
+        jit_assert(jit_var_all(one_true.index())  == (n == 1 ? 1 : 0));
+        jit_assert(jit_var_all(one_false.index()) == 0);
+        jit_assert(jit_var_any(one_false.index()) == (n == 1 ? 0 : 1));
+
+        Mask async_all = Mask::steal(jit_var_all_async(Backend, all_true.index()));
+        Mask async_any = Mask::steal(jit_var_any_async(Backend, one_true.index()));
+        Mask async_no  = Mask::steal(jit_var_all_async(Backend, one_false.index()));
+        jit_assert(strcmp(async_all.str(), "[1]") == 0);
+        jit_assert(strcmp(async_any.str(), "[1]") == 0);
+        jit_assert(strcmp(async_no.str(),  "[0]") == 0);
+    }
+
+    // ------------------------------------------------------------------
+    // 2. Block reductions (small, single-chunk, and multi-chunk blocks)
+    // ------------------------------------------------------------------
+    for (uint32_t size : { 17u, 300u, 5000u, 12345u }) {
+        for (uint32_t bsize : { 1u, 5u, 256u, 1024u, 5000u, size }) {
+            if (bsize > size)
+                continue;
+            uint32_t bcount = (size + bsize - 1) / bsize;
+
+            std::vector<int32_t> h_i32(size);
+            std::vector<uint32_t> h_u32(size);
+            std::vector<float> h_f32(size);
+            std::vector<double> h_f64(size);
+            std::vector<drjit::half> h_f16(size);
+
+            for (uint32_t i = 0; i < size; ++i) {
+                int32_t v = (int32_t) ((i * 1103515245u + 12345u) % 7) - 3;
+                h_i32[i] = v;
+                h_u32[i] = (uint32_t) ((i % 5) + 1);
+                h_f32[i] = (float) v * 0.5f;
+                h_f64[i] = (double) v * 0.25;
+                h_f16[i] = drjit::half((float) ((int32_t) (i % 3) - 1) * 0.5f);
+            }
+
+            Int32 v_i32 = Int32::copy(h_i32.data(), size);
+            UInt32 v_u32 = UInt32::copy(h_u32.data(), size);
+            Float v_f32 = Float::copy(h_f32.data(), size);
+            Float64 v_f64 = Float64::copy(h_f64.data(), size);
+            Half v_f16 = Half::copy(h_f16.data(), size);
+
+            for (ReduceOp op : { ReduceOp::Add, ReduceOp::Min, ReduceOp::Max,
+                                 ReduceOp::Or, ReduceOp::And }) {
+                if (op == ReduceOp::Or || op == ReduceOp::And) {
+                    UInt32 r_u32 = UInt32::steal(
+                        jit_var_block_reduce(op, v_u32.index(), bsize, 0));
+                    r_u32.eval();
+                    std::vector<uint32_t> got_u(bcount);
+                    jit_memcpy(Backend, got_u.data(), r_u32.data(),
+                               bcount * sizeof(uint32_t));
+                    for (uint32_t b = 0; b < bcount; ++b) {
+                        uint32_t ref = (op == ReduceOp::Or) ? 0u : ~0u;
+                        uint32_t end = std::min(size, (b + 1) * bsize);
+                        for (uint32_t i = b * bsize; i < end; ++i)
+                            ref = (op == ReduceOp::Or) ? (ref | h_u32[i])
+                                                       : (ref & h_u32[i]);
+                        jit_assert(got_u[b] == ref);
+                    }
+                } else {
+                    Int32 r_i32 = Int32::steal(
+                        jit_var_block_reduce(op, v_i32.index(), bsize, 0));
+                    Float r_f32 = Float::steal(
+                        jit_var_block_reduce(op, v_f32.index(), bsize, 0));
+                    Float64 r_f64 = Float64::steal(
+                        jit_var_block_reduce(op, v_f64.index(), bsize, 0));
+                    Half r_f16 = Half::steal(
+                        jit_var_block_reduce(op, v_f16.index(), bsize, 0));
+                    r_i32.eval(); r_f32.eval(); r_f64.eval(); r_f16.eval();
+
+                    std::vector<int32_t> got_i(bcount);
+                    std::vector<float> got_f(bcount);
+                    std::vector<double> got_d(bcount);
+                    std::vector<drjit::half> got_h(bcount);
+                    jit_memcpy(Backend, got_i.data(), r_i32.data(),
+                               bcount * sizeof(int32_t));
+                    jit_memcpy(Backend, got_f.data(), r_f32.data(),
+                               bcount * sizeof(float));
+                    jit_memcpy(Backend, got_d.data(), r_f64.data(),
+                               bcount * sizeof(double));
+                    jit_memcpy(Backend, got_h.data(), r_f16.data(),
+                               bcount * sizeof(drjit::half));
+
+                    for (uint32_t b = 0; b < bcount; ++b) {
+                        int32_t ref_i = (op == ReduceOp::Add) ? 0
+                                      : (op == ReduceOp::Min) ? INT32_MAX : INT32_MIN;
+                        double ref_d = (op == ReduceOp::Add) ? 0.0
+                                     : (op == ReduceOp::Min) ? 1e30 : -1e30;
+                        float ref_h = (op == ReduceOp::Add) ? 0.0f
+                                    : (op == ReduceOp::Min) ? 1e4f : -1e4f;
+                        uint32_t end = std::min(size, (b + 1) * bsize);
+                        for (uint32_t i = b * bsize; i < end; ++i) {
+                            if (op == ReduceOp::Add) {
+                                ref_i += h_i32[i];
+                                ref_d += h_f64[i];
+                                ref_h += (float) h_f16[i];
+                            } else if (op == ReduceOp::Min) {
+                                ref_i = std::min(ref_i, h_i32[i]);
+                                ref_d = std::min(ref_d, h_f64[i]);
+                                ref_h = std::min(ref_h, (float) h_f16[i]);
+                            } else {
+                                ref_i = std::max(ref_i, h_i32[i]);
+                                ref_d = std::max(ref_d, h_f64[i]);
+                                ref_h = std::max(ref_h, (float) h_f16[i]);
+                            }
+                        }
+                        jit_assert(got_i[b] == ref_i);
+                        jit_assert(std::abs(got_f[b] - (float) (ref_d * 2.0)) < 1e-4f);
+                        jit_assert(std::abs(got_d[b] - ref_d) < 1e-9);
+                        jit_assert(std::abs((float) got_h[b] - ref_h) < 1e-2f);
+                    }
+                }
+            }
+        }
+    }
+
+    // Also test UInt64 / Int64 reductions
+    {
+        uint32_t size = 5000;
+        std::vector<int64_t> h_i64(size);
+        int64_t ref_sum = 0, ref_min = INT64_MAX, ref_max = INT64_MIN;
+        for (uint32_t i = 0; i < size; ++i) {
+            h_i64[i] = (int64_t) i * 100000ll - 250000000ll;
+            ref_sum += h_i64[i];
+            ref_min = std::min(ref_min, h_i64[i]);
+            ref_max = std::max(ref_max, h_i64[i]);
+        }
+        Int64 v = Int64::copy(h_i64.data(), size);
+        Int64 r_sum = Int64::steal(jit_var_reduce(Backend, VarType::Int64, ReduceOp::Add, v.index()));
+        Int64 r_min = Int64::steal(jit_var_reduce(Backend, VarType::Int64, ReduceOp::Min, v.index()));
+        Int64 r_max = Int64::steal(jit_var_reduce(Backend, VarType::Int64, ReduceOp::Max, v.index()));
+        int64_t got_sum = 0, got_min = 0, got_max = 0;
+        jit_var_read(r_sum.index(), 0, &got_sum);
+        jit_var_read(r_min.index(), 0, &got_min);
+        jit_var_read(r_max.index(), 0, &got_max);
+        jit_assert(got_sum == ref_sum);
+        jit_assert(got_min == ref_min);
+        jit_assert(got_max == ref_max);
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Block prefix reductions (SmallScan, single-chunk Scan, multi-chunk)
+    // ------------------------------------------------------------------
+    for (uint32_t size : { 19u, 500u, 3500u }) {
+        for (uint32_t bsize : { 1u, 7u, 300u, 1024u, 2500u, size }) {
+            if (bsize > size)
+                continue;
+            std::vector<int32_t> h_in(size);
+            std::vector<drjit::half> h_f16(size);
+            for (uint32_t i = 0; i < size; ++i) {
+                h_in[i] = (int32_t) ((i * 17 + 5) % 9) - 4;
+                h_f16[i] = drjit::half((float) ((int32_t) (i % 3) - 1) * 0.5f);
+            }
+            Int32 v_in = Int32::copy(h_in.data(), size);
+            Half v_h16 = Half::copy(h_f16.data(), size);
+
+            for (int excl = 0; excl < 2; ++excl) {
+                for (int rev = 0; rev < 2; ++rev) {
+                    Int32 r = Int32::steal(jit_var_block_prefix_reduce(
+                        ReduceOp::Add, v_in.index(), bsize, excl, rev));
+                    Half rh = Half::steal(jit_var_block_prefix_reduce(
+                        ReduceOp::Add, v_h16.index(), bsize, excl, rev));
+                    r.eval();
+                    rh.eval();
+
+                    std::vector<int32_t> got(size);
+                    std::vector<drjit::half> got_h(size);
+                    jit_memcpy(Backend, got.data(), r.data(), size * sizeof(int32_t));
+                    jit_memcpy(Backend, got_h.data(), rh.data(), size * sizeof(drjit::half));
+
+                    uint32_t bcount = (size + bsize - 1) / bsize;
+                    for (uint32_t b = 0; b < bcount; ++b) {
+                        uint32_t start = b * bsize;
+                        uint32_t end = std::min(size, start + bsize);
+                        int32_t acc = 0;
+                        float acc_h = 0.f;
+                        for (uint32_t j = 0; j < end - start; ++j) {
+                            uint32_t idx = rev ? (end - 1 - j) : (start + j);
+                            int32_t val = h_in[idx];
+                            float val_h = (float) h_f16[idx];
+                            int32_t next = acc + val;
+                            float next_h = acc_h + val_h;
+                            int32_t expected = excl ? acc : next;
+                            float expected_h = excl ? acc_h : next_h;
+                            jit_assert(got[idx] == expected);
+                            jit_assert(std::abs((float) got_h[idx] - expected_h) < 1e-2f);
+                            acc = next;
+                            acc_h = next_h;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 4. Fused dot-product reduction (reduce_dot: f16, f32, f64)
+    // ------------------------------------------------------------------
+    for (uint32_t size : { 17u, 300u, 10000u }) {
+        std::vector<float> a_f32(size), b_f32(size);
+        std::vector<double> a_f64(size), b_f64(size);
+        std::vector<drjit::half> a_f16(size), b_f16(size);
+        double ref_d = 0.0;
+        float ref_h = 0.0f;
+
+        for (uint32_t i = 0; i < size; ++i) {
+            double va = ((int) (i % 7) - 3) * 0.5;
+            double vb = ((int) ((i * 3) % 5) - 2) * 0.25;
+            a_f32[i] = (float) va; b_f32[i] = (float) vb;
+            a_f64[i] = va;         b_f64[i] = vb;
+            a_f16[i] = drjit::half((float) va);
+            b_f16[i] = drjit::half((float) vb);
+            ref_d += va * vb;
+            ref_h += (float) a_f16[i] * (float) b_f16[i];
+        }
+
+        Float va32 = Float::copy(a_f32.data(), size),
+              vb32 = Float::copy(b_f32.data(), size);
+        Float64 va64 = Float64::copy(a_f64.data(), size),
+                vb64 = Float64::copy(b_f64.data(), size);
+        Half va16 = Half::copy(a_f16.data(), size),
+             vb16 = Half::copy(b_f16.data(), size);
+
+        Float d32 = Float::steal(jit_var_reduce_dot(va32.index(), vb32.index()));
+        Float64 d64 = Float64::steal(jit_var_reduce_dot(va64.index(), vb64.index()));
+        Half d16 = Half::steal(jit_var_reduce_dot(va16.index(), vb16.index()));
+
+        float got32 = 0.f;
+        double got64 = 0.0;
+        drjit::half got16(0.f);
+        jit_var_read(d32.index(), 0, &got32);
+        jit_var_read(d64.index(), 0, &got64);
+        jit_var_read(d16.index(), 0, &got16);
+
+        jit_assert(std::abs(got32 - (float) ref_d) < 1e-3f);
+        jit_assert(std::abs(got64 - ref_d) < 1e-9);
+        jit_assert(std::abs((float) got16 - ref_h) < 1.0f);
+    }
+
+    // ------------------------------------------------------------------
+    // 5. Mask compaction (compress)
+    // ------------------------------------------------------------------
+    for (uint32_t size : { 1u, 17u, 1024u, 3500u }) {
+        UInt32 idx = arange<UInt32>(size);
+        Mask m_none = idx >= size;
+        Mask m_all  = idx < size;
+        Mask m_some = eq(idx % 3u, 1u);
+
+        UInt32 c_none = UInt32::steal(jit_var_compress(m_none.index()));
+        UInt32 c_all  = UInt32::steal(jit_var_compress(m_all.index()));
+        UInt32 c_some = UInt32::steal(jit_var_compress(m_some.index()));
+
+        jit_assert(c_none.size() == 0);
+        jit_assert(c_all.size() == size);
+
+        std::vector<uint32_t> expected;
+        for (uint32_t i = 0; i < size; ++i)
+            if (i % 3u == 1u)
+                expected.push_back(i);
+        jit_assert(c_some.size() == expected.size());
+        if (!expected.empty()) {
+            std::vector<uint32_t> got(expected.size());
+            jit_memcpy(Backend, got.data(), c_some.data(),
+                       expected.size() * sizeof(uint32_t));
+            for (size_t i = 0; i < expected.size(); ++i)
+                jit_assert(got[i] == expected[i]);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 6. Bucket permutation (block_mkperm: tiny & global-atomic variants)
+    // ------------------------------------------------------------------
+    for (uint32_t n_buckets : { 1u, 13u, 256u, 2500u }) {
+        uint32_t size = 4000;
+        std::vector<uint32_t> h_val(size);
+        for (uint32_t i = 0; i < size; ++i)
+            h_val[i] = (i * 2654435761u) % n_buckets;
+
+        UInt32 v_val = UInt32::copy(h_val.data(), size);
+        uint32_t *perm = (uint32_t *) jit_malloc(Backend, size * sizeof(uint32_t));
+        uint32_t *offsets = (uint32_t *) jit_malloc(
+            Backend, (n_buckets * 4 + 1) * sizeof(uint32_t), /*shared=*/true);
+
+        uint32_t num_unique = jit_block_mkperm(
+            Backend, (const uint32_t *) v_val.data(), size, size, n_buckets,
+            perm, offsets);
+        jit_sync_thread();
+
+        std::vector<uint32_t> h_perm(size);
+        jit_memcpy(Backend, h_perm.data(), perm, size * sizeof(uint32_t));
+
+        struct Bucket { uint32_t id, start, size, unused; };
+        Bucket *buckets = (Bucket *) offsets;
+        jit_assert(offsets[4 * n_buckets] == num_unique);
+
+        uint32_t total = 0;
+        for (uint32_t b = 0; b < num_unique; ++b) {
+            total += buckets[b].size;
+            uint32_t prev_idx = 0;
+            for (uint32_t k = 0; k < buckets[b].size; ++k) {
+                uint32_t idx = h_perm[buckets[b].start + k];
+                jit_assert(idx < size);
+                jit_assert(h_val[idx] == buckets[b].id);
+                // The tiny variant (n_buckets <= 2048) guarantees stability
+                if (n_buckets <= 2048 && k > 0)
+                    jit_assert(idx > prev_idx);
+                prev_idx = idx;
+            }
+        }
+        jit_assert(total == size);
+
+        jit_free(perm);
+        jit_free(offsets);
+    }
+
+    // Multi-block permutation (block_size < size)
+    {
+        uint32_t size = 1000, block_size = 250, n_buckets = 7;
+        std::vector<uint32_t> h_val(size);
+        for (uint32_t i = 0; i < size; ++i)
+            h_val[i] = (i * 73u + 3u) % n_buckets;
+
+        UInt32 v_val = UInt32::copy(h_val.data(), size);
+        uint32_t *perm = (uint32_t *) jit_malloc(Backend, size * sizeof(uint32_t));
+
+        jit_block_mkperm(Backend, (const uint32_t *) v_val.data(), size,
+                         block_size, n_buckets, perm, nullptr);
+
+        std::vector<uint32_t> h_perm(size);
+        jit_memcpy(Backend, h_perm.data(), perm, size * sizeof(uint32_t));
+
+        for (uint32_t blk = 0; blk < size / block_size; ++blk) {
+            uint32_t start = blk * block_size;
+            for (uint32_t k = 0; k < block_size; ++k) {
+                uint32_t idx = h_perm[start + k];
+                jit_assert(idx >= start && idx < start + block_size);
+                if (k > 0) {
+                    uint32_t prev = h_perm[start + k - 1];
+                    jit_assert(h_val[prev] < h_val[idx] ||
+                               (h_val[prev] == h_val[idx] && prev < idx));
+                }
+            }
+        }
+        jit_free(perm);
+    }
+
+    // ------------------------------------------------------------------
+    // 7. Polymorphic calls with OptimizeCalls=1 (jitc_var_call_reduce)
+    // ------------------------------------------------------------------
+    {
+        struct BaseOpt {
+            virtual ~BaseOpt() = default;
+            virtual UInt32 eval(UInt32 x) = 0;
+        };
+        struct Impl1 : BaseOpt {
+            UInt32 eval(UInt32 x) override { return x + 10u; }
+        };
+        struct Impl2 : BaseOpt {
+            UInt32 eval(UInt32 x) override { return x * 10u; }
+        };
+        struct Impl3 : BaseOpt {
+            UInt32 eval(UInt32 x) override { return x + 1000u; }
+        };
+
+        Impl1 i1; Impl2 i2; Impl3 i3;
+        jit_registry_put("Vulkan", "BaseOpt", &i1); // id 1
+        jit_registry_put("Vulkan", "BaseOpt", &i2); // id 2 (unused in self!)
+        jit_registry_put("Vulkan", "BaseOpt", &i3); // id 3
+
+        // self uses only ids 0 (null), 1, and 3 (skipping id 2), testing
+        // compaction of active callables under OptimizeCalls=1
+        uint32_t h_self[6] = { 3, 1, 0, 3, 1, 3 };
+        UInt32 self = UInt32::copy(h_self, 6);
+        UInt32 x    = arange<UInt32>(6) + 1u; // [1, 2, 3, 4, 5, 6]
+        Mask mask   = neq(arange<UInt32>(6), 5u); // mask out lane 5
+
+        auto f_call = [](void *p, uint32_t *in, uint32_t *out) {
+            UInt32 rv = ((BaseOpt *) p)->eval(UInt32::borrow(in[0]));
+            out[0] = rv.release();
+        };
+
+        jit_set_flag(JitFlag::OptimizeCalls, 1);
+        uint32_t inputs[1]  = { x.index() };
+        uint32_t outputs[1] = { 0 };
+        symbolic_call_vk<3, 1, 1>(Backend, "BaseOpt", false,
+                                  self.index(), mask.index(),
+                                  f_call, inputs, outputs);
+        UInt32 y = UInt32::steal(outputs[0]);
+        assemble_and_validate_spirv(y.index());
+
+        // Lane 0: id 3 -> 1 + 1000 = 1001
+        // Lane 1: id 1 -> 2 + 10 = 12
+        // Lane 2: id 0 (null) -> 0
+        // Lane 3: id 3 -> 4 + 1000 = 1004
+        // Lane 4: id 1 -> 5 + 10 = 15
+        // Lane 5: masked out -> 0
+        jit_assert(strcmp(y.str(), "[1001, 12, 0, 1004, 15, 0]") == 0);
+
+        jit_registry_remove(&i1);
+        jit_registry_remove(&i2);
+        jit_registry_remove(&i3);
+    }
 }
 
 

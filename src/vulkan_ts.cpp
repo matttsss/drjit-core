@@ -9,6 +9,8 @@
 
 #include "vulkan_ts.h"
 #include "vulkan.h"
+#include "var.h"
+#include "util.h"
 #include "log.h"
 #include <algorithm>
 #include <cstring>
@@ -17,10 +19,62 @@
 /// Maximum size of a vkCmdUpdateBuffer() command
 static constexpr size_t VulkanMaxUpdateSize = 65536;
 
+/// Workgroup size of precompiled utility kernels in vulkan_kernels.glsl
+static constexpr uint32_t VulkanWorkgroupSize = 256;
+
+/// Contiguous elements each thread of a chunked reduction/scan processes
+static constexpr uint32_t VulkanGrain = 4;
+
+/// Elements covered by one scan workgroup (256 threads * 4 elements)
+static constexpr uint32_t VulkanScanChunkSize =
+    VulkanWorkgroupSize * VulkanGrain;
+
+/// Elements covered by one reduction/dot workgroup (4 iterations * 1024)
+static constexpr uint32_t VulkanChunkSize = 4096;
+
 /// Return the device associated with a thread state
 static VulkanDevice &vulkan_device(const ThreadState *ts) {
     return state.vulkan_devices[ts->device];
 }
+
+/// RAII guard for recording outermost utility operations in the kernel history
+struct VulkanHistoryScope {
+    VulkanThreadState *ts;
+    KernelType type;
+    uint32_t size;
+    bool enabled, outermost, recorded = false;
+
+    VulkanHistoryScope(VulkanThreadState *ts, KernelType type, uint32_t size)
+        : ts(ts), type(type), size(size),
+          enabled(jit_flags() & (uint32_t) JitFlag::KernelHistory),
+          outermost(false) {
+        if (enabled)
+            outermost = (ts->vulkan_history_depth++ == 0);
+    }
+
+    void record() {
+        if (!enabled || !outermost || recorded)
+            return;
+        recorded = true;
+
+        KernelHistoryEntry meta = {};
+        meta.backend = JitBackend::Vulkan;
+        meta.type = type;
+        meta.recording_mode = ts->recording_mode;
+        meta.size = size;
+        meta.input_count = 1;
+        meta.output_count = 1;
+        jitc_kernel_history_append(meta);
+    }
+
+    ~VulkanHistoryScope() {
+        if (!enabled)
+            return;
+        ts->vulkan_history_depth--;
+        if (outermost)
+            record();
+    }
+};
 
 [[noreturn]] static void vulkan_unsupported(const char *func) {
     jitc_raise("%s(): this operation is not supported by the Vulkan backend "
@@ -426,24 +480,364 @@ void VulkanThreadState::memset_async(void *ptr, uint32_t size, uint32_t isize,
     if (size == 0)
         return;
 
+    VulkanHistoryScope hist(this, KernelType::Memset, size);
     vulkan_fill(vulkan_device(this), ptr, (size_t) size * isize, isize, src,
                 "jit_memset_async");
 }
 
-void VulkanThreadState::block_reduce(VarType, ReduceOp, uint32_t, uint32_t,
-                                     const void *, void *) {
-    vulkan_unsupported("jit_block_reduce");
+// ====================================================================
+//          Reductions, prefix scans, compaction & permutations
+// ====================================================================
+
+static VarType vulkan_make_int_unsigned(VarType type) {
+    switch (type) {
+        case VarType::Int8:  return VarType::UInt8;
+        case VarType::Int16: return VarType::UInt16;
+        case VarType::Int32: return VarType::UInt32;
+        case VarType::Int64: return VarType::UInt64;
+        default: return type;
+    }
 }
 
-void VulkanThreadState::block_prefix_reduce(VarType, ReduceOp, uint32_t,
-                                            uint32_t, bool, bool, const void *,
-                                            void *) {
-    vulkan_unsupported("jit_block_prefix_reduce");
+static uint64_t vulkan_resolve(const void *ptr, size_t size, const char *func) {
+    if (!ptr && size == 0)
+        return 0;
+    size_t offset = 0;
+    VulkanBuffer *buf = vulkan_lookup(ptr, size, &offset, func);
+    if (!buf)
+        jitc_raise("%s(): " DRJIT_PTR " is not a Vulkan allocation!", func,
+                   (uintptr_t) ptr);
+    return buf->address + offset;
 }
 
-void VulkanThreadState::reduce_dot(VarType, const void *, const void *,
-                                   uint32_t, void *) {
-    vulkan_unsupported("jit_reduce_dot");
+template <typename Params>
+static void vulkan_dispatch_groups(VulkanDevice &dev, VkPipeline pipeline,
+                                   const Params &params,
+                                   uint32_t total_groups) {
+    if (total_groups == 0)
+        return;
+
+    VkCommandBuffer cmd = jitc_vulkan_cmd(dev);
+    jitc_vulkan_access(dev, true);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdPushConstants(cmd, (VkPipelineLayout) dev.pipeline_layout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Params), &params);
+
+    uint32_t max_x = dev.max_compute_work_group_count[0];
+    uint32_t gx = total_groups, gy = 1;
+    if (max_x > 0 && total_groups > max_x) {
+        gx = max_x;
+        gy = ceil_div(total_groups, gx);
+    }
+
+    vkCmdDispatch(cmd, gx, gy, 1);
+
+    if (unlikely(jit_flag(JitFlag::LaunchBlocking)))
+        jitc_vulkan_sync(false);
+    else
+        jitc_vulkan_maybe_submit(dev);
+}
+
+template <typename Params>
+static void vulkan_dispatch_threads(VulkanDevice &dev, VkPipeline pipeline,
+                                    const Params &params,
+                                    uint32_t thread_count) {
+    vulkan_dispatch_groups(dev, pipeline, params,
+                           ceil_div(thread_count, VulkanWorkgroupSize));
+}
+
+// Host-side mirrors of the push constant structs in resources/vulkan_kernels.glsl
+
+struct VulkanCompressScatterParams {
+    uint64_t in_addr, prefix_addr, out_addr;
+    uint32_t size;
+};
+
+struct VulkanMkpermParams {
+    uint64_t values_addr, buckets_addr, perm_addr;
+    uint32_t size;
+};
+
+struct VulkanMkpermOffsetsParams {
+    uint64_t buckets_addr, offsets_addr, counter_addr;
+    uint32_t bucket_count, perm_size, row_stride;
+};
+
+struct VulkanMkpermTinyParams {
+    uint64_t values_addr, buckets_addr, perm_addr;
+    uint32_t size, size_per_block, bucket_count, block_size;
+    uint32_t n_blocks, gpu_blocks_per_group, warp_count, rows_per_group;
+};
+
+struct VulkanBlockReduceParams {
+    uint64_t in_addr, out_addr;
+    uint32_t size, block_size, block_count, chunk_size, chunks_per_block;
+};
+
+struct VulkanBlockPrefixReduceParams {
+    uint64_t in_addr, out_addr, prefixes_addr;
+    uint32_t size, block_size, block_count, chunk_size, chunks_per_block;
+    uint32_t exclusive, reverse;
+};
+
+struct VulkanReduceDotParams {
+    uint64_t in1_addr, in2_addr, out_addr;
+    uint32_t size, chunk_size, chunk_count;
+};
+
+void VulkanThreadState::block_reduce(VarType vt, ReduceOp op, uint32_t size,
+                                     uint32_t block_size, const void *in,
+                                     void *out) {
+    if (size == 0)
+        return;
+    if (block_size == 0 || block_size > size)
+        jitc_raise("jit_block_reduce(): invalid block size "
+                   "(size=%u, block_size=%u)!", size, block_size);
+
+    uint32_t tsize = type_size[(int) vt];
+    if (block_size == 1) {
+        if (in != out)
+            memcpy_async(out, in, (size_t) size * tsize);
+        return;
+    }
+
+    if (op == ReduceOp::Add || op == ReduceOp::Mul ||
+        op == ReduceOp::Or || op == ReduceOp::And)
+        vt = vulkan_make_int_unsigned(vt);
+
+    VulkanHistoryScope hist(this, KernelType::BlockReduce, size);
+    VulkanDevice &dev = vulkan_device(this);
+
+    uint32_t block_count = ceil_div(size, block_size);
+
+    constexpr uint32_t SmallThreshold = 256;
+    bool small = block_size < SmallThreshold;
+
+    VkPipeline pipe = jitc_vulkan_reduce_pipeline(
+        dev, small ? VulkanReduceKind::Small : VulkanReduceKind::Chunk, op, vt);
+    if (!pipe)
+        jitc_raise("jit_block_reduce(): unsupported type '%s' for op '%s' "
+                   "on the Vulkan backend.",
+                   type_name[(int) vt], red_name[(int) op]);
+
+    uint32_t chunk_size = 0, chunks_per_block = 1, chunk_count = block_count;
+    if (!small) {
+        chunk_size = std::min(block_size, VulkanChunkSize);
+        chunks_per_block = ceil_div(block_size, chunk_size);
+        chunk_count = block_count * chunks_per_block;
+    }
+
+    void *dst = out;
+    if (chunks_per_block > 1)
+        dst = jitc_malloc(JitBackend::Vulkan, (size_t) chunk_count * tsize);
+
+    VulkanBlockReduceParams params;
+    params.in_addr = vulkan_resolve(in, (size_t) size * tsize, "jit_block_reduce");
+    params.out_addr =
+        vulkan_resolve(dst, (size_t) chunk_count * tsize, "jit_block_reduce");
+    params.size = size;
+    params.block_size = block_size;
+    params.block_count = block_count;
+    params.chunk_size = chunk_size;
+    params.chunks_per_block = chunks_per_block;
+
+    jitc_log(Debug,
+             "jit_block_reduce(" DRJIT_PTR " -> " DRJIT_PTR
+             ", type=%s, op=%s, size=%u, block_size=%u, block_count=%u, "
+             "chunk_size=%u, chunks_per_block=%u)",
+             (uintptr_t) in, (uintptr_t) out, type_name[(int) vt],
+             red_name[(int) op], size, block_size, block_count, chunk_size,
+             chunks_per_block);
+
+    if (small)
+        vulkan_dispatch_threads(dev, pipe, params, block_count);
+    else
+        vulkan_dispatch_groups(dev, pipe, params, chunk_count);
+
+    if (chunks_per_block > 1) {
+        block_reduce(vt, op, chunk_count, chunks_per_block, dst, out);
+        jitc_free(dst);
+    }
+}
+
+static void vulkan_block_prefix_reduce(VulkanThreadState *ts, VarType vt,
+                                       VarType vta, ReduceOp op, uint32_t size,
+                                       uint32_t block_size, bool exclusive,
+                                       bool reverse, const void *in,
+                                       void *out) {
+    VulkanDevice &dev = vulkan_device(ts);
+    uint32_t tsize_in = type_size[(int) vt];
+    uint32_t tsize_out = (vt == VarType::UInt8 && vta == VarType::UInt32)
+                             ? sizeof(uint32_t)
+                             : tsize_in;
+
+    uint32_t block_count = ceil_div(size, block_size);
+    bool small = block_size < 64 && block_count >= 64;
+
+    VkPipeline scan_pipe = jitc_vulkan_reduce_pipeline(
+        dev, small ? VulkanReduceKind::SmallScan : VulkanReduceKind::Scan, op,
+        vt);
+    if (!scan_pipe)
+        jitc_raise("jit_block_prefix_reduce(): unsupported type '%s' for "
+                   "op '%s' on the Vulkan backend.",
+                   type_name[(int) vt], red_name[(int) op]);
+
+    uint32_t chunk_size = std::min(block_size, VulkanScanChunkSize),
+             chunks_per_block = small ? 1u : ceil_div(block_size, chunk_size),
+             chunk_count = block_count * chunks_per_block;
+
+    jitc_log(Debug,
+             "jit_block_prefix_reduce(" DRJIT_PTR " -> " DRJIT_PTR
+             ", type=%s, op=%s, size=%u, block_size=%u, exclusive=%i, "
+             "reverse=%i, block_count=%u, chunk_size=%u, "
+             "chunks_per_block=%u)",
+             (uintptr_t) in, (uintptr_t) out, type_name[(int) vt],
+             red_name[(int) op], size, block_size, (int) exclusive,
+             (int) reverse, block_count, chunk_size, chunks_per_block);
+
+    void *temp = nullptr;
+    if (chunks_per_block > 1) {
+        VkPipeline red_pipe = jitc_vulkan_reduce_pipeline(
+            dev,
+            vta != vt ? VulkanReduceKind::WideChunk : VulkanReduceKind::Chunk,
+            op, vt);
+        if (!red_pipe)
+            jitc_raise("jit_block_prefix_reduce(): unsupported type '%s' "
+                       "for op '%s' on the Vulkan backend.",
+                       type_name[(int) vt], red_name[(int) op]);
+
+        size_t temp_bytes = (size_t) chunk_count * type_size[(int) vta];
+        temp = jitc_malloc(JitBackend::Vulkan, temp_bytes);
+
+        VulkanBlockReduceParams rparams;
+        rparams.in_addr =
+            vulkan_resolve(in, (size_t) size * tsize_in, "jit_block_prefix_reduce");
+        rparams.out_addr =
+            vulkan_resolve(temp, temp_bytes, "jit_block_prefix_reduce");
+        rparams.size = size;
+        rparams.block_size = block_size;
+        rparams.block_count = block_count;
+        rparams.chunk_size = chunk_size;
+        rparams.chunks_per_block = chunks_per_block;
+
+        vulkan_dispatch_groups(dev, red_pipe, rparams, chunk_count);
+
+        ts->block_prefix_reduce(vta, op, chunk_count, chunks_per_block,
+                                /* exclusive = */ true, reverse, temp, temp);
+    }
+
+    // Handle in-place reverse scan over multiple elements in a single workgroup
+    // safely even if input and output alias. (Each workgroup reads all 4 per-thread
+    // elements into registers before writing any outputs.)
+    VulkanBlockPrefixReduceParams params;
+    params.in_addr =
+        vulkan_resolve(in, (size_t) size * tsize_in, "jit_block_prefix_reduce");
+    params.out_addr =
+        vulkan_resolve(out, (size_t) size * tsize_out, "jit_block_prefix_reduce");
+    params.prefixes_addr =
+        temp ? vulkan_resolve(temp, (size_t) chunk_count * type_size[(int) vta],
+                              "jit_block_prefix_reduce")
+             : params.out_addr;
+    params.size = size;
+    params.block_size = block_size;
+    params.block_count = block_count;
+    params.chunk_size = chunk_size;
+    params.chunks_per_block = chunks_per_block;
+    params.exclusive = exclusive ? 1u : 0u;
+    params.reverse = reverse ? 1u : 0u;
+
+    if (small)
+        vulkan_dispatch_threads(dev, scan_pipe, params, block_count);
+    else
+        vulkan_dispatch_groups(dev, scan_pipe, params, chunk_count);
+
+    if (temp)
+        jitc_free(temp);
+}
+
+void VulkanThreadState::block_prefix_reduce(VarType vt, ReduceOp op,
+                                            uint32_t size, uint32_t block_size,
+                                            bool exclusive, bool reverse,
+                                            const void *in, void *out) {
+    if (size == 0)
+        return;
+    if (block_size == 0 || block_size > size)
+        jitc_raise("jit_block_prefix_reduce(): invalid "
+                   "block_size=%u for size=%u.", block_size, size);
+
+    uint32_t tsize = type_size[(int) vt];
+    if (block_size == 1) {
+        if (exclusive) {
+            uint64_t ident = jitc_reduce_identity(vt, op);
+            memset_async(out, size, tsize, &ident);
+        } else if (in != out) {
+            memcpy_async(out, in, (size_t) size * tsize);
+        }
+        return;
+    }
+
+    if (op == ReduceOp::Add || op == ReduceOp::Mul ||
+        op == ReduceOp::Or || op == ReduceOp::And)
+        vt = vulkan_make_int_unsigned(vt);
+
+    VulkanHistoryScope hist(this, KernelType::BlockPrefixReduce, size);
+
+    VarType vta = vt;
+    if (vt == VarType::Float16 &&
+        (op == ReduceOp::Add || op == ReduceOp::Mul))
+        vta = VarType::Float32;
+
+    vulkan_block_prefix_reduce(this, vt, vta, op, size, block_size,
+                               exclusive, reverse, in, out);
+}
+
+void VulkanThreadState::reduce_dot(VarType vt, const void *ptr_1,
+                                   const void *ptr_2, uint32_t size,
+                                   void *out) {
+    if (size == 0)
+        return;
+
+    VulkanDevice &dev = vulkan_device(this);
+    VkPipeline pipe =
+        jitc_vulkan_reduce_pipeline(dev, VulkanReduceKind::Dot, ReduceOp::Add, vt);
+    if (!pipe)
+        jitc_raise("jit_reduce_dot(): unsupported type %s on the Vulkan backend.",
+                   type_name[(int) vt]);
+
+    VulkanHistoryScope hist(this, KernelType::Dot, size);
+
+    uint32_t tsize = type_size[(int) vt];
+    uint32_t chunk_size = std::min(size, VulkanChunkSize),
+             chunk_count = ceil_div(size, chunk_size);
+
+    jitc_log(Debug,
+             "jit_reduce_dot(" DRJIT_PTR ", " DRJIT_PTR
+             ", type=%s, size=%u, chunk_count=%u)",
+             (uintptr_t) ptr_1, (uintptr_t) ptr_2, type_name[(int) vt], size,
+             chunk_count);
+
+    void *dst = out;
+    if (chunk_count > 1)
+        dst = jitc_malloc(JitBackend::Vulkan, (size_t) chunk_count * tsize);
+
+    VulkanReduceDotParams params;
+    params.in1_addr =
+        vulkan_resolve(ptr_1, (size_t) size * tsize, "jit_reduce_dot");
+    params.in2_addr =
+        vulkan_resolve(ptr_2, (size_t) size * tsize, "jit_reduce_dot");
+    params.out_addr =
+        vulkan_resolve(dst, (size_t) chunk_count * tsize, "jit_reduce_dot");
+    params.size = size;
+    params.chunk_size = chunk_size;
+    params.chunk_count = chunk_count;
+
+    vulkan_dispatch_groups(dev, pipe, params, chunk_count);
+
+    if (chunk_count > 1) {
+        block_reduce(vt, ReduceOp::Add, chunk_count, chunk_count, dst, out);
+        jitc_free(dst);
+    }
 }
 
 void VulkanThreadState::batched_gemm(VarType, bool, bool, uint32_t, uint32_t,
@@ -452,13 +846,286 @@ void VulkanThreadState::batched_gemm(VarType, bool, bool, uint32_t, uint32_t,
     vulkan_unsupported("jit_batched_gemm");
 }
 
-uint32_t VulkanThreadState::compress(const uint8_t *, uint32_t, uint32_t *) {
-    vulkan_unsupported("jit_compress");
+uint32_t VulkanThreadState::compress(const uint8_t *in, uint32_t size,
+                                     uint32_t *out) {
+    if (size == 0)
+        return 0;
+
+    VulkanHistoryScope hist(this, KernelType::Compress, size);
+    VulkanDevice &dev = vulkan_device(this);
+
+    jitc_log(Debug, "jit_compress(" DRJIT_PTR " -> " DRJIT_PTR ", size=%u)",
+             (uintptr_t) in, (uintptr_t) out, size);
+
+    void *prefix =
+        jitc_malloc(JitBackend::Vulkan, (size_t) size * sizeof(uint32_t));
+    void *count =
+        jitc_malloc(JitBackend::Vulkan, sizeof(uint32_t), /*shared=*/true);
+
+    vulkan_block_prefix_reduce(this, VarType::UInt8, VarType::UInt32,
+                               ReduceOp::Add, size, /* block_size = */ size,
+                               /* exclusive = */ false,
+                               /* reverse = */ false, in, prefix);
+
+    VkPipeline scatter_pipe =
+        jitc_vulkan_pipeline(dev, VulkanKernel::CompressScatter);
+    if (!scatter_pipe)
+        jitc_raise("jit_compress(): failed to create compress_scatter pipeline!");
+
+    VulkanCompressScatterParams params;
+    params.in_addr = vulkan_resolve(in, size, "jit_compress");
+    params.prefix_addr =
+        vulkan_resolve(prefix, (size_t) size * sizeof(uint32_t), "jit_compress");
+    params.out_addr =
+        vulkan_resolve(out, (size_t) size * sizeof(uint32_t), "jit_compress");
+    params.size = size;
+
+    vulkan_dispatch_threads(dev, scatter_pipe, params, size);
+
+    memcpy_async(count, (const uint8_t *) prefix + (size_t) (size - 1) * 4, 4);
+
+    hist.record();
+    jitc_vulkan_sync(false);
+    uint32_t result = *(const uint32_t *) count;
+    jitc_free(prefix);
+    jitc_free(count);
+    return result;
 }
 
-uint32_t VulkanThreadState::block_mkperm(const uint32_t *, uint32_t, uint32_t,
-                                         uint32_t, uint32_t *, uint32_t *) {
-    vulkan_unsupported("jit_mkperm");
+static void vulkan_mkperm_detect_offsets(VulkanDevice &dev, void *buckets,
+                                         size_t buckets_bytes,
+                                         uint32_t bucket_count, uint32_t size,
+                                         uint32_t row_stride,
+                                         uint32_t *offsets_dev,
+                                         void **counter_out) {
+    void *counter =
+        jitc_malloc(JitBackend::Vulkan, sizeof(uint32_t), /*shared=*/true);
+    *(uint32_t *) counter = 0;
+    *counter_out = counter;
+
+    VkPipeline pipe =
+        jitc_vulkan_pipeline(dev, VulkanKernel::MkpermDetectOffsets);
+    if (!pipe)
+        jitc_raise("jit_block_mkperm(): failed to create mkperm_detect_offsets "
+                   "pipeline!");
+
+    size_t offsets_bytes = (size_t) bucket_count * 4 * sizeof(uint32_t);
+    VulkanMkpermOffsetsParams params;
+    params.buckets_addr =
+        vulkan_resolve(buckets, buckets_bytes, "jit_block_mkperm");
+    params.offsets_addr =
+        vulkan_resolve(offsets_dev, offsets_bytes, "jit_block_mkperm");
+    params.counter_addr =
+        vulkan_resolve(counter, sizeof(uint32_t), "jit_block_mkperm");
+    params.bucket_count = bucket_count;
+    params.perm_size = size;
+    params.row_stride = row_stride;
+
+    vulkan_dispatch_threads(dev, pipe, params, bucket_count);
+}
+
+static uint32_t vulkan_mkperm_finish(VulkanThreadState *ts,
+                                     VulkanHistoryScope &hist, void *buckets,
+                                     uint32_t bucket_count, uint32_t *offsets,
+                                     uint32_t *offsets_staging,
+                                     VulkanBuffer *offsets_buf, void *counter) {
+    jitc_free(buckets);
+    hist.record();
+
+    uint32_t unique_count = 0;
+    if (offsets) {
+        jitc_vulkan_sync(false);
+        unique_count = *(const uint32_t *) counter;
+        if (offsets_staging) {
+            offsets_staging[4 * bucket_count] = unique_count;
+            std::memcpy(offsets, offsets_staging,
+                        ((size_t) bucket_count * 4 + 1) * sizeof(uint32_t));
+            jitc_free(offsets_staging);
+        } else if (offsets_buf->shared) {
+            offsets[4 * bucket_count] = unique_count;
+        } else {
+            ts->poke(offsets + 4 * bucket_count, &unique_count,
+                     sizeof(uint32_t));
+            jitc_vulkan_sync(false);
+        }
+        jitc_free(counter);
+    }
+
+    return unique_count;
+}
+
+uint32_t VulkanThreadState::block_mkperm(const uint32_t *values, uint32_t size,
+                                         uint32_t block_size,
+                                         uint32_t bucket_count, uint32_t *perm,
+                                         uint32_t *offsets) {
+    if (size == 0)
+        return 0;
+    if (bucket_count == 0)
+        jitc_fail("jit_block_mkperm(): bucket_count cannot be zero!");
+
+    VulkanDevice &dev = vulkan_device(this);
+    const uint32_t warp = dev.subgroup_size ? dev.subgroup_size : 32u;
+
+    size_t offsets_bytes = ((size_t) bucket_count * 4 + 1) * sizeof(uint32_t);
+    size_t offsets_off = 0;
+    VulkanBuffer *offsets_buf =
+        offsets ? vulkan_lookup(offsets, offsets_bytes, &offsets_off,
+                                "jit_block_mkperm")
+                : nullptr;
+    uint32_t *offsets_staging = nullptr;
+    uint32_t *offsets_dev = offsets;
+    if (offsets && !offsets_buf) {
+        offsets_staging = (uint32_t *) jitc_malloc(
+            JitBackend::Vulkan, offsets_bytes, /*shared=*/true);
+        offsets_dev = offsets_staging;
+    }
+
+    // ---- Stable "tiny" path: per-subgroup shared memory histograms ----
+    // vulkan_kernels.glsl declares 'shared uint sh[2048]' (8 KiB).
+    uint32_t max_subgroups = std::max(1u, VulkanWorkgroupSize / warp);
+    uint32_t max_warps_mem = 2048u / bucket_count;
+    uint32_t warp_count = std::min({ 8u, max_subgroups, max_warps_mem });
+
+    if (warp_count >= 1) {
+        uint32_t thread_count = warp_count * warp;
+        uint32_t n_blocks = ceil_div(size, block_size);
+
+        const uint32_t ELEMS_PER_THREAD = 16;
+        uint32_t elems_per_blk = thread_count * ELEMS_PER_THREAD;
+        uint32_t gpu_blocks_per_group =
+            std::max(1u, ceil_div(block_size, elems_per_blk));
+
+        uint32_t max_cells = std::max(1u, size / 4u);
+        uint64_t denom = (uint64_t) n_blocks * warp_count * bucket_count;
+        uint32_t max_sub = (uint32_t) std::max<uint64_t>(1, max_cells / denom);
+        gpu_blocks_per_group = std::min(gpu_blocks_per_group, max_sub);
+
+        uint32_t size_per_block =
+            align_up(ceil_div(block_size, gpu_blocks_per_group), warp);
+        uint32_t rows_per_group = gpu_blocks_per_group * warp_count;
+        uint32_t seg = rows_per_group * bucket_count;
+        uint32_t total_cells = n_blocks * seg;
+        uint32_t total_groups = n_blocks * gpu_blocks_per_group;
+
+        if (offsets && n_blocks != 1)
+            jitc_raise("jit_block_mkperm(): offset extraction requires "
+                       "block_size == size.");
+
+        jitc_log(Debug,
+                 "jit_block_mkperm(" DRJIT_PTR ", size=%u, block_size=%u, "
+                 "bucket_count=%u, variant=tiny, blocks=%u, sub/block=%u, "
+                 "warps=%u, size_per_block=%u)",
+                 (uintptr_t) values, size, block_size, bucket_count, n_blocks,
+                 gpu_blocks_per_group, warp_count, size_per_block);
+
+        VulkanHistoryScope hist(this, KernelType::MkPerm, size);
+
+        size_t buckets_bytes = (size_t) total_cells * sizeof(uint32_t);
+        void *buckets = jitc_malloc(JitBackend::Vulkan, buckets_bytes);
+
+        VkPipeline p1_tiny =
+            jitc_vulkan_pipeline(dev, VulkanKernel::MkpermPhase1Tiny);
+        VkPipeline p4_tiny =
+            jitc_vulkan_pipeline(dev, VulkanKernel::MkpermPhase4Tiny);
+        if (!p1_tiny || !p4_tiny)
+            jitc_raise("jit_block_mkperm(): failed to create tiny mkperm "
+                       "pipelines!");
+
+        VulkanMkpermTinyParams tp;
+        tp.values_addr = vulkan_resolve(
+            values, (size_t) size * sizeof(uint32_t), "jit_block_mkperm");
+        tp.buckets_addr =
+            vulkan_resolve(buckets, buckets_bytes, "jit_block_mkperm");
+        tp.perm_addr = 0;
+        tp.size = size;
+        tp.size_per_block = size_per_block;
+        tp.bucket_count = bucket_count;
+        tp.block_size = block_size;
+        tp.n_blocks = n_blocks;
+        tp.gpu_blocks_per_group = gpu_blocks_per_group;
+        tp.warp_count = warp_count;
+        tp.rows_per_group = rows_per_group;
+
+        // Phase 1: per-subgroup histograms -> bucket-major global layout
+        vulkan_dispatch_groups(dev, p1_tiny, tp, total_groups);
+
+        // Phase 2: per-group exclusive prefix sum (segment length = seg)
+        block_prefix_reduce(VarType::UInt32, ReduceOp::Add, total_cells, seg,
+                            /*exclusive=*/true, /*reverse=*/false, buckets,
+                            buckets);
+
+        // Phase 2.5 (optional, single block): detect non-empty buckets
+        void *counter = nullptr;
+        if (offsets)
+            vulkan_mkperm_detect_offsets(dev, buckets, buckets_bytes,
+                                         bucket_count, size, rows_per_group,
+                                         offsets_dev, &counter);
+
+        // Phase 4: scatter the permutation
+        tp.perm_addr = vulkan_resolve(perm, (size_t) size * sizeof(uint32_t),
+                                      "jit_block_mkperm");
+        vulkan_dispatch_groups(dev, p4_tiny, tp, total_groups);
+
+        return vulkan_mkperm_finish(this, hist, buckets, bucket_count, offsets,
+                                    offsets_staging, offsets_buf, counter);
+    }
+
+    // ---- Fallback: global-atomic path (single block only) ----
+    if (block_size != size)
+        jitc_raise("jit_block_mkperm(): bucket_count=%u exceeds the stable "
+                   "shared-memory path, and the global-atomic fallback does "
+                   "not support per-block permutations (block_size != size) "
+                   "on Vulkan.",
+                   bucket_count);
+
+    VulkanHistoryScope hist(this, KernelType::MkPerm, size);
+
+    jitc_log(Debug,
+             "jit_block_mkperm(" DRJIT_PTR ", size=%u, block_size=%u, "
+             "bucket_count=%u, variant=global)",
+             (uintptr_t) values, size, block_size, bucket_count);
+
+    size_t bucket_bytes = (size_t) bucket_count * sizeof(uint32_t);
+    void *buckets = jitc_malloc(JitBackend::Vulkan, bucket_bytes);
+    uint32_t zero = 0;
+    vulkan_fill(dev, buckets, bucket_bytes, sizeof(uint32_t), &zero,
+                "jit_block_mkperm");
+
+    VkPipeline p1 = jitc_vulkan_pipeline(dev, VulkanKernel::MkpermPhase1);
+    VkPipeline p3 = jitc_vulkan_pipeline(dev, VulkanKernel::MkpermPhase3);
+    if (!p1 || !p3)
+        jitc_raise("jit_block_mkperm(): failed to create global mkperm "
+                   "pipelines!");
+
+    VulkanMkpermParams params;
+    params.values_addr = vulkan_resolve(
+        values, (size_t) size * sizeof(uint32_t), "jit_block_mkperm");
+    params.buckets_addr =
+        vulkan_resolve(buckets, bucket_bytes, "jit_block_mkperm");
+    params.perm_addr = 0;
+    params.size = size;
+
+    // Phase 1: Build histogram via global atomics
+    vulkan_dispatch_threads(dev, p1, params, size);
+
+    // Phase 2: Exclusive prefix sum over histogram
+    block_prefix_reduce(VarType::UInt32, ReduceOp::Add, bucket_count,
+                        bucket_count, true, false, buckets, buckets);
+
+    // Phase 2.5 (optional): Detect non-empty buckets
+    void *counter = nullptr;
+    if (offsets)
+        vulkan_mkperm_detect_offsets(dev, buckets, bucket_bytes, bucket_count,
+                                     size, /* row_stride = */ 1, offsets_dev,
+                                     &counter);
+
+    // Phase 3: Scatter indices using atomics on the prefix-summed histogram
+    params.perm_addr = vulkan_resolve(perm, (size_t) size * sizeof(uint32_t),
+                                      "jit_block_mkperm");
+    vulkan_dispatch_threads(dev, p3, params, size);
+
+    return vulkan_mkperm_finish(this, hist, buckets, bucket_count, offsets,
+                                offsets_staging, offsets_buf, counter);
 }
 
 void VulkanThreadState::memcpy(void *dst, const void *src, size_t size) {
@@ -466,10 +1133,14 @@ void VulkanThreadState::memcpy(void *dst, const void *src, size_t size) {
 }
 
 void VulkanThreadState::memcpy_async(void *dst, const void *src, size_t size) {
+    if (size == 0)
+        return;
+    VulkanHistoryScope hist(this, KernelType::Memcpy, (uint32_t) size);
     vulkan_copy(vulkan_device(this), dst, src, size, true);
 }
 
 void VulkanThreadState::poke(void *dst, const void *src, uint32_t size) {
+    VulkanHistoryScope hist(this, KernelType::Poke, size);
     jitc_log(Debug, "jit_poke(" DRJIT_PTR ", size=%u)", (uintptr_t) dst, size);
 
     if (size != 1 && size != 2 && size != 4 && size != 8)
@@ -483,6 +1154,7 @@ void VulkanThreadState::aggregate(void *dst, AggregationEntry *agg,
     if (size == 0)
         return;
 
+    VulkanHistoryScope hist(this, KernelType::Aggregate, size);
     VulkanDevice &dev = vulkan_device(this);
 
     jitc_log(InfoSym,

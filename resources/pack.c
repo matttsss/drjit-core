@@ -201,9 +201,194 @@ static void pack_metal(void) {
     close_header(f);
 }
 
+struct VulkanKernelSpec {
+    char name[64];
+    char flags[160];
+};
+
+static void add_vulkan_kernel(struct VulkanKernelSpec **list, size_t *count,
+                              size_t *cap, const char *name, const char *flags) {
+    if (*count == *cap) {
+        *cap = *cap ? (*cap * 2) : 256;
+        *list = realloc(*list, *cap * sizeof(struct VulkanKernelSpec));
+    }
+    snprintf((*list)[*count].name, sizeof((*list)[*count].name), "%s", name);
+    snprintf((*list)[*count].flags, sizeof((*list)[*count].flags), "%s", flags);
+    (*count)++;
+}
+
+/// Compile and compress the Vulkan utility kernels from vulkan_kernels.glsl
+static void pack_vulkan(void) {
+    struct VulkanKernelSpec *specs = NULL;
+    size_t count = 0, cap = 0;
+
+    add_vulkan_kernel(&specs, &count, &cap, "compress_scatter",
+                      "-DKERNEL_COMPRESS_SCATTER");
+    add_vulkan_kernel(&specs, &count, &cap, "mkperm_phase_1",
+                      "-DKERNEL_MKPERM_PHASE_1");
+    add_vulkan_kernel(&specs, &count, &cap, "mkperm_phase_3",
+                      "-DKERNEL_MKPERM_PHASE_3");
+    add_vulkan_kernel(&specs, &count, &cap, "mkperm_detect_offsets",
+                      "-DKERNEL_MKPERM_DETECT_OFFSETS");
+    add_vulkan_kernel(&specs, &count, &cap, "mkperm_phase_1_tiny",
+                      "-DKERNEL_MKPERM_PHASE_1_TINY");
+    add_vulkan_kernel(&specs, &count, &cap, "mkperm_phase_4_tiny",
+                      "-DKERNEL_MKPERM_PHASE_4_TINY");
+
+    static const struct {
+        const char *op;
+        const char *op_def;
+        const char *types[8];
+        const char *type_defs[8];
+    } red_table[] = {
+        { "add", "OP_ADD",
+          { "f16", "f32", "f64", "u32", "u64", NULL },
+          { "TYPE_F16", "TYPE_F32", "TYPE_F64", "TYPE_U32", "TYPE_U64", NULL } },
+        { "mul", "OP_MUL",
+          { "f16", "f32", "f64", "u32", "u64", NULL },
+          { "TYPE_F16", "TYPE_F32", "TYPE_F64", "TYPE_U32", "TYPE_U64", NULL } },
+        { "min", "OP_MIN",
+          { "f16", "f32", "f64", "u32", "u64", "i32", "i64", NULL },
+          { "TYPE_F16", "TYPE_F32", "TYPE_F64", "TYPE_U32", "TYPE_U64", "TYPE_I32", "TYPE_I64", NULL } },
+        { "max", "OP_MAX",
+          { "f16", "f32", "f64", "u32", "u64", "i32", "i64", NULL },
+          { "TYPE_F16", "TYPE_F32", "TYPE_F64", "TYPE_U32", "TYPE_U64", "TYPE_I32", "TYPE_I64", NULL } },
+        { "or", "OP_OR",
+          { "u8", "u32", "u64", NULL },
+          { "TYPE_U8", "TYPE_U32", "TYPE_U64", NULL } },
+        { "and", "OP_AND",
+          { "u8", "u32", "u64", NULL },
+          { "TYPE_U8", "TYPE_U32", "TYPE_U64", NULL } }
+    };
+
+    for (size_t i = 0; i < sizeof(red_table) / sizeof(red_table[0]); ++i) {
+        for (size_t j = 0; red_table[i].types[j]; ++j) {
+            const char *op = red_table[i].op;
+            const char *op_def = red_table[i].op_def;
+            const char *tn = red_table[i].types[j];
+            const char *td = red_table[i].type_defs[j];
+            char name[64], flags[160];
+
+            snprintf(name, sizeof(name), "block_reduce_small_%s_%s", op, tn);
+            snprintf(flags, sizeof(flags),
+                     "-DKERNEL_BLOCK_REDUCE_SMALL -D%s -D%s", op_def, td);
+            add_vulkan_kernel(&specs, &count, &cap, name, flags);
+
+            snprintf(name, sizeof(name), "block_reduce_%s_%s", op, tn);
+            snprintf(flags, sizeof(flags),
+                     "-DKERNEL_BLOCK_REDUCE_CHUNK -D%s -D%s", op_def, td);
+            add_vulkan_kernel(&specs, &count, &cap, name, flags);
+
+            // block_prefix_reduce skips u8 for or/and
+            if (strcmp(tn, "u8") != 0) {
+                snprintf(name, sizeof(name), "block_prefix_reduce_small_%s_%s", op, tn);
+                snprintf(flags, sizeof(flags),
+                         "-DKERNEL_BLOCK_PREFIX_REDUCE_SMALL -D%s -D%s", op_def, td);
+                add_vulkan_kernel(&specs, &count, &cap, name, flags);
+
+                snprintf(name, sizeof(name), "block_prefix_reduce_%s_%s", op, tn);
+                snprintf(flags, sizeof(flags),
+                         "-DKERNEL_BLOCK_PREFIX_REDUCE -D%s -D%s", op_def, td);
+                add_vulkan_kernel(&specs, &count, &cap, name, flags);
+            }
+        }
+    }
+
+    // Widened chunk reductions & u8 -> u32 prefix scan (for f16 prefix scan & compress)
+    add_vulkan_kernel(&specs, &count, &cap, "block_reduce_wide_add_f16",
+                      "-DKERNEL_BLOCK_REDUCE_CHUNK -DOP_ADD -DTYPE_F16 -DWIDE_OUT");
+    add_vulkan_kernel(&specs, &count, &cap, "block_reduce_wide_mul_f16",
+                      "-DKERNEL_BLOCK_REDUCE_CHUNK -DOP_MUL -DTYPE_F16 -DWIDE_OUT");
+    add_vulkan_kernel(&specs, &count, &cap, "block_reduce_wide_add_u8",
+                      "-DKERNEL_BLOCK_REDUCE_CHUNK -DOP_ADD -DTYPE_U8 -DWIDE_OUT");
+    add_vulkan_kernel(&specs, &count, &cap, "block_prefix_reduce_small_add_u8",
+                      "-DKERNEL_BLOCK_PREFIX_REDUCE_SMALL -DOP_ADD -DTYPE_U8 -DWIDE_OUT");
+    add_vulkan_kernel(&specs, &count, &cap, "block_prefix_reduce_add_u8",
+                      "-DKERNEL_BLOCK_PREFIX_REDUCE -DOP_ADD -DTYPE_U8 -DWIDE_OUT");
+
+    // Fused dot-product reductions
+    add_vulkan_kernel(&specs, &count, &cap, "reduce_dot_f16",
+                      "-DKERNEL_REDUCE_DOT -DTYPE_F16");
+    add_vulkan_kernel(&specs, &count, &cap, "reduce_dot_f32",
+                      "-DKERNEL_REDUCE_DOT -DTYPE_F32");
+    add_vulkan_kernel(&specs, &count, &cap, "reduce_dot_f64",
+                      "-DKERNEL_REDUCE_DOT -DTYPE_F64");
+
+    size_t blob_cap = 512 * 1024, blob_pos = 0;
+    char *blob = malloc(blob_cap);
+    size_t *offsets = malloc(count * sizeof(size_t));
+    size_t *sizes   = malloc(count * sizeof(size_t));
+
+    const char *tmp_spv = "vulkan_kernel_tmp.spv";
+    for (size_t i = 0; i < count; ++i) {
+        char cmd[512];
+        snprintf(cmd, sizeof(cmd),
+                 "glslangValidator --quiet -V --target-env vulkan1.3 -S comp %s "
+                 "vulkan_kernels.glsl -o %s",
+                 specs[i].flags, tmp_spv);
+        int ret = system(cmd);
+        if (ret != 0) {
+            fprintf(stderr, "pack: glslangValidator failed for '%s'!\n",
+                    specs[i].name);
+            remove(tmp_spv);
+            exit(EXIT_FAILURE);
+        }
+
+        size_t spv_size = 0;
+        char *spv = read_file(tmp_spv, &spv_size);
+        if (spv_size == 0 || (spv_size % 4) != 0) {
+            fprintf(stderr, "pack: invalid SPIR-V size (%zu) for '%s'!\n",
+                    spv_size, specs[i].name);
+            remove(tmp_spv);
+            exit(EXIT_FAILURE);
+        }
+
+        if (blob_pos + spv_size > blob_cap) {
+            while (blob_pos + spv_size > blob_cap)
+                blob_cap *= 2;
+            blob = realloc(blob, blob_cap);
+        }
+
+        offsets[i] = blob_pos;
+        sizes[i]   = spv_size;
+        memcpy(blob + blob_pos, spv, spv_size);
+        blob_pos += spv_size;
+        free(spv);
+    }
+    remove(tmp_spv);
+
+    FILE *f = open_header("vulkan_kernels.h");
+    pack_buffer(f, "vulkan_kernels", blob, blob_pos, "vulkan_kernels.lz4");
+
+    fprintf(f, "static const unsigned int vulkan_kernels_offsets[] = {");
+    for (size_t i = 0; i < count; ++i)
+        fprintf(f, "%s%u,", (i % 8 == 0) ? "\n    " : " ",
+                (unsigned int) offsets[i]);
+    fprintf(f, "\n};\n\n");
+
+    fprintf(f, "static const unsigned int vulkan_kernels_sizes[] = {");
+    for (size_t i = 0; i < count; ++i)
+        fprintf(f, "%s%u,", (i % 8 == 0) ? "\n    " : " ",
+                (unsigned int) sizes[i]);
+    fprintf(f, "\n};\n\n");
+
+    fprintf(f, "static const char *vulkan_kernels_list =");
+    for (size_t i = 0; i < count; ++i)
+        fprintf(f, "\n    \"%s,\"", specs[i].name);
+    fprintf(f, ";\n\n");
+
+    free(specs);
+    free(offsets);
+    free(sizes);
+    free(blob);
+    close_header(f);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "metal") == 0)
         pack_metal();
+    else if (argc > 1 && strcmp(argv[1], "vulkan") == 0)
+        pack_vulkan();
     else
         pack_ptx();
 

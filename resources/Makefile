@@ -42,5 +42,13 @@ metal_kernels.metallib: metal_kernels.metal
 metal_kernels.lz4: pack metal_kernels.metallib
 	./pack metal
 
+# Precompiled Vulkan SPIR-V utility kernels shipped with Dr.Jit-core. Requires
+# glslangValidator (from the Vulkan SDK or glslang-tools package), unlike the
+# CMake build itself, which only embeds the committed compressed SPIR-V archive.
+vulkan: vulkan_kernels.lz4
+
+vulkan_kernels.lz4: pack vulkan_kernels.glsl
+	./pack vulkan
+
 clean:
-	rm -f kernels_75.ptx kernels.bin metal_kernels.air metal_kernels.metallib
+	rm -f kernels_75.ptx kernels.bin metal_kernels.air metal_kernels.metallib vulkan_kernel_tmp.spv

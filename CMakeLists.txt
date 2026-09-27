@@ -209,6 +209,14 @@ if (DRJIT_ENABLE_METAL)
 endif()
 
 if (DRJIT_ENABLE_VULKAN)
+  # Precompiled Vulkan SPIR-V utility kernels
+  drjit_embed_binary(
+    OUTPUT  ${CMAKE_CURRENT_BINARY_DIR}/resources/vulkan_kernels.c
+    SYMBOLS vulkan_kernels
+    INPUTS  ${CMAKE_CURRENT_SOURCE_DIR}/resources/vulkan_kernels.lz4
+    TYPE    char
+    HEADER  resources/vulkan_kernels.h)
+
   # Vulkan backend sources: the dynamic Vulkan/SPIRV-Tools loader
   # (vulkan_api.*), device context & thread state (vulkan_core.cpp,
   # vulkan_ts.*), and SPIR-V code generation (vulkan_eval.*) are added to this
@@ -221,7 +229,9 @@ if (DRJIT_ENABLE_VULKAN)
     src/vulkan_eval.h
     src/vulkan_eval.cpp
     src/vulkan_ts.h
-    src/vulkan_ts.cpp)
+    src/vulkan_ts.cpp
+    resources/vulkan_kernels.h
+    ${CMAKE_CURRENT_BINARY_DIR}/resources/vulkan_kernels.c)
 endif()
 
 

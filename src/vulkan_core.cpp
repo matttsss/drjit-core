@@ -12,7 +12,9 @@
 #include "vulkan_ts.h"
 #include "io.h"
 #include "unit.h"
+#include "util.h"
 #include "log.h"
+#include "resources/vulkan_kernels.h"
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
@@ -1214,6 +1216,153 @@ static bool vulkan_create_device(const VulkanDeviceInfo &info, int index) {
     return true;
 }
 
+// ====================================================================
+//                   Precompiled utility compute pipelines
+// ====================================================================
+
+/// Decompressed builtin SPIR-V utility kernel blob
+static char *jitc_vulkan_kernels = nullptr;
+
+static const char *vulkan_kernel_names[(uint32_t) VulkanKernel::Count] = {
+    "compress_scatter",
+    "mkperm_phase_1",
+    "mkperm_phase_3",
+    "mkperm_detect_offsets",
+    "mkperm_phase_1_tiny",
+    "mkperm_phase_4_tiny"
+};
+
+static VkPipeline vulkan_create_utility_pipeline(VulkanDevice &dev,
+                                                 const char *name) {
+    if (!jitc_vulkan_kernels)
+        return VK_NULL_HANDLE;
+
+    size_t name_len = strlen(name);
+    const char *p = vulkan_kernels_list;
+    uint32_t idx = 0;
+    const uint32_t *code = nullptr;
+    size_t code_size = 0;
+
+    while (const char *comma = strchr(p, ',')) {
+        if ((size_t) (comma - p) == name_len && memcmp(p, name, name_len) == 0) {
+            code = (const uint32_t *) (jitc_vulkan_kernels +
+                                       vulkan_kernels_offsets[idx]);
+            code_size = vulkan_kernels_sizes[idx];
+            break;
+        }
+        p = comma + 1;
+        ++idx;
+    }
+
+    if (!code || code_size == 0)
+        return VK_NULL_HANDLE;
+
+    VkDevice device = (VkDevice) dev.device;
+
+    VkShaderModuleCreateInfo mod_info {};
+    mod_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    mod_info.codeSize = code_size;
+    mod_info.pCode = code;
+
+    VkShaderModule mod = VK_NULL_HANDLE;
+    VkResult rv = vkCreateShaderModule(device, &mod_info, nullptr, &mod);
+    if (rv != VK_SUCCESS) {
+        jitc_log(Warn, "vulkan_create_utility_pipeline(%s): "
+                       "vkCreateShaderModule() failed: %s",
+                 name, jitc_vulkan_error_name(rv));
+        return VK_NULL_HANDLE;
+    }
+
+    VkComputePipelineCreateInfo pipe_info {};
+    pipe_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipe_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipe_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipe_info.stage.module = mod;
+    pipe_info.stage.pName = "main";
+    pipe_info.layout = (VkPipelineLayout) dev.pipeline_layout;
+
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    rv = vkCreateComputePipelines(device, (VkPipelineCache) dev.pipeline_cache,
+                                  1, &pipe_info, nullptr, &pipeline);
+    vkDestroyShaderModule(device, mod, nullptr);
+
+    if (rv != VK_SUCCESS) {
+        jitc_log(Warn, "vulkan_create_utility_pipeline(%s): "
+                       "vkCreateComputePipelines() failed: %s",
+                 name, jitc_vulkan_error_name(rv));
+        return VK_NULL_HANDLE;
+    }
+
+    return pipeline;
+}
+
+VkPipeline jitc_vulkan_pipeline(VulkanDevice &dev, VulkanKernel kernel) {
+    void *&slot = dev.pipelines[(uint32_t) kernel];
+    if (!slot)
+        slot = vulkan_create_utility_pipeline(
+            dev, vulkan_kernel_names[(uint32_t) kernel]);
+    return (VkPipeline) slot;
+}
+
+static const char *vulkan_reduce_type_name(VarType vt) {
+    switch (vt) {
+        case VarType::Bool:
+        case VarType::UInt8:   return "u8";
+        case VarType::Float16: return "f16";
+        case VarType::Float32: return "f32";
+        case VarType::Float64: return "f64";
+        case VarType::UInt32:  return "u32";
+        case VarType::Int32:   return "i32";
+        case VarType::UInt64:  return "u64";
+        case VarType::Int64:   return "i64";
+        default:               return nullptr;
+    }
+}
+
+VkPipeline jitc_vulkan_reduce_pipeline(VulkanDevice &dev,
+                                       VulkanReduceKind kind,
+                                       ReduceOp op, VarType vt) {
+    void *&slot = dev.reduce_pipelines[(uint32_t) kind]
+                                      [(uint32_t) op]
+                                      [(uint32_t) vt];
+    if (slot)
+        return (VkPipeline) slot;
+
+    if (vt == VarType::Float64 && !dev.shader_float64)
+        return VK_NULL_HANDLE;
+    if (vt == VarType::Float16 &&
+        (!dev.shader_float16 || !dev.storage_buffer_16bit))
+        return VK_NULL_HANDLE;
+    if ((vt == VarType::UInt8 || vt == VarType::Bool) &&
+        (!dev.shader_int8 || !dev.storage_buffer_8bit))
+        return VK_NULL_HANDLE;
+
+    const char *tname = vulkan_reduce_type_name(vt);
+    if (!tname)
+        return VK_NULL_HANDLE;
+
+    const char *prefix = nullptr;
+    switch (kind) {
+        case VulkanReduceKind::Small:     prefix = "block_reduce_small"; break;
+        case VulkanReduceKind::Chunk:     prefix = "block_reduce"; break;
+        case VulkanReduceKind::WideChunk: prefix = "block_reduce_wide"; break;
+        case VulkanReduceKind::SmallScan: prefix = "block_prefix_reduce_small"; break;
+        case VulkanReduceKind::Scan:      prefix = "block_prefix_reduce"; break;
+        case VulkanReduceKind::Dot:       prefix = "reduce_dot"; break;
+        default: return VK_NULL_HANDLE;
+    }
+
+    char name[64];
+    if (kind == VulkanReduceKind::Dot)
+        snprintf(name, sizeof(name), "%s_%s", prefix, tname);
+    else
+        snprintf(name, sizeof(name), "%s_%s_%s",
+                 prefix, red_name[(int) op], tname);
+
+    slot = vulkan_create_utility_pipeline(dev, name);
+    return (VkPipeline) slot;
+}
+
 bool jitc_vulkan_init() {
     if (!state.vulkan_devices.empty())
         return true;
@@ -1288,11 +1437,22 @@ bool jitc_vulkan_init() {
     if (selected < 0)
         return vulkan_init_fail("no compatible Vulkan devices found");
 
+    if (!jitc_vulkan_kernels) {
+        jitc_vulkan_kernels = jitc_lz4_inflate(
+            vulkan_kernels, vulkan_kernels_size_compressed,
+            vulkan_kernels_size_uncompressed, "Vulkan utility kernels");
+    }
+
     return vulkan_create_device(infos[selected], selected);
 }
 
 void jitc_vulkan_shutdown() {
     vulkan_init_failed = false;
+
+    if (jitc_vulkan_kernels) {
+        free(jitc_vulkan_kernels);
+        jitc_vulkan_kernels = nullptr;
+    }
 
     if (state.vulkan_devices.empty())
         return;
@@ -1343,6 +1503,20 @@ void jitc_vulkan_shutdown() {
 
     for (VulkanDevice &dev : state.vulkan_devices) {
         VkDevice device = (VkDevice) dev.device;
+
+        for (uint32_t i = 0; i < (uint32_t) VulkanKernel::Count; ++i) {
+            if (dev.pipelines[i])
+                vkDestroyPipeline(device, (VkPipeline) dev.pipelines[i],
+                                  nullptr);
+        }
+
+        for (uint32_t i = 0; i < (uint32_t) VulkanReduceKind::Count; ++i)
+            for (uint32_t j = 0; j < (uint32_t) ReduceOp::Count; ++j)
+                for (uint32_t k = 0; k < (uint32_t) VarType::Count; ++k)
+                    if (dev.reduce_pipelines[i][j][k])
+                        vkDestroyPipeline(
+                            device, (VkPipeline) dev.reduce_pipelines[i][j][k],
+                            nullptr);
 
         if (dev.pipeline_cache) {
             VkPipelineCache cache = (VkPipelineCache) dev.pipeline_cache;

@@ -270,4 +270,18 @@ extern VulkanBuffer *jitc_vulkan_find_buffer(const void *ptr,
 /// Is \c ptr the base address of a registered buffer?
 extern bool jitc_vulkan_owns(const void *ptr);
 
+// ---------------------------------------------------------------------
+//  Utility compute pipelines
+// ---------------------------------------------------------------------
+
+/// Return the utility compute pipeline for \c kernel, creating it on first use
+extern VkPipeline jitc_vulkan_pipeline(VulkanDevice &dev, VulkanKernel kernel);
+
+/// Return the block (prefix) reduction compute pipeline for the requested
+/// kernel family, operation, and type, creating it on first use (or \c nullptr
+/// if unsupported)
+extern VkPipeline jitc_vulkan_reduce_pipeline(VulkanDevice &dev,
+                                              VulkanReduceKind kind,
+                                              ReduceOp op, VarType vt);
+
 #endif // defined(DRJIT_ENABLE_VULKAN)

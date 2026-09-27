@@ -771,6 +771,31 @@ struct MetalDevice {
 /// Command stream of a Vulkan device (see vulkan.h)
 struct VulkanStream;
 
+/// Identifies one of the block (prefix) reduction kernel families in
+/// vulkan_kernels.glsl; used to look up lazily created pipelines.
+enum class VulkanReduceKind : uint32_t {
+    Small,     // block_reduce_small_*: one thread serially reduces one block
+    Chunk,     // block_reduce_*: one workgroup reduces one chunk of a block
+    WideChunk, // block_reduce_wide_*: as above, but writing the accumulator
+               // type (f16 -> f32 or u8 -> u32 chunk totals, for prefix reductions)
+    SmallScan, // block_prefix_reduce_small_*: one thread serially scans one block
+    Scan,      // block_prefix_reduce_*: one workgroup prefix-reduces one chunk
+    Dot,       // reduce_dot_*: fused dot-product chunk reduction (op ignored)
+    Count
+};
+
+/// Enumeration of the precompiled non-reduction utility kernels in
+/// vulkan_kernels.glsl.
+enum class VulkanKernel : uint32_t {
+    CompressScatter,
+    MkpermPhase1,
+    MkpermPhase3,
+    MkpermDetectOffsets,
+    MkpermPhase1Tiny,
+    MkpermPhase4Tiny,
+    Count
+};
+
 /**
  * \brief Caches basic information about a Vulkan device (see vulkan_core.cpp)
  *
@@ -795,6 +820,15 @@ struct VulkanDevice {
 
     /// Driver pipeline cache (VkPipelineCache), loaded from and saved to disk
     void *pipeline_cache = nullptr;
+
+    /// Lazily created non-reduction utility compute pipelines (VkPipeline)
+    void *pipelines[(uint32_t) VulkanKernel::Count] { };
+
+    /// Lazily created block (prefix) reduction compute pipelines (VkPipeline),
+    /// indexed by [VulkanReduceKind][ReduceOp][VarType]
+    void *reduce_pipelines[(uint32_t) VulkanReduceKind::Count]
+                          [(uint32_t) ReduceOp::Count]
+                          [(uint32_t) VarType::Count] { };
 
     /// Value of the most recently submitted signal operation of 'timeline'.
     /// Incremented while holding 'state.lock' along with each vkQueueSubmit().
