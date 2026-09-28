@@ -28,9 +28,8 @@ static constexpr uint32_t VulkanWorkgroupSize = 256;
 /// Contiguous elements each thread of a chunked reduction/scan processes
 static constexpr uint32_t VulkanGrain = 4;
 
-/// Elements covered by one scan workgroup (256 threads * 4 elements)
-static constexpr uint32_t VulkanScanChunkSize =
-    VulkanWorkgroupSize * VulkanGrain;
+/// Elements covered by one forward scan workgroup (4 tiles * 256 threads * 4 elements)
+static constexpr uint32_t VulkanScanChunkSize = 4096;
 
 /// Elements covered by one reduction/dot workgroup (4 iterations * 1024)
 static constexpr uint32_t VulkanChunkSize = 4096;
@@ -598,8 +597,8 @@ static void vulkan_dispatch_threads(VulkanDevice &dev, KernelType type,
 // Host-side mirrors of the push constant structs in resources/vulkan_kernels.glsl
 
 struct VulkanCompressScatterParams {
-    uint64_t in_addr, prefix_addr, out_addr;
-    uint32_t size;
+    uint64_t in_addr, prefix_addr, out_addr, count_addr;
+    uint32_t size, chunk_size, chunk_count, chunks_scanned;
 };
 
 struct VulkanMkpermParams {
@@ -658,8 +657,11 @@ void VulkanThreadState::block_reduce(VarType vt, ReduceOp op, uint32_t size,
 
     uint32_t block_count = ceil_div(size, block_size);
 
-    constexpr uint32_t SmallThreshold = 256;
-    bool small = block_size < SmallThreshold;
+    bool sg_coop = block_size >= 16 &&
+                   (block_size < 256 || (block_size <= 1024 && block_count >= 64)) &&
+                   dev.subgroup_size >= 16 &&
+                   VulkanWorkgroupSize % dev.subgroup_size == 0;
+    bool small = block_size < 16 || sg_coop;
 
     VkPipeline pipe = jitc_vulkan_reduce_pipeline(
         dev, small ? VulkanReduceKind::Small : VulkanReduceKind::Chunk, op, vt);
@@ -668,7 +670,9 @@ void VulkanThreadState::block_reduce(VarType vt, ReduceOp op, uint32_t size,
                    "on the Vulkan backend.",
                    type_name[(int) vt], red_name[(int) op]);
 
-    uint32_t chunk_size = 0, chunks_per_block = 1, chunk_count = block_count;
+    uint32_t chunk_size = sg_coop ? 1u : 0u,
+             chunks_per_block = 1,
+             chunk_count = block_count;
     if (!small) {
         chunk_size = std::min(block_size, VulkanChunkSize);
         chunks_per_block = ceil_div(block_size, chunk_size);
@@ -697,14 +701,20 @@ void VulkanThreadState::block_reduce(VarType vt, ReduceOp op, uint32_t size,
              red_name[(int) op], size, block_size, block_count, chunk_size,
              chunks_per_block);
 
-    if (small)
+    if (sg_coop) {
+        uint32_t sgs_per_wg = VulkanWorkgroupSize / dev.subgroup_size;
+        vulkan_dispatch_groups(dev, KernelType::BlockReduce,
+                               this->recording_mode, pipe, params,
+                               ceil_div(block_count, sgs_per_wg), size);
+    } else if (small) {
         vulkan_dispatch_threads(dev, KernelType::BlockReduce,
                                 this->recording_mode, pipe, params,
                                 block_count, size);
-    else
+    } else {
         vulkan_dispatch_groups(dev, KernelType::BlockReduce,
                                this->recording_mode, pipe, params,
                                chunk_count, size);
+    }
 
     if (chunks_per_block > 1) {
         block_reduce(vt, op, chunk_count, chunks_per_block, dst, out);
@@ -735,7 +745,9 @@ static void vulkan_block_prefix_reduce(VulkanThreadState *ts, VarType vt,
                    "op '%s' on the Vulkan backend.",
                    type_name[(int) vt], red_name[(int) op]);
 
-    uint32_t chunk_size = std::min(block_size, VulkanScanChunkSize),
+    uint32_t max_chunk = reverse ? (VulkanWorkgroupSize * VulkanGrain)
+                                 : VulkanScanChunkSize;
+    uint32_t chunk_size = std::min(block_size, max_chunk),
              chunks_per_block = small ? 1u : ceil_div(block_size, chunk_size),
              chunk_count = block_count * chunks_per_block;
 
@@ -910,38 +922,75 @@ uint32_t VulkanThreadState::compress(const uint8_t *in, uint32_t size,
     jitc_log(Debug, "jit_compress(" DRJIT_PTR " -> " DRJIT_PTR ", size=%u)",
              (uintptr_t) in, (uintptr_t) out, size);
 
-    void *prefix =
-        jitc_malloc(JitBackend::Vulkan, (size_t) size * sizeof(uint32_t));
-    void *count =
-        jitc_malloc(JitBackend::Vulkan, sizeof(uint32_t), /*shared=*/true);
-
-    vulkan_block_prefix_reduce(this, VarType::UInt8, VarType::UInt32,
-                               ReduceOp::Add, size, /* block_size = */ size,
-                               /* exclusive = */ false,
-                               /* reverse = */ false, in, prefix,
-                               KernelType::Compress);
-
     VkPipeline scatter_pipe =
         jitc_vulkan_pipeline(dev, VulkanKernel::CompressScatter);
     if (!scatter_pipe)
         jitc_raise("jit_compress(): failed to create compress_scatter pipeline!");
 
-    VulkanCompressScatterParams params;
-    params.in_addr = vulkan_resolve(in, size, "jit_compress");
-    params.prefix_addr =
-        vulkan_resolve(prefix, (size_t) size * sizeof(uint32_t), "jit_compress");
-    params.out_addr =
+    uint32_t chunk_size = VulkanChunkSize;
+    uint32_t chunk_count = ceil_div(size, chunk_size);
+    uint32_t chunks_scanned = 0;
+
+    void *count =
+        jitc_malloc(JitBackend::Vulkan, sizeof(uint32_t), /*shared=*/true);
+    void *chunk_buf = nullptr;
+
+    uint64_t in_addr = vulkan_resolve(in, size, "jit_compress");
+    uint64_t out_addr =
         vulkan_resolve(out, (size_t) size * sizeof(uint32_t), "jit_compress");
+    uint64_t count_addr =
+        vulkan_resolve(count, sizeof(uint32_t), "jit_compress");
+    uint64_t prefix_addr = out_addr;
+
+    if (chunk_count > 1) {
+        VkPipeline red_pipe = jitc_vulkan_reduce_pipeline(
+            dev, VulkanReduceKind::WideChunk, ReduceOp::Add, VarType::UInt8);
+        if (!red_pipe)
+            jitc_raise("jit_compress(): failed to create chunk reduction pipeline!");
+
+        size_t chunk_bytes = (size_t) chunk_count * sizeof(uint32_t);
+        chunk_buf = jitc_malloc(JitBackend::Vulkan, chunk_bytes);
+        prefix_addr = vulkan_resolve(chunk_buf, chunk_bytes, "jit_compress");
+
+        VulkanBlockReduceParams rparams;
+        rparams.in_addr = in_addr;
+        rparams.out_addr = prefix_addr;
+        rparams.size = size;
+        rparams.block_size = size;
+        rparams.block_count = 1;
+        rparams.chunk_size = chunk_size;
+        rparams.chunks_per_block = chunk_count;
+
+        vulkan_dispatch_groups(dev, KernelType::Compress, this->recording_mode,
+                               red_pipe, rparams, chunk_count, size);
+
+        if (chunk_count > VulkanScanChunkSize) {
+            vulkan_block_prefix_reduce(this, VarType::UInt32, VarType::UInt32,
+                                       ReduceOp::Add, chunk_count, chunk_count,
+                                       /* exclusive = */ true,
+                                       /* reverse = */ false, chunk_buf,
+                                       chunk_buf, KernelType::Compress);
+            chunks_scanned = 1;
+        }
+    }
+
+    VulkanCompressScatterParams params;
+    params.in_addr = in_addr;
+    params.prefix_addr = prefix_addr;
+    params.out_addr = out_addr;
+    params.count_addr = count_addr;
     params.size = size;
+    params.chunk_size = chunk_size;
+    params.chunk_count = chunk_count;
+    params.chunks_scanned = chunks_scanned;
 
-    vulkan_dispatch_threads(dev, KernelType::Compress, this->recording_mode,
-                            scatter_pipe, params, size, size);
-
-    memcpy_async(count, (const uint8_t *) prefix + (size_t) (size - 1) * 4, 4);
+    vulkan_dispatch_groups(dev, KernelType::Compress, this->recording_mode,
+                           scatter_pipe, params, chunk_count, size);
 
     jitc_vulkan_sync(false);
     uint32_t result = *(const uint32_t *) count;
-    jitc_free(prefix);
+    if (chunk_buf)
+        jitc_free(chunk_buf);
     jitc_free(count);
     return result;
 }

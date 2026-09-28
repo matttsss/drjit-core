@@ -42,30 +42,143 @@ layout(local_size_x = 256) in;
 
 #if defined(KERNEL_COMPRESS_SCATTER)
 
-layout(buffer_reference, scalar) readonly buffer InBuf  { uint8_t d[]; };
-layout(buffer_reference, scalar) readonly buffer PreBuf { uint    d[]; };
-layout(buffer_reference, scalar) writeonly buffer OutBuf { uint   d[]; };
+layout(buffer_reference, scalar) readonly buffer  InBuf    { uint8_t d[]; };
+layout(buffer_reference, scalar) readonly buffer  PreBuf   { uint    d[]; };
+layout(buffer_reference, scalar) writeonly buffer OutBuf   { uint    d[]; };
+layout(buffer_reference, scalar) writeonly buffer CountBuf { uint    d[]; };
 
 layout(push_constant, scalar) uniform PushConstants {
     uint64_t in_addr;
     uint64_t prefix_addr;
     uint64_t out_addr;
+    uint64_t count_addr;
     uint     size;
+    uint     chunk_size;
+    uint     chunk_count;
+    uint     chunks_scanned;
 } p;
+
+shared uint sh_sg[257];
 
 void main() {
     uint wg_id = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
-    uint tid   = wg_id * 256u + gl_LocalInvocationID.x;
-    if (tid >= p.size)
+    if (wg_id >= p.chunk_count)
         return;
 
-    InBuf in_buf = InBuf(p.in_addr);
-    if (in_buf.d[tid] == uint8_t(0))
-        return;
+    uint tid     = gl_LocalInvocationID.x;
+    uint lane    = gl_SubgroupInvocationID;
+    uint sgid    = gl_SubgroupID;
+    uint nsg     = gl_NumSubgroups;
+    uint sg_size = gl_SubgroupSize;
 
-    PreBuf pre_buf = PreBuf(p.prefix_addr);
+    uint chunk_running = 0u;
+    if (p.chunk_count > 1u) {
+        PreBuf pre_buf = PreBuf(p.prefix_addr);
+        if (p.chunks_scanned != 0u) {
+            chunk_running = pre_buf.d[wg_id];
+        } else {
+            uint pre_sum = 0u;
+            for (uint i = tid; i < wg_id; i += 256u)
+                pre_sum += pre_buf.d[i];
+            pre_sum = subgroupAdd(pre_sum);
+            if (nsg > 1u) {
+                if (lane == 0u)
+                    sh_sg[sgid] = pre_sum;
+                barrier();
+                if (sgid == 0u) {
+                    uint s = 0u;
+                    for (uint i = lane; i < nsg; i += sg_size)
+                        s += sh_sg[i];
+                    s = subgroupAdd(s);
+                    if (lane == 0u)
+                        sh_sg[0] = s;
+                }
+                barrier();
+                pre_sum = sh_sg[0];
+                barrier();
+            }
+            chunk_running = pre_sum;
+        }
+    }
+
+    InBuf  in_buf  = InBuf(p.in_addr);
     OutBuf out_buf = OutBuf(p.out_addr);
-    out_buf.d[pre_buf.d[tid] - 1u] = tid;
+
+    uint chunk_start = wg_id * p.chunk_size;
+    uint chunk_end   = min(chunk_start + p.chunk_size, p.size);
+    uint n_entries   = 4u * nsg;
+
+    for (uint tile_base = chunk_start; tile_base < chunk_end; tile_base += 1024u) {
+        uint pos0 = tile_base + tid;
+        uint pos1 = pos0 + 256u;
+        uint pos2 = pos0 + 512u;
+        uint pos3 = pos0 + 768u;
+
+        bool act0, act1, act2, act3;
+        if (tile_base + 1024u <= chunk_end) {
+            act0 = in_buf.d[pos0] != uint8_t(0);
+            act1 = in_buf.d[pos1] != uint8_t(0);
+            act2 = in_buf.d[pos2] != uint8_t(0);
+            act3 = in_buf.d[pos3] != uint8_t(0);
+        } else {
+            act0 = (pos0 < chunk_end) && (in_buf.d[pos0] != uint8_t(0));
+            act1 = (pos1 < chunk_end) && (in_buf.d[pos1] != uint8_t(0));
+            act2 = (pos2 < chunk_end) && (in_buf.d[pos2] != uint8_t(0));
+            act3 = (pos3 < chunk_end) && (in_buf.d[pos3] != uint8_t(0));
+        }
+
+        uvec4 bal0 = subgroupBallot(act0);
+        uvec4 bal1 = subgroupBallot(act1);
+        uvec4 bal2 = subgroupBallot(act2);
+        uvec4 bal3 = subgroupBallot(act3);
+
+        if (lane == 0u) {
+            sh_sg[0u * nsg + sgid] = subgroupBallotBitCount(bal0);
+            sh_sg[1u * nsg + sgid] = subgroupBallotBitCount(bal1);
+            sh_sg[2u * nsg + sgid] = subgroupBallotBitCount(bal2);
+            sh_sg[3u * nsg + sgid] = subgroupBallotBitCount(bal3);
+        }
+        barrier();
+
+        if (sgid == 0u) {
+            if (n_entries <= sg_size) {
+                uint t = (lane < n_entries) ? sh_sg[lane] : 0u;
+                uint scan_excl = subgroupExclusiveAdd(t);
+                if (lane < n_entries)
+                    sh_sg[lane] = scan_excl;
+                if (lane == n_entries - 1u)
+                    sh_sg[n_entries] = scan_excl + t;
+            } else {
+                uint running = 0u;
+                for (uint base = 0u; base < n_entries; base += sg_size) {
+                    uint idx       = base + lane;
+                    uint t         = (idx < n_entries) ? sh_sg[idx] : 0u;
+                    uint scan_excl = subgroupExclusiveAdd(t);
+                    uint scan_incl = scan_excl + t;
+                    if (idx < n_entries)
+                        sh_sg[idx] = running + scan_excl;
+                    running += subgroupShuffle(scan_incl, sg_size - 1u);
+                }
+                if (lane == 0u)
+                    sh_sg[n_entries] = running;
+            }
+        }
+        barrier();
+
+        if (act0) out_buf.d[chunk_running + sh_sg[0u * nsg + sgid] + subgroupBallotExclusiveBitCount(bal0)] = pos0;
+        if (act1) out_buf.d[chunk_running + sh_sg[1u * nsg + sgid] + subgroupBallotExclusiveBitCount(bal1)] = pos1;
+        if (act2) out_buf.d[chunk_running + sh_sg[2u * nsg + sgid] + subgroupBallotExclusiveBitCount(bal2)] = pos2;
+        if (act3) out_buf.d[chunk_running + sh_sg[3u * nsg + sgid] + subgroupBallotExclusiveBitCount(bal3)] = pos3;
+
+        chunk_running += sh_sg[n_entries];
+        if (tile_base + 1024u < chunk_end)
+            barrier();
+    }
+
+    if (wg_id == p.chunk_count - 1u && tid == 0u) {
+        CountBuf count_buf = CountBuf(p.count_addr);
+        count_buf.d[0] = chunk_running;
+    }
 }
 
 #endif // KERNEL_COMPRESS_SCATTER
@@ -387,15 +500,46 @@ layout(push_constant, scalar) uniform PushConstants {
 
 void main() {
     uint wg_id = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
-    uint b     = wg_id * 256u + gl_LocalInvocationID.x;
+    InBuf  in_buf  = InBuf(p.in_addr);
+    OutBuf out_buf = OutBuf(p.out_addr);
+
+    if (p.chunk_size != 0u) {
+        uint b = wg_id * gl_NumSubgroups + gl_SubgroupID;
+        if (b >= p.block_count)
+            return;
+
+        uint base    = b * p.block_size;
+        uint n       = min(p.size - base, p.block_size);
+        uint lane    = gl_SubgroupInvocationID;
+        uint sg_size = gl_SubgroupSize;
+        uint step4   = sg_size * 4u;
+
+        ACC_T acc = RED_INIT;
+        uint i = 0u;
+        for (; i + step4 <= n; i += step4) {
+            uint idx = base + i + lane;
+            ACC_T v0 = ACC_T(in_buf.d[idx]);
+            ACC_T v1 = ACC_T(in_buf.d[idx + sg_size]);
+            ACC_T v2 = ACC_T(in_buf.d[idx + sg_size * 2u]);
+            ACC_T v3 = ACC_T(in_buf.d[idx + sg_size * 3u]);
+            acc = RED_OP(acc, RED_OP(RED_OP(v0, v1), RED_OP(v2, v3)));
+        }
+        for (; i < n; i += sg_size) {
+            if (i + lane < n)
+                acc = RED_OP(acc, ACC_T(in_buf.d[base + i + lane]));
+        }
+        acc = SG_REDUCE(acc);
+        if (lane == 0u)
+            out_buf.d[b] = OUT_T(acc);
+        return;
+    }
+
+    uint b = wg_id * 256u + gl_LocalInvocationID.x;
     if (b >= p.block_count)
         return;
 
     uint base = b * p.block_size;
     uint n    = min(p.size - base, p.block_size);
-
-    InBuf  in_buf  = InBuf(p.in_addr);
-    OutBuf out_buf = OutBuf(p.out_addr);
 
     ACC_T acc = RED_INIT;
     uint i = 0u;
@@ -425,23 +569,26 @@ void main() {
     uint block_start = block * p.block_size;
     uint block_len   = min(p.size - block_start, p.block_size);
     uint chunk_start = rel_chunk * p.chunk_size;
+    uint chunk_end   = min(chunk_start + p.chunk_size, block_len);
 
     InBuf  in_buf  = InBuf(p.in_addr);
     OutBuf out_buf = OutBuf(p.out_addr);
 
     ACC_T acc = RED_INIT;
-    for (uint off = tid * 4u; off < p.chunk_size; off += 256u * 4u) {
-        uint pib = chunk_start + off;
+    for (uint base_off = chunk_start; base_off < chunk_end; base_off += 1024u) {
+        uint pib = base_off + tid;
         uint pos = block_start + pib;
-        if (pib + 3u < block_len) {
-            ACC_T v01 = RED_OP(ACC_T(in_buf.d[pos]),      ACC_T(in_buf.d[pos + 1u]));
-            ACC_T v23 = RED_OP(ACC_T(in_buf.d[pos + 2u]), ACC_T(in_buf.d[pos + 3u]));
-            acc = RED_OP(acc, RED_OP(v01, v23));
+        if (base_off + 1024u <= chunk_end) {
+            ACC_T v0 = ACC_T(in_buf.d[pos]);
+            ACC_T v1 = ACC_T(in_buf.d[pos + 256u]);
+            ACC_T v2 = ACC_T(in_buf.d[pos + 512u]);
+            ACC_T v3 = ACC_T(in_buf.d[pos + 768u]);
+            acc = RED_OP(acc, RED_OP(RED_OP(v0, v1), RED_OP(v2, v3)));
         } else {
-            for (uint j = 0u; j < 4u; ++j) {
-                if (pib + j < block_len)
-                    acc = RED_OP(acc, ACC_T(in_buf.d[min(pos + j, p.size - 1u)]));
-            }
+            if (pib < chunk_end)        acc = RED_OP(acc, ACC_T(in_buf.d[pos]));
+            if (pib + 256u < chunk_end) acc = RED_OP(acc, ACC_T(in_buf.d[pos + 256u]));
+            if (pib + 512u < chunk_end) acc = RED_OP(acc, ACC_T(in_buf.d[pos + 512u]));
+            if (pib + 768u < chunk_end) acc = RED_OP(acc, ACC_T(in_buf.d[pos + 768u]));
         }
     }
 
@@ -460,7 +607,7 @@ void main() {
     }
 
     if (tid == 0u)
-        out_buf.d[block * p.chunks_per_block + rel_chunk] = OUT_T(acc);
+        out_buf.d[wg_id] = OUT_T(acc);
 }
 
 #endif // KERNEL_BLOCK_REDUCE_SMALL / CHUNK
@@ -518,7 +665,7 @@ void main() {
 
 #else // KERNEL_BLOCK_PREFIX_REDUCE
 
-shared ACC_T sh[64];
+shared ACC_T sh[65];
 
 void main() {
     uint wg_id     = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
@@ -535,80 +682,127 @@ void main() {
     uint block_start = block * p.block_size;
     uint block_len   = min(p.size - block_start, p.block_size);
     bool rev         = p.reverse != 0u;
+    bool excl        = p.exclusive != 0u;
 
     InBuf  in_buf  = InBuf(p.in_addr);
     OutBuf out_buf = OutBuf(p.out_addr);
 
-    ACC_T v[4];
-    bool  valid[4];
-    uint  pos[4];
-    for (uint j = 0u; j < 4u; ++j) {
-        uint s = tid * 4u + j;
-        uint pib = rev
-            ? ((rel_chunk + 1u) * p.chunk_size - 1u - s)
-            : (rel_chunk * p.chunk_size + s);
-        valid[j] = (s < p.chunk_size) && (pib < block_len);
-        pos[j]   = valid[j] ? (block_start + pib) : 0u;
-        v[j]     = valid[j] ? ACC_T(in_buf.d[pos[j]]) : RED_INIT;
-    }
-
-    // Inclusive scan of the 4-element grain in registers
-    v[1] = RED_OP(v[0], v[1]);
-    v[2] = RED_OP(v[1], v[2]);
-    v[3] = RED_OP(v[2], v[3]);
-
-    // Exclusive scan of per-thread totals within each subgroup
-    ACC_T prefix = SG_EXCL_SCAN(v[3]);
-
-    // Exclusive scan of per-subgroup totals across the workgroup
-    if (nsg > 1u) {
-        if (lane == sg_size - 1u)
-            sh[sgid] = RED_OP(prefix, v[3]);
-        barrier();
-        if (sgid == 0u) {
-            ACC_T running = RED_INIT;
-            for (uint base = 0u; base < nsg; base += sg_size) {
-                uint  idx       = base + lane;
-                ACC_T t         = (idx < nsg) ? sh[idx] : RED_INIT;
-                ACC_T scan_excl = SG_EXCL_SCAN(t);
-                ACC_T scan_incl = RED_OP(scan_excl, t);
-                if (idx < nsg)
-                    sh[idx] = RED_OP(running, scan_excl);
-                running = RED_OP(running, subgroupShuffle(scan_incl, sg_size - 1u));
-            }
-        }
-        barrier();
-        prefix = RED_OP(sh[sgid], prefix);
-    }
-
-    // Add exclusive prefix of preceding chunks in the same block (if multi-chunk).
-    // When chunks_per_block == 1 the host sets prefixes_addr = out_addr so any
-    // speculated load by software drivers (e.g. Mesa llvmpipe) reads index 0 of
-    // a valid buffer.
+    ACC_T chunk_running = RED_INIT;
     if (p.chunks_per_block > 1u) {
         PreBuf pre_buf = PreBuf(p.prefixes_addr);
         uint pre_idx = (p.prefixes_addr != p.out_addr)
-                           ? (block * p.chunks_per_block + rel_chunk)
+                           ? wg_id
                            : 0u;
-        prefix = RED_OP(pre_buf.d[pre_idx], prefix);
+        chunk_running = pre_buf.d[pre_idx];
     }
 
-    ACC_T r[4];
-    if (p.exclusive != 0u) {
-        r[0] = prefix;
-        r[1] = RED_OP(prefix, v[0]);
-        r[2] = RED_OP(prefix, v[1]);
-        r[3] = RED_OP(prefix, v[2]);
-    } else {
-        r[0] = RED_OP(prefix, v[0]);
-        r[1] = RED_OP(prefix, v[1]);
-        r[2] = RED_OP(prefix, v[2]);
-        r[3] = RED_OP(prefix, v[3]);
-    }
+    uint chunk_start = rel_chunk * p.chunk_size;
+    uint chunk_span  = rev ? p.chunk_size
+                           : min(p.chunk_size,
+                                 block_len > chunk_start ? (block_len - chunk_start) : 0u);
 
-    for (uint j = 0u; j < 4u; ++j) {
-        if (valid[j])
-            out_buf.d[pos[j]] = OUT_T(r[j]);
+    for (uint tile_off = 0u; tile_off < chunk_span; tile_off += 1024u) {
+        uint s0   = tile_off + tid * 4u;
+        bool fast = !rev && (s0 + 3u < chunk_span);
+
+        ACC_T v0, v1, v2, v3;
+        bool  valid[4];
+        uint  pos[4];
+
+        if (fast) {
+            uint gpos = block_start + chunk_start + s0;
+            v0 = ACC_T(in_buf.d[gpos]);
+            v1 = ACC_T(in_buf.d[gpos + 1u]);
+            v2 = ACC_T(in_buf.d[gpos + 2u]);
+            v3 = ACC_T(in_buf.d[gpos + 3u]);
+        } else {
+            for (uint j = 0u; j < 4u; ++j) {
+                uint s = s0 + j;
+                uint pib = rev
+                    ? ((rel_chunk + 1u) * p.chunk_size - 1u - s)
+                    : (chunk_start + s);
+                valid[j] = (s < p.chunk_size) && (pib < block_len);
+                pos[j]   = valid[j] ? (block_start + pib) : 0u;
+            }
+            v0 = valid[0] ? ACC_T(in_buf.d[pos[0]]) : RED_INIT;
+            v1 = valid[1] ? ACC_T(in_buf.d[pos[1]]) : RED_INIT;
+            v2 = valid[2] ? ACC_T(in_buf.d[pos[2]]) : RED_INIT;
+            v3 = valid[3] ? ACC_T(in_buf.d[pos[3]]) : RED_INIT;
+        }
+
+        ACC_T s1 = RED_OP(v0, v1);
+        ACC_T s2 = RED_OP(s1, v2);
+        ACC_T s3 = RED_OP(s2, v3);
+
+        ACC_T prefix = SG_EXCL_SCAN(s3);
+        ACC_T sg_tot = RED_OP(prefix, s3);
+        ACC_T tile_tot = sg_tot;
+
+        if (nsg > 1u) {
+            if (lane == sg_size - 1u)
+                sh[sgid] = sg_tot;
+            barrier();
+            if (sgid == 0u) {
+                if (nsg <= sg_size) {
+                    ACC_T t = (lane < nsg) ? sh[lane] : RED_INIT;
+                    ACC_T scan_excl = SG_EXCL_SCAN(t);
+                    if (lane < nsg)
+                        sh[lane] = scan_excl;
+                    if (lane == nsg - 1u)
+                        sh[nsg] = RED_OP(scan_excl, t);
+                } else {
+                    ACC_T running = RED_INIT;
+                    for (uint base = 0u; base < nsg; base += sg_size) {
+                        uint  idx       = base + lane;
+                        ACC_T t         = (idx < nsg) ? sh[idx] : RED_INIT;
+                        ACC_T scan_excl = SG_EXCL_SCAN(t);
+                        ACC_T scan_incl = RED_OP(scan_excl, t);
+                        if (idx < nsg)
+                            sh[idx] = RED_OP(running, scan_excl);
+                        running = RED_OP(running, subgroupShuffle(scan_incl, sg_size - 1u));
+                    }
+                    if (lane == 0u)
+                        sh[nsg] = running;
+                }
+            }
+            barrier();
+            prefix   = RED_OP(sh[sgid], prefix);
+            tile_tot = sh[nsg];
+        } else {
+            tile_tot = subgroupShuffle(sg_tot, sg_size - 1u);
+        }
+
+        prefix = RED_OP(chunk_running, prefix);
+        chunk_running = RED_OP(chunk_running, tile_tot);
+
+        ACC_T r0, r1, r2, r3;
+        if (excl) {
+            r0 = prefix;
+            r1 = RED_OP(prefix, v0);
+            r2 = RED_OP(prefix, s1);
+            r3 = RED_OP(prefix, s2);
+        } else {
+            r0 = RED_OP(prefix, v0);
+            r1 = RED_OP(prefix, s1);
+            r2 = RED_OP(prefix, s2);
+            r3 = RED_OP(prefix, s3);
+        }
+
+        if (fast) {
+            uint gpos = block_start + chunk_start + s0;
+            out_buf.d[gpos]      = OUT_T(r0);
+            out_buf.d[gpos + 1u] = OUT_T(r1);
+            out_buf.d[gpos + 2u] = OUT_T(r2);
+            out_buf.d[gpos + 3u] = OUT_T(r3);
+        } else {
+            if (valid[0]) out_buf.d[pos[0]] = OUT_T(r0);
+            if (valid[1]) out_buf.d[pos[1]] = OUT_T(r1);
+            if (valid[2]) out_buf.d[pos[2]] = OUT_T(r2);
+            if (valid[3]) out_buf.d[pos[3]] = OUT_T(r3);
+        }
+
+        if (tile_off + 1024u < chunk_span && nsg > 1u)
+            barrier();
     }
 }
 
@@ -648,25 +842,24 @@ void main() {
     uint chunk_start = wg_id * p.chunk_size;
     uint chunk_len   = min(p.size - chunk_start, p.chunk_size);
 
-    T acc_t = T(0);
-    for (uint off = tid * 4u; off < p.chunk_size; off += 256u * 4u) {
+    T acc0 = T(0), acc1 = T(0);
+    for (uint base_off = 0u; base_off < chunk_len; base_off += 1024u) {
+        uint off = base_off + tid;
         uint pos = chunk_start + off;
-        if (off + 3u < chunk_len) {
-            acc_t = fma(a.d[pos],      b.d[pos],      acc_t);
-            acc_t = fma(a.d[pos + 1u], b.d[pos + 1u], acc_t);
-            acc_t = fma(a.d[pos + 2u], b.d[pos + 2u], acc_t);
-            acc_t = fma(a.d[pos + 3u], b.d[pos + 3u], acc_t);
+        if (base_off + 1024u <= chunk_len) {
+            acc0 = fma(a.d[pos],        b.d[pos],        acc0);
+            acc1 = fma(a.d[pos + 256u], b.d[pos + 256u], acc1);
+            acc0 = fma(a.d[pos + 512u], b.d[pos + 512u], acc0);
+            acc1 = fma(a.d[pos + 768u], b.d[pos + 768u], acc1);
         } else {
-            for (uint j = 0u; j < 4u; ++j) {
-                if (off + j < chunk_len) {
-                    uint idx = min(pos + j, p.size - 1u);
-                    acc_t = fma(a.d[idx], b.d[idx], acc_t);
-                }
-            }
+            if (off < chunk_len)        acc0 = fma(a.d[pos],        b.d[pos],        acc0);
+            if (off + 256u < chunk_len) acc1 = fma(a.d[pos + 256u], b.d[pos + 256u], acc1);
+            if (off + 512u < chunk_len) acc0 = fma(a.d[pos + 512u], b.d[pos + 512u], acc0);
+            if (off + 768u < chunk_len) acc1 = fma(a.d[pos + 768u], b.d[pos + 768u], acc1);
         }
     }
 
-    ACC_T acc = subgroupAdd(ACC_T(acc_t));
+    ACC_T acc = subgroupAdd(ACC_T(acc0 + acc1));
 
     if (gl_NumSubgroups > 1u) {
         if (gl_SubgroupInvocationID == 0u)

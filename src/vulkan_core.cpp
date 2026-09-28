@@ -454,8 +454,14 @@ void jitc_vulkan_access(VulkanDevice &dev, bool is_write) {
         mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        vkCmdPipelineBarrier(s.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
+        VkPipelineStageFlags stages =
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_TRANSFER_BIT |
+            VK_PIPELINE_STAGE_HOST_BIT |
+            (dev.supports_accel
+                 ? VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+                 : 0);
+        vkCmdPipelineBarrier(s.cmd, stages, stages, 0, 1, &mb, 0,
                              nullptr, 0, nullptr);
         s.barrier_pending = false;
         s.write_pending = false;
@@ -488,7 +494,13 @@ void jitc_vulkan_submit(VulkanDevice &dev) {
     mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+    VkPipelineStageFlags src_stages =
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+        VK_PIPELINE_STAGE_TRANSFER_BIT |
+        (dev.supports_accel
+             ? VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+             : 0);
+    vkCmdPipelineBarrier(cmd, src_stages,
                          VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0,
                          nullptr);
 

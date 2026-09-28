@@ -121,6 +121,7 @@ static uint32_t spv_aux_id = 0;
 static uint32_t spv_func_id = 0;
 
 static char current_block_label[64];
+static std::vector<std::string> cond_true_labels;
 
 static bool jitc_vulkan_mark_emitted(uint32_t idx, EmittedFlag flag) {
     bool already = (emitted_flags[idx] & flag) != 0;
@@ -156,6 +157,7 @@ void jitc_vulkan_assemble_reset() {
     emitted_lit_consts.clear();
     spv_aux_id = 0;
     spv_func_id = 0;
+    cond_true_labels.clear();
 
     snprintf(current_block_label, sizeof(current_block_label), "%%loop_body");
 }
@@ -1261,6 +1263,10 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
         (size_t) n_params * sizeof(void *) <= dev.max_push_constants_size;
     uint32_t n_args = n_params > 1 ? n_params - 1 : 1;
 
+    uint64_t wg_count = ((uint64_t) group.size + wg_size - 1) / wg_size;
+    bool need_grid_loop = dev.max_compute_work_group_count[0] > 0 &&
+                          wg_count > dev.max_compute_work_group_count[0];
+
     // 1. Baseline types, built-ins, and kernel parameter block
     jitc_vulkan_require_type(VarType::Void);
     jitc_vulkan_require_type(VarType::Bool);
@@ -1268,7 +1274,6 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
     jitc_vulkan_require_type(VarType::UInt64);
 
     put_annot("OpDecorate %gl_GlobalInvocationID BuiltIn GlobalInvocationId\n"
-              "OpDecorate %gl_NumWorkGroups BuiltIn NumWorkgroups\n"
               "OpDecorate %arr_u64 ArrayStride 8\n"
               "OpDecorate %Params Block\n"
               "OpMemberDecorate %Params 0 Offset 0\n"
@@ -1276,12 +1281,16 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
 
     put_tc("%v3u32 = OpTypeVector %u32 3\n"
            "%ptr_in_v3u32 = OpTypePointer Input %v3u32\n"
-           "%gl_GlobalInvocationID = OpVariable %ptr_in_v3u32 Input\n"
-           "%gl_NumWorkGroups = OpVariable %ptr_in_v3u32 Input\n");
+           "%gl_GlobalInvocationID = OpVariable %ptr_in_v3u32 Input\n");
+
+    if (unlikely(need_grid_loop)) {
+        put_annot("OpDecorate %gl_NumWorkGroups BuiltIn NumWorkgroups\n");
+        put_tc("%gl_NumWorkGroups = OpVariable %ptr_in_v3u32 Input\n");
+        jitc_vulkan_require_u32_const(wg_size);
+    }
 
     jitc_vulkan_require_u32_const(0);
     jitc_vulkan_require_u32_const(1);
-    jitc_vulkan_require_u32_const(wg_size);
     jitc_vulkan_require_u32_const(n_args);
 
     fmt_tc("%arr_u64 = OpTypeArray %u64 %c_u32_$u\n"
@@ -1485,8 +1494,9 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
     put_header("OpMemoryModel PhysicalStorageBuffer64 GLSL450\n");
     fmt_header("OpEntryPoint GLCompute %main "
                "\"drjit_^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\" "
-               "%gl_GlobalInvocationID %gl_NumWorkGroups$s $s$s$s$s$s$s\n"
+               "%gl_GlobalInvocationID$s$s $s$s$s$s$s$s\n"
                "OpExecutionMode %main LocalSize $u 1 1\n",
+               unlikely(need_grid_loop) ? " %gl_NumWorkGroups" : "",
                (spv_flags & SpvCapSubgroup) ? " %gl_SubgroupLocalInvocationId"
                                             : "",
                params_in_pc ? "%params" : "%pc",
@@ -1522,12 +1532,17 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
     if (spv_func_locals.size() > 0)
         put(spv_func_locals.get(), spv_func_locals.size());
 
-    fmt("%gid_vec = OpLoad %v3u32 %gl_GlobalInvocationID\n"
-        "%gid = OpCompositeExtract %u32 %gid_vec 0\n"
-        "%nwg_vec = OpLoad %v3u32 %gl_NumWorkGroups\n"
-        "%nwg = OpCompositeExtract %u32 %nwg_vec 0\n"
-        "%stride = OpIMul %u32 %nwg %c_u32_$u\n",
-        wg_size);
+    if (unlikely(need_grid_loop)) {
+        fmt("%gid_vec = OpLoad %v3u32 %gl_GlobalInvocationID\n"
+            "%gid = OpCompositeExtract %u32 %gid_vec 0\n"
+            "%nwg_vec = OpLoad %v3u32 %gl_NumWorkGroups\n"
+            "%nwg = OpCompositeExtract %u32 %nwg_vec 0\n"
+            "%stride = OpIMul %u32 %nwg %c_u32_$u\n",
+            wg_size);
+    } else {
+        put("%gid_vec = OpLoad %v3u32 %gl_GlobalInvocationID\n"
+            "%idx = OpCompositeExtract %u32 %gid_vec 0\n");
+    }
 
     if (params_in_pc) {
         put("%size_ptr = OpAccessChain %ptr_pc_u32 %params %c_u32_0\n"
@@ -1539,23 +1554,37 @@ void jitc_vulkan_assemble(ThreadState *ts, ScheduledGroup group,
             "%size = OpLoad %u32 %size_ptr Aligned 4\n");
     }
 
-    put("OpBranch %loop_head\n"
-        "%loop_head = OpLabel\n"
-        "%idx = OpPhi %u32 %gid %entry %idx_next %loop_cont\n"
-        "%in_bounds = OpULessThan %bool %idx %size\n"
-        "OpLoopMerge %loop_exit %loop_cont None\n"
-        "OpBranchConditional %in_bounds %loop_body %loop_exit\n"
-        "%loop_body = OpLabel\n");
+    if (unlikely(need_grid_loop)) {
+        put("OpBranch %loop_head\n"
+            "%loop_head = OpLabel\n"
+            "%idx = OpPhi %u32 %gid %entry %idx_next %loop_cont\n"
+            "%in_bounds = OpULessThan %bool %idx %size\n"
+            "OpLoopMerge %loop_exit %loop_cont None\n"
+            "OpBranchConditional %in_bounds %loop_body %loop_exit\n"
+            "%loop_body = OpLabel\n");
 
-    put(spv_body.get(), spv_body.size());
+        put(spv_body.get(), spv_body.size());
 
-    put("OpBranch %loop_cont\n"
-        "%loop_cont = OpLabel\n"
-        "%idx_next = OpIAdd %u32 %idx %stride\n"
-        "OpBranch %loop_head\n"
-        "%loop_exit = OpLabel\n"
-        "OpReturn\n"
-        "OpFunctionEnd\n");
+        put("OpBranch %loop_cont\n"
+            "%loop_cont = OpLabel\n"
+            "%idx_next = OpIAdd %u32 %idx %stride\n"
+            "OpBranch %loop_head\n"
+            "%loop_exit = OpLabel\n"
+            "OpReturn\n"
+            "OpFunctionEnd\n");
+    } else {
+        put("%in_bounds = OpULessThan %bool %idx %size\n"
+            "OpSelectionMerge %loop_exit None\n"
+            "OpBranchConditional %in_bounds %loop_body %loop_exit\n"
+            "%loop_body = OpLabel\n");
+
+        put(spv_body.get(), spv_body.size());
+
+        put("OpBranch %loop_exit\n"
+            "%loop_exit = OpLabel\n"
+            "OpReturn\n"
+            "OpFunctionEnd\n");
+    }
 
     if (spv_funcs.size() > 0)
         put(spv_funcs.get(), spv_funcs.size());
@@ -3164,49 +3193,47 @@ static void jitc_vulkan_render(Variable *v) {
 
         case VarKind::LoopStart: {
             const LoopData *ld = (const LoopData *) v->data;
+            char before_loop_label[64];
+            memcpy(before_loop_label, current_block_label,
+                   sizeof(before_loop_label));
+
+            fmt("OpBranch %loop_header_r$u\n"
+                "%loop_header_r$u = OpLabel\n",
+                v->reg_index,
+                v->reg_index);
+
             for (size_t i = 0; i < ld->size; ++i) {
-                Variable *inner_in = jitc_var(ld->inner_in[i]),
-                         *outer_in = jitc_var(ld->outer_in[i]);
+                Variable *inner_in  = jitc_var(ld->inner_in[i]),
+                         *outer_in  = jitc_var(ld->outer_in[i]),
+                         *inner_out = jitc_var(ld->inner_out[i]);
                 if (inner_in == outer_in || !inner_in->reg_index ||
                     inner_in->is_array())
                     continue;
 
                 VarType ivt = (VarType) inner_in->type;
-                const char *fn_ptr = jitc_vulkan_require_fn_ptr(ivt);
-                fmt_local("%loop_var_r$u = OpVariable $s Function\n",
-                          inner_in->reg_index, fn_ptr);
+                jitc_vulkan_require_type(ivt);
+                Variable *back_var =
+                    (inner_out && inner_out->reg_index) ? inner_out : inner_in;
+
                 if (outer_in && outer_in->reg_index) {
-                    fmt("OpStore %loop_var_r$u $v\n",
-                        inner_in->reg_index, outer_in);
+                    fmt("$v = OpPhi $t $v $s $v %loop_cont_r$u\n",
+                        inner_in, inner_in, outer_in, before_loop_label,
+                        back_var, v->reg_index);
                 } else {
                     const char *zero_c = jitc_vulkan_require_zero(ivt);
-                    fmt("OpStore %loop_var_r$u $s\n",
-                        inner_in->reg_index, zero_c);
+                    fmt("$v = OpPhi $t $s $s $v %loop_cont_r$u\n",
+                        inner_in, inner_in, zero_c, before_loop_label,
+                        back_var, v->reg_index);
                 }
             }
 
-            fmt("OpBranch %loop_header_r$u\n"
-                "%loop_header_r$u = OpLabel\n"
-                "OpLoopMerge %loop_exit_r$u %loop_cont_r$u None\n"
+            fmt("OpLoopMerge %loop_exit_r$u %loop_cont_r$u DontUnroll\n"
                 "OpBranch %loop_body_r$u\n"
                 "%loop_body_r$u = OpLabel\n",
-                v->reg_index,
-                v->reg_index,
                 v->reg_index, v->reg_index,
                 v->reg_index,
                 v->reg_index);
             jitc_vulkan_set_label("loop_body", v->reg_index);
-
-            for (size_t i = 0; i < ld->size; ++i) {
-                Variable *inner_in = jitc_var(ld->inner_in[i]),
-                         *outer_in = jitc_var(ld->outer_in[i]);
-                if (inner_in == outer_in || !inner_in->reg_index ||
-                    inner_in->is_array())
-                    continue;
-                jitc_vulkan_require_type((VarType) inner_in->type);
-                fmt("$v = OpLoad $t %loop_var_r$u\n",
-                    inner_in, inner_in, inner_in->reg_index);
-            }
             break;
         }
 
@@ -3227,21 +3254,12 @@ static void jitc_vulkan_render(Variable *v) {
             break;
 
         case VarKind::LoopEnd: {
-            const LoopData *ld = (const LoopData *) a0->data;
             fmt("OpBranch %loop_cont_r$u\n"
-                "%loop_cont_r$u = OpLabel\n",
-                a0->reg_index,
-                a0->reg_index);
-            for (size_t i = 0; i < ld->size; ++i) {
-                Variable *in  = jitc_var(ld->inner_in[i]),
-                         *out = jitc_var(ld->inner_out[i]);
-                if (in == out || !in->reg_index || !out->reg_index ||
-                    in->is_array())
-                    continue;
-                fmt("OpStore %loop_var_r$u $v\n", in->reg_index, out);
-            }
-            fmt("OpBranch %loop_header_r$u\n"
+                "%loop_cont_r$u = OpLabel\n"
+                "OpBranch %loop_header_r$u\n"
                 "%loop_exit_r$u = OpLabel\n",
+                a0->reg_index,
+                a0->reg_index,
                 a0->reg_index,
                 a0->reg_index);
             jitc_vulkan_set_label("loop_exit", a0->reg_index);
@@ -3251,15 +3269,10 @@ static void jitc_vulkan_render(Variable *v) {
         case VarKind::LoopOutput: {
             const LoopData *ld = (const LoopData *) a0->data;
             size_t i = (size_t) v->literal;
-            Variable *inner_in = jitc_var(ld->inner_in[i]),
-                     *outer_in = jitc_var(ld->outer_in[i]);
+            Variable *inner_in = jitc_var(ld->inner_in[i]);
             if (v->reg_index && inner_in && inner_in->reg_index) {
                 jitc_vulkan_require_type((VarType) v->type);
-                if (inner_in == outer_in)
-                    fmt("$v = OpCopyObject $t $v\n", v, v, inner_in);
-                else
-                    fmt("$v = OpLoad $t %loop_var_r$u\n",
-                        v, v, inner_in->reg_index);
+                fmt("$v = OpCopyObject $t $v\n", v, v, inner_in);
             }
             break;
         }
@@ -3267,16 +3280,6 @@ static void jitc_vulkan_render(Variable *v) {
         // ================ Structured Control Flow: Conditionals ================
 
         case VarKind::CondStart: {
-            const CondData *cd = (const CondData *) v->data;
-            for (size_t i = 0; i < cd->indices_out.size(); ++i) {
-                Variable *vo = jitc_var(cd->indices_out[i]);
-                if (jitc_cond_output_active(vo)) {
-                    const char *fn_ptr =
-                        jitc_vulkan_require_fn_ptr((VarType) vo->type);
-                    fmt_local("%cond_out_r$u = OpVariable $s Function\n",
-                              vo->reg_index, fn_ptr);
-                }
-            }
             jitc_vulkan_require_type(VarType::Bool);
             fmt("OpSelectionMerge %cond_merge_r$u None\n"
                 "OpBranchConditional $v %cond_true_r$u %cond_false_r$u\n"
@@ -3289,22 +3292,7 @@ static void jitc_vulkan_render(Variable *v) {
         }
 
         case VarKind::CondMid: {
-            const CondData *cd = (const CondData *) a0->data;
-            for (size_t i = 0; i < cd->indices_out.size(); ++i) {
-                Variable *vt_var = jitc_var(cd->indices_t[i]),
-                         *vo     = jitc_var(cd->indices_out[i]);
-                if (jitc_cond_output_active(vo)) {
-                    if (vt_var && vt_var->reg_index) {
-                        fmt("OpStore %cond_out_r$u $v\n",
-                            vo->reg_index, vt_var);
-                    } else {
-                        const char *zero_c =
-                            jitc_vulkan_require_zero((VarType) vo->type);
-                        fmt("OpStore %cond_out_r$u $s\n",
-                            vo->reg_index, zero_c);
-                    }
-                }
-            }
+            cond_true_labels.emplace_back(current_block_label);
             fmt("OpBranch %cond_merge_r$u\n"
                 "%cond_false_r$u = OpLabel\n",
                 a0->reg_index,
@@ -3315,21 +3303,11 @@ static void jitc_vulkan_render(Variable *v) {
 
         case VarKind::CondEnd: {
             const CondData *cd = (const CondData *) a0->data;
-            for (size_t i = 0; i < cd->indices_out.size(); ++i) {
-                Variable *vf_var = jitc_var(cd->indices_f[i]),
-                         *vo     = jitc_var(cd->indices_out[i]);
-                if (jitc_cond_output_active(vo)) {
-                    if (vf_var && vf_var->reg_index) {
-                        fmt("OpStore %cond_out_r$u $v\n",
-                            vo->reg_index, vf_var);
-                    } else {
-                        const char *zero_c =
-                            jitc_vulkan_require_zero((VarType) vo->type);
-                        fmt("OpStore %cond_out_r$u $s\n",
-                            vo->reg_index, zero_c);
-                    }
-                }
-            }
+            std::string true_lbl = std::move(cond_true_labels.back());
+            cond_true_labels.pop_back();
+            char false_lbl[64];
+            memcpy(false_lbl, current_block_label, sizeof(false_lbl));
+
             fmt("OpBranch %cond_merge_r$u\n"
                 "%cond_merge_r$u = OpLabel\n",
                 a0->reg_index,
@@ -3337,11 +3315,31 @@ static void jitc_vulkan_render(Variable *v) {
             jitc_vulkan_set_label("cond_merge", a0->reg_index);
 
             for (size_t i = 0; i < cd->indices_out.size(); ++i) {
-                Variable *vo = jitc_var(cd->indices_out[i]);
-                if (jitc_cond_output_active(vo)) {
-                    jitc_vulkan_require_type((VarType) vo->type);
-                    fmt("$v = OpLoad $t %cond_out_r$u\n",
-                        vo, vo, vo->reg_index);
+                Variable *vt_var = jitc_var(cd->indices_t[i]),
+                         *vf_var = jitc_var(cd->indices_f[i]),
+                         *vo     = jitc_var(cd->indices_out[i]);
+                if (!jitc_cond_output_active(vo))
+                    continue;
+
+                VarType ovt = (VarType) vo->type;
+                jitc_vulkan_require_type(ovt);
+                bool has_t = vt_var && vt_var->reg_index;
+                bool has_f = vf_var && vf_var->reg_index;
+                const char *zero_c =
+                    (!has_t || !has_f) ? jitc_vulkan_require_zero(ovt) : nullptr;
+
+                if (has_t && has_f) {
+                    fmt("$v = OpPhi $t $v $s $v $s\n",
+                        vo, vo, vt_var, true_lbl.c_str(), vf_var, false_lbl);
+                } else if (has_t) {
+                    fmt("$v = OpPhi $t $v $s $s $s\n",
+                        vo, vo, vt_var, true_lbl.c_str(), zero_c, false_lbl);
+                } else if (has_f) {
+                    fmt("$v = OpPhi $t $s $s $v $s\n",
+                        vo, vo, zero_c, true_lbl.c_str(), vf_var, false_lbl);
+                } else {
+                    fmt("$v = OpPhi $t $s $s $s $s\n",
+                        vo, vo, zero_c, true_lbl.c_str(), zero_c, false_lbl);
                 }
             }
             break;
